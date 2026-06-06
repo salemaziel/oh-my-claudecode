@@ -1,5 +1,5 @@
 import { execSync } from 'child_process';
-const DEFAULT_REPO_URL = 'https://github.com/Yeachan-Heo/oh-my-claudecode';
+const DEFAULT_REPO_URL = 'https://github.com/salemaziel/oh-my-claudecode';
 
 export interface ReleasePullRequest {
   number: string;
