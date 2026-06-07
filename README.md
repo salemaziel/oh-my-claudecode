@@ -2,6 +2,8 @@ English | [한국어](README.ko.md) | [中文](README.zh.md) | [日本語](READM
 
 # oh-my-claudecode
 
+> **Note:** This is a personal fork of [Yeachan-Heo/oh-my-claudecode](https://github.com/Yeachan-Heo/oh-my-claudecode). For the upstream project, documentation, and to support the original maintainer, please visit the upstream repo.
+
 [![npm version](https://img.shields.io/npm/v/oh-my-claude-sisyphus?color=cb3837)](https://www.npmjs.com/package/oh-my-claude-sisyphus)
 [![npm downloads](https://img.shields.io/npm/dm/oh-my-claude-sisyphus?color=blue)](https://www.npmjs.com/package/oh-my-claude-sisyphus)
 [![GitHub stars](https://img.shields.io/github/stars/salemaziel/oh-my-claudecode?style=flat&color=yellow)](https://github.com/salemaziel/oh-my-claudecode/stargazers)
@@ -597,7 +599,9 @@ Top personal non-fork, non-archived repos from all-time OMC contributors (100+ G
 
 ## 💖 Support This Project
 
-If Oh-My-ClaudeCode helps your workflow, consider sponsoring:
+> **Note:** This is a fork. The sponsorship link below goes to the upstream project maintainer ([@Yeachan-Heo](https://github.com/Yeachan-Heo)), not this fork.
+
+If Oh-My-ClaudeCode helps your workflow, consider sponsoring the upstream maintainer:
 
 [![Sponsor on GitHub](https://img.shields.io/badge/Sponsor-❤️-red?style=for-the-badge&logo=github)](https://github.com/sponsors/Yeachan-Heo)
 
