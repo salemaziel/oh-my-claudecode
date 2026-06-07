@@ -131,7 +131,7 @@ Before claiming completion:
 ## Resources
 - **GitHub:** github.com/salemaziel/oh-my-claudecode
 - **Docs:** /docs/REFERENCE.md
-- **Website:** yeachan-heo.github.io/oh-my-claudecode-website
+- **Website:** yeachan-heo.github.io/oh-my-claudecode-website *(upstream docs site; TODO: replace when fork docs site is published)*
 - **NPM:** `npm i -g oh-my-claudecode`
 - **Discord:** (community support - link in GitHub)
 
