@@ -70,9 +70,9 @@ This directory contains documentation for end-users and developers:
 
 #### Linking to Raw Content
 
-Use raw GitHub URLs for external accessibility:
+Use raw GitHub URLs for external accessibility. For this repository, prefer fork-owned URLs (`salemaziel/oh-my-claudecode`); keep upstream-only URLs only when a fork equivalent does not exist and note that explicitly.
 
-[Migration Guide](https://raw.githubusercontent.com/Yeachan-Heo/oh-my-claudecode/main/docs/MIGRATION.md)
+[Migration Guide](https://raw.githubusercontent.com/salemaziel/oh-my-claudecode/main/docs/MIGRATION.md)
 
 #### Version References
 

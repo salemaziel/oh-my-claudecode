@@ -1,9 +1,9 @@
 # oh-my-claudecode Quick Reference Card
-**v3.6.3 | github.com/Yeachan-Heo/oh-my-claudecode**
+**v3.6.3 | github.com/salemaziel/oh-my-claudecode**
 
 ## Install
 ```bash
-/plugin marketplace add https://github.com/Yeachan-Heo/oh-my-claudecode
+/plugin marketplace add https://github.com/salemaziel/oh-my-claudecode
 /plugin install oh-my-claudecode
 /oh-my-claudecode:omc-setup
 ```
@@ -129,9 +129,9 @@ Before claiming completion:
 - **LSP diagnostics:** Full project type checking with `lsp_diagnostics_directory`
 
 ## Resources
-- **GitHub:** github.com/Yeachan-Heo/oh-my-claudecode
+- **GitHub:** github.com/salemaziel/oh-my-claudecode
 - **Docs:** /docs/REFERENCE.md
-- **Website:** yeachan-heo.github.io/oh-my-claudecode-website
+- **Website:** yeachan-heo.github.io/oh-my-claudecode-website *(upstream docs site; TODO: replace when fork docs site is published)*
 - **NPM:** `npm i -g oh-my-claudecode`
 - **Discord:** (community support - link in GitHub)
 

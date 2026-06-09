@@ -109,7 +109,7 @@ jobs:
 
           if npm view "oh-my-claude-sisyphus@$CURRENT_PACKAGE_VERSION" version >/dev/null 2>&1; then
             GITHUB_LATEST_VERSION="$(node -e '
-              fetch("https://api.github.com/repos/Yeachan-Heo/oh-my-claudecode/releases/latest", {
+              fetch("https://api.github.com/repos/salemaziel/oh-my-claudecode/releases/latest", {
                 headers: { "User-Agent": "omc-upgrade-test" }
               })
                 .then(async response => {
