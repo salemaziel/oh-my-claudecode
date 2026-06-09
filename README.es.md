@@ -23,8 +23,8 @@
 
 **Paso 1: Instalar**
 ```bash
-/plugin marketplace add https://github.com/salemaziel/oh-my-claudecode
-/plugin install oh-my-claudecode
+/plugin marketplace add https://github.com/salemaziel/vdw-claude-plugins
+/plugin install oh-my-claudecode@vdw
 ```
 
 **Paso 2: Configurar**

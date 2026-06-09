@@ -39,7 +39,7 @@ Most users want **both**: the plugin for the in-session experience, and the npm 
 Run the following command inside Claude Code:
 
 ```bash
-/plugin marketplace add https://github.com/salemaziel/oh-my-claudecode
+/plugin marketplace add https://github.com/salemaziel/vdw-claude-plugins
 ```
 
 ### Step 2: Install the plugin
@@ -47,7 +47,7 @@ Run the following command inside Claude Code:
 After adding the marketplace, install the plugin:
 
 ```bash
-/plugin install oh-my-claudecode
+/plugin install oh-my-claudecode@vdw
 ```
 
 ### Step 2b (optional but recommended): install the terminal CLI

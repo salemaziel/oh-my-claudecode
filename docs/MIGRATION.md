@@ -364,8 +364,8 @@ npm uninstall -g oh-my-claudecode
 
 ```bash
 # In Claude Code:
-/plugin marketplace add https://github.com/salemaziel/oh-my-claudecode
-/plugin install oh-my-claudecode
+/plugin marketplace add https://github.com/salemaziel/vdw-claude-plugins
+/plugin install oh-my-claudecode@vdw
 ```
 
 > **Note**: npm/bun global installs are no longer supported. Use the plugin system.
