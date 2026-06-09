@@ -152,7 +152,7 @@ describe('auto-update reconciliation', () => {
         });
         vi.stubGlobal('fetch', fetchMock);
         await expect(fetchLatestRelease()).resolves.toEqual(release);
-        expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/releases/latest'), {
+        expect(fetchMock).toHaveBeenCalledWith('https://api.github.com/repos/Yeachan-Heo/oh-my-claudecode/releases/latest', {
             headers: {
                 'Accept': 'application/vnd.github.v3+json',
                 'User-Agent': 'oh-my-claudecode-updater',
