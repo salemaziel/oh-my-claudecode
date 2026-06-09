@@ -118,17 +118,22 @@ jobs:
                   process.stdout.write(String(release.tag_name || "").replace(/^v/, ""));
                 })
                 .catch(error => {
-                  console.error(error instanceof Error ? error.message : String(error));
-                  process.exit(1);
+                  console.error(`Unable to read GitHub latest release (${error instanceof Error ? error.message : String(error)}); using local tarball fallback.`);
+                  process.stdout.write("");
                 });
             ')"
-            echo "GitHub latest release version: $GITHUB_LATEST_VERSION"
-            if [ "$GITHUB_LATEST_VERSION" = "$CURRENT_PACKAGE_VERSION" ]; then
-              echo "OMC_UPGRADE_TEST_USE_LOCAL_TARBALL=false" >> "$GITHUB_ENV"
-              echo "Package $CURRENT_PACKAGE_VERSION is published and GitHub latest matches; testing the live omc update path."
-            else
+            if [ -z "$GITHUB_LATEST_VERSION" ]; then
               echo "OMC_UPGRADE_TEST_USE_LOCAL_TARBALL=true" >> "$GITHUB_ENV"
-              echo "Package $CURRENT_PACKAGE_VERSION is published, but GitHub latest is $GITHUB_LATEST_VERSION; testing local tarball + update-reconcile."
+              echo "GitHub latest release could not be resolved; testing local tarball + update-reconcile."
+            else
+              echo "GitHub latest release version: $GITHUB_LATEST_VERSION"
+              if [ "$GITHUB_LATEST_VERSION" = "$CURRENT_PACKAGE_VERSION" ]; then
+                echo "OMC_UPGRADE_TEST_USE_LOCAL_TARBALL=false" >> "$GITHUB_ENV"
+                echo "Package $CURRENT_PACKAGE_VERSION is published and GitHub latest matches; testing the live omc update path."
+              else
+                echo "OMC_UPGRADE_TEST_USE_LOCAL_TARBALL=true" >> "$GITHUB_ENV"
+                echo "Package $CURRENT_PACKAGE_VERSION is published, but GitHub latest is $GITHUB_LATEST_VERSION; testing local tarball + update-reconcile."
+              fi
             fi
           else
             echo "OMC_UPGRADE_TEST_USE_LOCAL_TARBALL=true" >> "$GITHUB_ENV"
