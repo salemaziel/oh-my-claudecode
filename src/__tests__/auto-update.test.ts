@@ -168,7 +168,7 @@ describe('auto-update reconciliation', () => {
     await expect(fetchLatestRelease()).resolves.toEqual(release);
 
     expect(fetchMock).toHaveBeenCalledWith(
-      expect.stringContaining('/releases/latest'),
+      'https://api.github.com/repos/Yeachan-Heo/oh-my-claudecode/releases/latest',
       {
         headers: {
           'Accept': 'application/vnd.github.v3+json',

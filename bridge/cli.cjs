@@ -12394,7 +12394,7 @@ var init_auto_update = __esm({
     init_paths();
     init_security_config();
     init_paths3();
-    REPO_OWNER = "salemaziel";
+    REPO_OWNER = "Yeachan-Heo";
     REPO_NAME = "oh-my-claudecode";
     GITHUB_API_URL = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}`;
     GITHUB_RAW_URL = `https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}`;
