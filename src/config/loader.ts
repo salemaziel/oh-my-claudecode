@@ -153,7 +153,7 @@ export function buildDefaultConfig(): PluginConfig {
       fallbackPolicy: {
         onModelFailure: "provider_chain",
         allowCrossProvider: false,
-        crossProviderOrder: ["codex", "gemini"],
+        crossProviderOrder: ["codex", "antigravity"],
       },
     },
     // Delegation routing configuration (opt-in feature for external model routing)

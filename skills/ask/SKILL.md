@@ -17,8 +17,8 @@ Examples:
 
 ```bash
 /oh-my-claudecode:ask codex "review this patch from a security perspective"
-/oh-my-claudecode:ask gemini "suggest UX improvements for this flow"
 /oh-my-claudecode:ask antigravity "suggest UX improvements for this flow"
+/oh-my-claudecode:ask gemini "suggest UX improvements for this flow"
 /oh-my-claudecode:ask claude "draft an implementation plan for issue #123"
 /oh-my-claudecode:ask cursor "apply this implementation plan"
 ```

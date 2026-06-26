@@ -525,8 +525,8 @@ claude --plugin-dir /path/to/oh-my-claudecode
 ```bash
 omc ask claude "review this patch"
 omc ask codex "review this patch from a security perspective"
-omc ask gemini --prompt "suggest UX improvements"
 omc ask antigravity --prompt "suggest UX improvements"
+omc ask gemini --prompt "suggest UX improvements"
 omc ask cursor --prompt "apply this implementation plan"
 omc ask claude --agent-prompt executor --prompt "create an implementation plan"
 ```
@@ -765,7 +765,7 @@ Marketplace/plugin installs compact the native plugin `skills/*/SKILL.md` files 
 | `autoresearch`            | Stateful single-mission evaluator-driven improvement loop           | `/oh-my-claudecode:autoresearch`            |
 | `autopilot`               | Full autonomous execution from idea to working code              | `/oh-my-claudecode:autopilot`               |
 | `cancel`                  | Unified cancellation for active modes                            | `/oh-my-claudecode:cancel`                  |
-| `ccg`                     | Tri-model workflow via `ask codex` + `ask gemini`, then Claude synthesis | `/oh-my-claudecode:ccg`                     |
+| `ccg`                     | Tri-model workflow via `ask codex` + `ask antigravity`, then Claude synthesis | `/oh-my-claudecode:ccg`                |
 | `configure-notifications` | Configure notification integrations (Telegram, Discord, Slack) via natural language | `/oh-my-claudecode:configure-notifications` |
 | `deep-dive`               | Two-stage trace → deep-interview pipeline with context handoff   | `/oh-my-claudecode:deep-dive`               |
 | `deep-interview`          | Socratic deep interview with ambiguity gating                    | `/deep-interview`                           |
@@ -947,7 +947,7 @@ Use these trigger phrases in natural language prompts to activate enhanced modes
 | `autopilot`, `build me`, `I want a`, `handle it all`, `end to end`, `e2e this` | Full autonomous execution                                                                     |
 | `deslop`, `anti-slop`, cleanup/refactor + slop smells                          | Anti-slop cleanup workflow (`ai-slop-cleaner`)                                                |
 | `ralph`, `don't stop`, `must complete`, `until done`                           | Persistence until verified complete                                                           |
-| `ccg`, `claude-codex-gemini`                                                   | Claude-Codex-Gemini orchestration (use `antigravity` when using the Antigravity CLI)         |
+| `ccg`, `claude-codex-gemini`                                                   | Claude-Codex-Antigravity orchestration (`antigravity` default; `gemini` for enterprise/API-key) |
 | `ralplan`                                                                      | Iterative planning consensus with structured deliberation (`--deliberate` for high-risk mode) |
 | `deep interview`, `ouroboros`                                                  | Deep Socratic interview with mathematical clarity gating                                      |
 | `deepsearch`, `search the codebase`, `find in codebase`                        | Codebase-focused search mode                                                                  |
