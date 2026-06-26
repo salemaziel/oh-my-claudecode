@@ -77,30 +77,31 @@ Habilita los equipos nativos de Claude Code en `~/.claude/settings.json`:
 
 > Si los equipos están desactivados, OMC te avisará y hará fallback a ejecución sin Team cuando sea posible.
 
-### Trabajadores CLI tmux — Codex & Gemini (v4.4.0+)
+### Trabajadores CLI tmux — Codex & Antigravity (v4.4.0+)
 
 **v4.4.0 elimina los servidores MCP de Codex/Gemini** (proveedores `x`, `g`). Usa `/omc-teams` para lanzar procesos CLI reales en paneles divididos de tmux:
 
 ```bash
-/omc-teams 2:codex   "review auth module for security issues"
-/omc-teams 2:gemini  "redesign UI components for accessibility"
-/omc-teams 1:claude  "implement the payment flow"
+/omc-teams 2:codex        "review auth module for security issues"
+/omc-teams 2:antigravity  "redesign UI components for accessibility"
+/omc-teams 1:claude       "implement the payment flow"
 ```
 
-Para trabajo mixto de Codex + Gemini en un solo comando, usa la habilidad **`/ccg`**:
+Para trabajo mixto de Codex + Antigravity en un solo comando, usa la habilidad **`/ccg`**:
 
 ```bash
-/ccg Review this PR — architecture (Codex) and UI components (Gemini)
+/ccg Review this PR — architecture (Codex) and UI components (Antigravity)
 ```
 
 | Habilidad | Trabajadores | Mejor Para |
 |-------|---------|----------|
 | `/omc-teams N:codex` | N paneles Codex CLI | Revisión de código, análisis de seguridad, arquitectura |
-| `/omc-teams N:gemini` | N paneles Gemini CLI | Diseño UI/UX, docs, tareas de gran contexto |
+| `/omc-teams N:antigravity` | N paneles Antigravity CLI (`agy`) | Diseño UI/UX, docs, tareas de gran contexto |
+| `/omc-teams N:gemini` | N paneles Gemini CLI | Diseño UI/UX, docs (uso empresarial/API-key) |
 | `/omc-teams N:claude` | N paneles Claude CLI | Tareas generales via Claude CLI en tmux |
-| `/ccg` | 1 Codex + 1 Gemini | Orquestación tri-modelo en paralelo |
+| `/ccg` | 1 Codex + 1 Antigravity | Orquestación tri-modelo en paralelo |
 
-Los trabajadores se inician bajo demanda y terminan cuando su tarea se completa — sin uso de recursos en espera. Requiere las CLIs `codex` / `gemini` instaladas y una sesión tmux activa.
+Los trabajadores se inician bajo demanda y terminan cuando su tarea se completa — sin uso de recursos en espera. Requiere las CLIs `codex` / `agy` (antigravity) instaladas y una sesión tmux activa.
 
 > **Nota: Nombre del paquete** — El proyecto usa la marca **oh-my-claudecode** (repositorio, plugin, comandos), pero el paquete npm se publica como [`oh-my-claude-sisyphus`](https://www.npmjs.com/package/oh-my-claude-sisyphus). Si instalas las herramientas CLI via npm/bun, usa `npm install -g oh-my-claude-sisyphus`.
 
@@ -208,8 +209,8 @@ Atajos opcionales para usuarios avanzados. El lenguaje natural funciona bien sin
 | Palabra Clave | Efecto | Ejemplo |
 |---------|--------|---------|
 | `team` | Orquestación canónica con Team | `/team 3:executor "fix all TypeScript errors"` |
-| `omc-teams` | Trabajadores CLI tmux (codex/gemini/claude) | `/omc-teams 2:codex "security review"` |
-| `ccg` | Orquestación tri-modelo Codex+Gemini | `/ccg review this PR` |
+| `omc-teams` | Trabajadores CLI tmux (codex/antigravity/claude) | `/omc-teams 2:codex "security review"` |
+| `ccg` | Orquestación tri-modelo Codex+Antigravity | `/ccg review this PR` |
 | `autopilot` | Ejecución completamente autónoma | `autopilot: build a todo app` |
 | `ralph` | Modo persistencia | `ralph: refactor auth` |
 | `ulw` | Máximo paralelismo | `ulw fix all errors` |
