@@ -264,7 +264,7 @@ describe('resolveClaudeFamily() — Bedrock inference profile IDs', () => {
         expect(resolveClaudeFamily('eu.anthropic.claude-haiku-4-5-v1:0')).toBe('HAIKU');
     });
     it('resolves bare Anthropic model IDs', () => {
-        expect(resolveClaudeFamily('claude-sonnet-4-6')).toBe('SONNET');
+        expect(resolveClaudeFamily('claude-sonnet-5')).toBe('SONNET');
         expect(resolveClaudeFamily('claude-opus-4-6')).toBe('OPUS');
         expect(resolveClaudeFamily('claude-haiku-4-5')).toBe('HAIKU');
         expect(resolveClaudeFamily('claude-fable-5')).toBe('FABLE');

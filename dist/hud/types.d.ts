@@ -71,6 +71,8 @@ export interface ActiveAgent {
     id: string;
     type: string;
     model?: string;
+    /** Native Claude Code teammate name when spawned with Agent/Task name="..." */
+    name?: string;
     description?: string;
     status: 'running' | 'completed';
     startTime: Date;
@@ -168,6 +170,8 @@ export interface RateLimits {
     enterpriseUtilization?: number;
     /** Enterprise billing currency (e.g. 'USD') */
     enterpriseCurrency?: string;
+    /** Minor-unit exponent for the billing currency (USD=2, JPY=0, BHD=3); how many decimals to render */
+    enterpriseDecimalPlaces?: number;
     /** When the enterprise billing period resets (null if unavailable or not returned by API) */
     enterpriseResetsAt?: Date | null;
 }

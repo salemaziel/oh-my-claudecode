@@ -50,6 +50,7 @@ var import_path = require("path");
 var import_os = require("os");
 
 // src/lib/worktree-paths.ts
+var WORKSPACE_MARKER = ".omc-workspace";
 var OmcPaths = {
   ROOT: ".omc",
   STATE: ".omc/state",
@@ -67,6 +68,206 @@ var OmcPaths = {
   SHARED_MEMORY: ".omc/state/shared-memory",
   DEEPINIT_MANIFEST: ".omc/deepinit-manifest.json"
 };
+var MAX_WORKTREE_CACHE_SIZE = 8;
+var worktreeCacheMap = /* @__PURE__ */ new Map();
+var toplevelCacheMap = /* @__PURE__ */ new Map();
+var workspaceCacheMap = /* @__PURE__ */ new Map();
+function findWorkspaceRoot(startDir) {
+  if (process.env.OMC_DISABLE_MULTIREPO === "1") return null;
+  const effectiveStart = startDir || process.cwd();
+  let current;
+  try {
+    current = (0, import_path2.resolve)(effectiveStart);
+  } catch {
+    return null;
+  }
+  if (workspaceCacheMap.has(current)) {
+    const cached = workspaceCacheMap.get(current) ?? null;
+    workspaceCacheMap.delete(current);
+    workspaceCacheMap.set(current, cached);
+    return cached;
+  }
+  const home = (() => {
+    try {
+      return (0, import_path2.resolve)((0, import_os2.homedir)());
+    } catch {
+      return null;
+    }
+  })();
+  let cursor = current;
+  let result = null;
+  while (true) {
+    if (home && cursor === home) break;
+    if ((0, import_fs.existsSync)((0, import_path2.join)(cursor, WORKSPACE_MARKER))) {
+      result = cursor;
+      break;
+    }
+    const parent = (0, import_path2.dirname)(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
+  }
+  if (workspaceCacheMap.size >= MAX_WORKTREE_CACHE_SIZE) {
+    const oldest = workspaceCacheMap.keys().next().value;
+    if (oldest !== void 0) workspaceCacheMap.delete(oldest);
+  }
+  workspaceCacheMap.set(current, result);
+  return result;
+}
+function readWorkspaceMarkerConfig(workspaceRoot) {
+  try {
+    const raw = (0, import_fs.readFileSync)((0, import_path2.join)(workspaceRoot, WORKSPACE_MARKER), "utf-8").trim();
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed;
+    }
+    return {};
+  } catch {
+    return {};
+  }
+}
+function resolveSuperprojectRoot(cwd) {
+  let anchor = null;
+  let probeCwd = cwd;
+  for (let depth = 0; depth < 32; depth++) {
+    let superRoot;
+    try {
+      superRoot = (0, import_child_process.execSync)("git rev-parse --show-superproject-working-tree", {
+        cwd: probeCwd,
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+        timeout: 5e3
+      }).trim();
+    } catch {
+      break;
+    }
+    if (!superRoot) break;
+    anchor = superRoot;
+    probeCwd = superRoot;
+  }
+  return anchor;
+}
+function resolveStateAnchorRoot(worktreeRoot) {
+  if (worktreeRoot) return resolveSuperprojectRoot(worktreeRoot) || worktreeRoot;
+  return getWorktreeRoot() || process.cwd();
+}
+function getGitTopLevel(cwd) {
+  const effectiveCwd = cwd || process.cwd();
+  if (toplevelCacheMap.has(effectiveCwd)) {
+    const root = toplevelCacheMap.get(effectiveCwd);
+    toplevelCacheMap.delete(effectiveCwd);
+    toplevelCacheMap.set(effectiveCwd, root);
+    return root || null;
+  }
+  try {
+    const root = (0, import_child_process.execSync)("git rev-parse --show-toplevel", {
+      cwd: effectiveCwd,
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+      timeout: 5e3
+    }).trim();
+    if (toplevelCacheMap.size >= MAX_WORKTREE_CACHE_SIZE) {
+      const oldest = toplevelCacheMap.keys().next().value;
+      if (oldest !== void 0) toplevelCacheMap.delete(oldest);
+    }
+    toplevelCacheMap.set(effectiveCwd, root);
+    return root;
+  } catch {
+    return null;
+  }
+}
+function getWorktreeRoot(cwd) {
+  const effectiveCwd = cwd || process.cwd();
+  if (worktreeCacheMap.has(effectiveCwd)) {
+    const root2 = worktreeCacheMap.get(effectiveCwd);
+    worktreeCacheMap.delete(effectiveCwd);
+    worktreeCacheMap.set(effectiveCwd, root2);
+    return root2 || null;
+  }
+  const root = resolveSuperprojectRoot(effectiveCwd) || getGitTopLevel(effectiveCwd);
+  if (!root) {
+    return null;
+  }
+  if (worktreeCacheMap.size >= MAX_WORKTREE_CACHE_SIZE) {
+    const oldest = worktreeCacheMap.keys().next().value;
+    if (oldest !== void 0) {
+      worktreeCacheMap.delete(oldest);
+    }
+  }
+  worktreeCacheMap.set(effectiveCwd, root);
+  return root;
+}
+var dualDirWarnings = /* @__PURE__ */ new Set();
+function getProjectIdentifier(worktreeRoot) {
+  const root = worktreeRoot || getGitTopLevel() || process.cwd();
+  const workspaceRoot = findWorkspaceRoot(root);
+  if (workspaceRoot) {
+    const cfg = readWorkspaceMarkerConfig(workspaceRoot);
+    if (cfg.id && typeof cfg.id === "string" && cfg.id.trim()) {
+      const safeId = cfg.id.trim().replace(/[^a-zA-Z0-9_-]/g, "_");
+      const hash3 = (0, import_crypto.createHash)("sha256").update(safeId).digest("hex").slice(0, 16);
+      return `${safeId}-${hash3}`;
+    }
+    const hash2 = (0, import_crypto.createHash)("sha256").update(workspaceRoot).digest("hex").slice(0, 16);
+    const dirName2 = (0, import_path2.basename)(workspaceRoot).replace(/[^a-zA-Z0-9_-]/g, "_");
+    return `${dirName2}-${hash2}`;
+  }
+  let source;
+  try {
+    const remoteUrl = (0, import_child_process.execSync)("git remote get-url origin", {
+      cwd: root,
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"]
+    }).trim();
+    source = remoteUrl || root;
+  } catch {
+    source = root;
+  }
+  let primaryRoot = root;
+  try {
+    const commonDir = (0, import_child_process.execSync)("git rev-parse --path-format=absolute --git-common-dir", {
+      cwd: root,
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+      timeout: 5e3
+    }).trim();
+    const isGitDir = (0, import_path2.basename)(commonDir) === ".git";
+    const isSubmodule = commonDir.includes(`${import_path2.sep}.git${import_path2.sep}modules`);
+    if (isGitDir && !isSubmodule) {
+      const resolved = (0, import_path2.dirname)(commonDir);
+      if (resolved && resolved !== root) {
+        primaryRoot = resolved;
+      }
+    }
+  } catch {
+  }
+  const hash = (0, import_crypto.createHash)("sha256").update(source).digest("hex").slice(0, 16);
+  const dirName = (0, import_path2.basename)(primaryRoot).replace(/[^a-zA-Z0-9_-]/g, "_");
+  return `${dirName}-${hash}`;
+}
+function getOmcRoot(worktreeRoot) {
+  const customDir = process.env.OMC_STATE_DIR;
+  if (customDir) {
+    const root2 = worktreeRoot || getGitTopLevel() || process.cwd();
+    const projectId = getProjectIdentifier(root2);
+    const centralizedPath = (0, import_path2.join)(customDir, projectId);
+    const legacyPath = (0, import_path2.join)(root2, OmcPaths.ROOT);
+    const warningKey = `${legacyPath}:${centralizedPath}`;
+    if (!dualDirWarnings.has(warningKey) && (0, import_fs.existsSync)(legacyPath) && (0, import_fs.existsSync)(centralizedPath)) {
+      dualDirWarnings.add(warningKey);
+      console.warn(
+        `[omc] Both legacy state dir (${legacyPath}) and centralized state dir (${centralizedPath}) exist. Using centralized dir. Consider migrating data from the legacy dir and removing it.`
+      );
+    }
+    return centralizedPath;
+  }
+  const workspaceAnchor = findWorkspaceRoot(worktreeRoot);
+  if (workspaceAnchor) {
+    return (0, import_path2.join)(workspaceAnchor, OmcPaths.ROOT);
+  }
+  const root = resolveStateAnchorRoot(worktreeRoot);
+  return (0, import_path2.join)(root, OmcPaths.ROOT);
+}
 
 // src/hooks/learner/parser.ts
 function parseYamlMetadata(yamlContent) {
@@ -284,9 +485,8 @@ function summarizeSkillContent(content) {
   const firstUsefulLine = content.split(/\r?\n/).map((line) => line.replace(/^#+\s*/, "").trim()).find((line) => line && !line.startsWith("---"));
   return (firstUsefulLine || content.replace(/\s+/g, " ").trim()).slice(0, 240);
 }
-var STATE_FILE = `${OmcPaths.STATE}/skill-sessions.json`;
 function getStateFilePath(projectRoot) {
-  return (0, import_path3.join)(projectRoot, STATE_FILE);
+  return (0, import_path3.join)(getOmcRoot(projectRoot), "state", "skill-sessions.json");
 }
 function readSessionState(projectRoot) {
   const stateFile = getStateFilePath(projectRoot);

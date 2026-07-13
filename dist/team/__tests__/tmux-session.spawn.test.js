@@ -8,17 +8,47 @@ const mockedCalls = vi.hoisted(() => ({
     wrapLiteralCapture: false,
     insertWrapSpaces: false,
     enterSubmitsCommand: true,
+    submitClearsAfterCaptures: 0,
+    delayedSubmitCapturesRemaining: null,
+    delayedSubmitReplacement: '',
+    cmuxFailOnce: [],
+    cmuxFailures: [],
 }));
 vi.mock('child_process', async (importOriginal) => {
     const actual = await importOriginal();
     const execFileMock = vi.fn((_cmd, args, cb) => {
         mockedCalls.cmuxArgs.push(args);
+        const command = args[0] ?? '';
+        const failureIndex = mockedCalls.cmuxFailures.findIndex(failure => failure.command === command);
+        if (failureIndex >= 0) {
+            const [failure] = mockedCalls.cmuxFailures.splice(failureIndex, 1);
+            const error = new Error(failure?.message ?? `cmux ${command} failed`);
+            cb(error, '', failure?.message ?? `cmux ${command} failed`);
+            return {};
+        }
+        const failIndex = mockedCalls.cmuxFailOnce.indexOf(command);
+        if (failIndex >= 0) {
+            mockedCalls.cmuxFailOnce.splice(failIndex, 1);
+            cb(new Error(`cmux ${command} failed`), '', `cmux ${command} failed`);
+            return {};
+        }
         cb(null, '', '');
         return {};
     });
     const promisifyCustom = Symbol.for('nodejs.util.promisify.custom');
     execFileMock[promisifyCustom] = async (_cmd, args) => {
         mockedCalls.cmuxArgs.push(args);
+        const command = args[0] ?? '';
+        const failureIndex = mockedCalls.cmuxFailures.findIndex(failure => failure.command === command);
+        if (failureIndex >= 0) {
+            const [failure] = mockedCalls.cmuxFailures.splice(failureIndex, 1);
+            throw new Error(failure?.message ?? `cmux ${command} failed`);
+        }
+        const failIndex = mockedCalls.cmuxFailOnce.indexOf(command);
+        if (failIndex >= 0) {
+            mockedCalls.cmuxFailOnce.splice(failIndex, 1);
+            throw new Error(`cmux ${command} failed`);
+        }
         return { stdout: '', stderr: '' };
     };
     return {
@@ -37,6 +67,16 @@ vi.mock('../../cli/tmux-utils.js', async (importOriginal) => {
         tmuxExecAsync: vi.fn(async (args) => {
             mockedCalls.tmuxArgs.push(args);
             if (args[0] === 'capture-pane') {
+                if (mockedCalls.delayedSubmitCapturesRemaining !== null) {
+                    if (mockedCalls.delayedSubmitCapturesRemaining <= 0) {
+                        mockedCalls.paneCapture = mockedCalls.delayedSubmitReplacement;
+                        mockedCalls.delayedSubmitCapturesRemaining = null;
+                        mockedCalls.delayedSubmitReplacement = '';
+                    }
+                    else {
+                        mockedCalls.delayedSubmitCapturesRemaining -= 1;
+                    }
+                }
                 const stdout = args.includes('-J')
                     ? mockedCalls.paneCapture.replace(/\n/g, mockedCalls.insertWrapSpaces ? ' ' : '')
                     : mockedCalls.paneCapture;
@@ -49,9 +89,16 @@ vi.mock('../../cli/tmux-utils.js', async (importOriginal) => {
                     : literal;
             }
             if (args[0] === 'send-keys' && args.at(-1) === 'Enter' && mockedCalls.enterSubmitsCommand) {
-                mockedCalls.paneCapture = mockedCalls.paneCapture.includes('cursor-agent')
+                const replacement = mockedCalls.paneCapture.includes('cursor-agent')
                     ? 'cursor-agent ready\n'
                     : '';
+                if (mockedCalls.submitClearsAfterCaptures > 0) {
+                    mockedCalls.delayedSubmitCapturesRemaining = mockedCalls.submitClearsAfterCaptures;
+                    mockedCalls.delayedSubmitReplacement = replacement;
+                }
+                else {
+                    mockedCalls.paneCapture = replacement;
+                }
             }
             return { stdout: '', stderr: '' };
         }),
@@ -67,6 +114,7 @@ vi.mock('../../cli/tmux-utils.js', async (importOriginal) => {
 import { sendTeamPaneKey, spawnBridgeInSession, spawnWorkerInPane } from '../tmux-session.js';
 describe('spawnWorkerInPane', () => {
     beforeEach(() => {
+        vi.useRealTimers();
         mockedCalls.tmuxArgs = [];
         mockedCalls.cmuxArgs = [];
         mockedCalls.paneCapture = '';
@@ -74,8 +122,13 @@ describe('spawnWorkerInPane', () => {
         mockedCalls.echoOnLiteralSend = true;
         mockedCalls.wrapLiteralCapture = false;
         mockedCalls.insertWrapSpaces = false;
+        mockedCalls.cmuxFailOnce = [];
+        mockedCalls.cmuxFailures = [];
         vi.unstubAllEnvs();
         mockedCalls.enterSubmitsCommand = true;
+        mockedCalls.submitClearsAfterCaptures = 0;
+        mockedCalls.delayedSubmitCapturesRemaining = null;
+        mockedCalls.delayedSubmitReplacement = '';
     });
     it('uses argv-style launch with literal tmux send-keys', async () => {
         await spawnWorkerInPane('session:0', '%2', {
@@ -97,7 +150,7 @@ describe('spawnWorkerInPane', () => {
         expect(launchLine).toContain("'gpt-5;touch /tmp/pwn'");
         expect(launchLine).not.toContain('exec codex --full-auto');
     });
-    it('sends cmux worker command text and submits with send-key', async () => {
+    it('sends cmux worker command text to the target surface and submits with send-key-surface', async () => {
         vi.stubEnv('TMUX', '');
         vi.stubEnv('CMUX_SURFACE_ID', 'cmux-leader');
         await spawnWorkerInPane('cmux:workspace-1', 'cmux-worker-1', {
@@ -113,12 +166,12 @@ describe('spawnWorkerInPane', () => {
         });
         expect(mockedCalls.tmuxArgs.some((args) => args[0] === 'send-keys')).toBe(false);
         expect(mockedCalls.cmuxArgs).toHaveLength(2);
-        expect(mockedCalls.cmuxArgs[0]).toEqual(expect.arrayContaining(['send', '--surface', 'cmux-worker-1']));
-        expect(mockedCalls.cmuxArgs[0]?.[0]).toBe('send');
+        expect(mockedCalls.cmuxArgs[0]).toEqual(expect.arrayContaining(['send-surface', '--surface', 'cmux-worker-1']));
+        expect(mockedCalls.cmuxArgs[0]?.[0]).toBe('send-surface');
         expect(mockedCalls.cmuxArgs[0]?.at(-1)).toContain('exec "$@"');
-        expect(mockedCalls.cmuxArgs[1]).toEqual(['send-key', '--surface', 'cmux-worker-1', 'Enter']);
+        expect(mockedCalls.cmuxArgs[1]).toEqual(['send-key-surface', '--surface', 'cmux-worker-1', 'enter']);
     });
-    it('uses cmux send-key semantics for Enter and control keys', async () => {
+    it('uses cmux send-key-surface semantics for Enter and control keys', async () => {
         vi.stubEnv('TMUX', '');
         vi.stubEnv('CMUX_SURFACE_ID', 'cmux-leader');
         await sendTeamPaneKey('cmux-worker-1', 'Enter');
@@ -127,11 +180,127 @@ describe('spawnWorkerInPane', () => {
         await sendTeamPaneKey('cmux-worker-1', 'C-u');
         expect(mockedCalls.tmuxArgs.some((args) => args[0] === 'send-keys')).toBe(false);
         expect(mockedCalls.cmuxArgs).toEqual([
-            ['send-key', '--surface', 'cmux-worker-1', 'Enter'],
-            ['send-key', '--surface', 'cmux-worker-1', 'Tab'],
-            ['send-key', '--surface', 'cmux-worker-1', 'C-m'],
-            ['send-key', '--surface', 'cmux-worker-1', 'C-u'],
+            ['send-key-surface', '--surface', 'cmux-worker-1', 'enter'],
+            ['send-key-surface', '--surface', 'cmux-worker-1', 'tab'],
+            ['send-key-surface', '--surface', 'cmux-worker-1', 'C-m'],
+            ['send-key-surface', '--surface', 'cmux-worker-1', 'C-u'],
         ]);
+    });
+    it('falls back to legacy cmux surface commands when current dialect is unavailable', async () => {
+        vi.stubEnv('TMUX', '');
+        vi.stubEnv('CMUX_SURFACE_ID', 'cmux-leader');
+        mockedCalls.cmuxFailures = [
+            { command: 'send-surface', message: 'error: unrecognized subcommand send-surface' },
+            { command: 'send-key-surface', message: 'error: unrecognized subcommand send-key-surface' },
+        ];
+        await spawnWorkerInPane('cmux:workspace-1', 'cmux-worker-1', {
+            teamName: 'safe-team',
+            workerName: 'worker-1',
+            envVars: {
+                OMC_TEAM_NAME: 'safe-team',
+                OMC_TEAM_WORKER: 'safe-team/worker-1',
+            },
+            launchBinary: 'codex',
+            launchArgs: ['--full-auto'],
+            cwd: '/tmp',
+        });
+        expect(mockedCalls.cmuxArgs[0]?.[0]).toBe('send-surface');
+        expect(mockedCalls.cmuxArgs[1]?.[0]).toBe('send');
+        expect(mockedCalls.cmuxArgs[2]?.[0]).toBe('send-key-surface');
+        expect(mockedCalls.cmuxArgs[3]).toEqual(['send-key', '--surface', 'cmux-worker-1', 'Enter']);
+    });
+    it('falls back for clap-style cmux surface option dialect errors', async () => {
+        vi.stubEnv('TMUX', '');
+        vi.stubEnv('CMUX_SURFACE_ID', 'cmux-leader');
+        mockedCalls.cmuxFailures = [
+            { command: 'send-surface', message: "error: Found argument '--surface' which wasn't expected" },
+        ];
+        await spawnWorkerInPane('cmux:workspace-1', 'cmux-worker-1', {
+            teamName: 'safe-team',
+            workerName: 'worker-1',
+            envVars: {
+                OMC_TEAM_NAME: 'safe-team',
+                OMC_TEAM_WORKER: 'safe-team/worker-1',
+            },
+            launchBinary: 'codex',
+            launchArgs: ['--full-auto'],
+            cwd: '/tmp',
+        });
+        expect(mockedCalls.cmuxArgs[0]?.[0]).toBe('send-surface');
+        expect(mockedCalls.cmuxArgs[1]?.[0]).toBe('send');
+        expect(mockedCalls.cmuxArgs[2]?.[0]).toBe('send-key-surface');
+    });
+    it('does not replay cmux worker command text after a non-dialect send failure', async () => {
+        vi.stubEnv('TMUX', '');
+        vi.stubEnv('CMUX_SURFACE_ID', 'cmux-leader');
+        const secret = 'SECRET_TOKEN_SHOULD_NOT_LEAK';
+        mockedCalls.cmuxFailures = [
+            { command: 'send-surface', message: `cmux transport timed out after partial write --api-key ${secret}` },
+        ];
+        await expect(async () => {
+            try {
+                await spawnWorkerInPane('cmux:workspace-1', 'cmux-worker-1', {
+                    teamName: 'safe-team',
+                    workerName: 'worker-1',
+                    envVars: {
+                        OMC_TEAM_NAME: 'safe-team',
+                        OMC_TEAM_WORKER: 'safe-team/worker-1',
+                        SECRET_ENV: secret,
+                    },
+                    launchBinary: 'codex',
+                    launchArgs: ['--full-auto', '--api-key', secret],
+                    cwd: '/tmp',
+                });
+            }
+            catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                expect(message).toContain('cmux command failed for current form: current=send-surface');
+                expect(message).toContain('cmux transport timed out after partial write');
+                expect(message).not.toContain(secret);
+                expect(message).not.toContain('SECRET_ENV');
+                expect(message).not.toContain('--api-key');
+                throw error;
+            }
+        }).rejects.toThrow(/cmux command failed for current form/);
+        expect(mockedCalls.cmuxArgs).toHaveLength(1);
+        expect(mockedCalls.cmuxArgs[0]?.[0]).toBe('send-surface');
+        expect(mockedCalls.cmuxArgs.some(args => args[0] === 'send')).toBe(false);
+        expect(mockedCalls.cmuxArgs.some(args => args[0] === 'send-key-surface')).toBe(false);
+    });
+    it('redacts cmux command payloads when current and legacy dialects both fail', async () => {
+        vi.stubEnv('TMUX', '');
+        vi.stubEnv('CMUX_SURFACE_ID', 'cmux-leader');
+        const secret = 'SECRET_TOKEN_SHOULD_NOT_LEAK';
+        mockedCalls.cmuxFailures = [
+            { command: 'send-surface', message: `error: unrecognized subcommand send-surface ${secret}` },
+            { command: 'send', message: `legacy rejected command containing ${secret}` },
+        ];
+        await expect(async () => {
+            try {
+                await spawnWorkerInPane('cmux:workspace-1', 'cmux-worker-1', {
+                    teamName: 'safe-team',
+                    workerName: 'worker-1',
+                    envVars: {
+                        OMC_TEAM_NAME: 'safe-team',
+                        OMC_TEAM_WORKER: 'safe-team/worker-1',
+                        SECRET_ENV: secret,
+                    },
+                    launchBinary: 'codex',
+                    launchArgs: ['--full-auto', '--api-key', secret],
+                    cwd: '/tmp',
+                });
+            }
+            catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                expect(message).toContain('cmux command failed for both current and legacy forms');
+                expect(message).not.toContain(secret);
+                expect(message).not.toContain('SECRET_ENV');
+                expect(message).not.toContain('--api-key');
+                expect(message).toContain('current=send-surface');
+                expect(message).toContain('legacy=send');
+                throw error;
+            }
+        }).rejects.toThrow(/cmux command failed for both current and legacy forms/);
     });
     it('uses current JS runtime when launching bridge-entry helpers', () => {
         spawnBridgeInSession('session:0', '/tmp/bridge-entry.js', '/tmp/bridge-config.json');
@@ -212,8 +381,29 @@ describe('spawnWorkerInPane', () => {
         expect(enterSend).toBeDefined();
         expect(mockedCalls.paneCapture).toBe('cursor-agent ready\n');
     });
+    it('waits for slow tmux alt-screen repaint before treating worker start submit as failed', async () => {
+        vi.useFakeTimers();
+        mockedCalls.submitClearsAfterCaptures = 6;
+        const start = spawnWorkerInPane('session:0', '%2', {
+            teamName: 'safe-team',
+            workerName: 'worker-1',
+            envVars: {
+                OMC_TEAM_NAME: 'safe-team',
+                OMC_TEAM_WORKER: 'safe-team/worker-1',
+            },
+            launchBinary: 'claude',
+            launchArgs: ['--dangerously-skip-permissions'],
+            cwd: '/tmp',
+        });
+        await vi.advanceTimersByTimeAsync(2_000);
+        await expect(start).resolves.toBeUndefined();
+        const submitVerificationCaptures = mockedCalls.tmuxArgs.filter((args) => args[0] === 'capture-pane' && args.includes('-J'));
+        expect(submitVerificationCaptures.length).toBeGreaterThan(5);
+        vi.useRealTimers();
+    });
     it('fails loudly when a single Cursor worker start command remains unsubmitted after Enter', async () => {
         mockedCalls.enterSubmitsCommand = false;
+        vi.stubEnv('OMC_TEAM_START_SUBMIT_TIMEOUT_MS', '200');
         await expect(spawnWorkerInPane('session:0', '%2', {
             teamName: 'safe-team',
             workerName: 'worker-1',

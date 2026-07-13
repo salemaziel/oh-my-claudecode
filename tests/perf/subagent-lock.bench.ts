@@ -2,14 +2,16 @@
  * Benchmark: subagent-tracking RMW latency under no contention.
  *
  * Measures per-update wall time for sequential updates. Local Linux keeps the
- * strict p99 <= 8ms guard; CI runners use repeated samples and a wider p99
+ * strict p99 <= 8ms guard; CI runners use repeated samples and a wider p50/p99
  * envelope so an isolated scheduler/filesystem stall does not fail dev, while
- * still catching sustained lock slowdowns and hangs.
+ * still catching sustained lock slowdowns and hangs (median-p50, median-p99,
+ * and max-p99 ceilings). GitHub-hosted runners routinely sustain ~23-31ms p50
+ * / ~30-32ms p99 on a healthy path, so the CI ceilings sit above that band.
  */
 
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { performance } from "perf_hooks";
-import { mkdirSync, rmSync } from "fs";
+import { mkdirSync, readFileSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import {
@@ -17,14 +19,23 @@ import {
   executeFlush,
   type SubagentTrackingState,
 } from "../../src/hooks/subagent-tracker/index.js";
+import {
+  clearWorktreeCache,
+  resolveSessionStatePaths,
+} from "../../src/lib/worktree-paths.js";
 
 const N = 100;
+const TRACKING_STATE_NAME = "subagent-tracking";
 const WARMUP_RUNS = 1;
 const MEASURED_RUNS = 5;
 const LOCAL_P99_LIMIT_MS = 8;
-const CI_MEDIAN_P50_LIMIT_MS = 8;
+// CI ceilings sit above the GitHub-hosted runner steady-state band (p50
+// ~23-31ms, p99 ~30-32ms) so healthy runs pass, while still catching sustained
+// slowdowns/hangs via the median-p50, median-p99, and max-p99 guards. The
+// strict 8ms target is kept for LOCAL runs only (LOCAL_P99_LIMIT_MS). See #3352.
+const CI_MEDIAN_P50_LIMIT_MS = 40;
 const CI_MEDIAN_P99_LIMIT_MS = 25;
-const CI_MEDIAN_P99_JITTER_MARGIN_MS = 5;
+const CI_MEDIAN_P99_JITTER_MARGIN_MS = 20;
 const CI_MAX_P99_LIMIT_MS = 100;
 const isCi = process.env.CI === "true" || process.env.CI === "1";
 
@@ -67,6 +78,9 @@ function median(values: number[]): number {
 
 describe("subagent-lock benchmark", () => {
   const dirs: string[] = [];
+  beforeEach(() => {
+    clearWorktreeCache();
+  });
 
   afterEach(() => {
     flushPendingWrites();
@@ -74,6 +88,7 @@ describe("subagent-lock benchmark", () => {
       try { rmSync(d, { recursive: true, force: true }); } catch { /* ignore */ }
     }
     dirs.length = 0;
+    clearWorktreeCache();
   });
 
   function makeTempDir(): string {
@@ -82,6 +97,31 @@ describe("subagent-lock benchmark", () => {
     mkdirSync(join(dir, ".omc", "state"), { recursive: true });
     dirs.push(dir);
     return dir;
+  }
+
+  function assertPersistedRun(
+    dir: string,
+    sessionId: string,
+    expectedAgents: number,
+  ): void {
+    const statePath = resolveSessionStatePaths(
+      TRACKING_STATE_NAME,
+      sessionId,
+      dir,
+    ).effectiveWrite;
+    const persisted = JSON.parse(
+      readFileSync(statePath, "utf8"),
+    ) as SubagentTrackingState;
+    const actualAgentIds = persisted.agents
+      .map((agent) => agent.agent_id)
+      .sort();
+    const expectedAgentIds = Array.from(
+      { length: expectedAgents },
+      (_value, index) => `agent-${index}`,
+    ).sort();
+
+    expect(persisted.total_spawned).toBe(expectedAgents);
+    expect(actualAgentIds).toEqual(expectedAgentIds);
   }
 
   /**
@@ -104,10 +144,14 @@ describe("subagent-lock benchmark", () => {
 
       const t0 = performance.now();
       // executeFlush does the full RMW critical section under lock
-      executeFlush(dir, state, sessionId);
+      const succeeded = executeFlush(dir, state, sessionId);
       const elapsed = performance.now() - t0;
+      expect(succeeded, `locked RMW update ${i} must succeed`).toBe(true);
       samples.push(elapsed);
     }
+
+    // Persistence validation is intentionally outside every timed interval.
+    assertPersistedRun(dir, sessionId, N);
 
     return samples.slice().sort((a, b) => a - b);
   }
@@ -124,6 +168,36 @@ describe("subagent-lock benchmark", () => {
 
     return summaries;
   }
+
+  it("rejects a successful flush when the expected state was not persisted", () => {
+    const dir = makeTempDir();
+    const sessionId = `bench-write-failure-${Date.now()}`;
+    const statePath = resolveSessionStatePaths(
+      TRACKING_STATE_NAME,
+      sessionId,
+      dir,
+    ).effectiveWrite;
+    mkdirSync(statePath, { recursive: true });
+
+    const state = makeEmptyState();
+    state.agents.push({
+      agent_id: "agent-0",
+      agent_type: "oh-my-claudecode:executor",
+      started_at: new Date().toISOString(),
+      parent_mode: "ultrawork",
+      status: "running",
+      task_description: "write-failure",
+    });
+    state.total_spawned = 1;
+
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(executeFlush(dir, state, sessionId)).toBe(true);
+      expect(() => assertPersistedRun(dir, sessionId, 1)).toThrow();
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
 
   // Linux hard assertion with CI-noise-tolerant aggregation.
   it.runIf(process.platform === "linux")(
