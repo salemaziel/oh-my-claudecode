@@ -96,6 +96,16 @@ export declare function spawnBridgeInSession(tmuxSession: string, bridgeScriptPa
  * createTeamSession() already branches this way for panes created up front; the
  * on-demand worker spawns in both team runtimes must do the same. (#3267)
  */
+export interface WorkerPaneSplitEvidence {
+    commandSucceeded: boolean;
+    provider: 'tmux' | 'cmux';
+    splitTarget: string;
+    direction: 'right' | 'down';
+    rawOutput: string;
+    stderr: string;
+    paneId: string | null;
+}
+export declare function splitTeamWorkerPaneWithEvidence(splitTarget: string, direction: 'right' | 'down', cwd: string): Promise<WorkerPaneSplitEvidence>;
 export declare function splitTeamWorkerPane(splitTarget: string, direction: 'right' | 'down', cwd: string): Promise<string | null>;
 export declare function createTeamSession(teamName: string, workerCount: number, cwd: string, options?: CreateTeamSessionOptions): Promise<TeamSession>;
 /**

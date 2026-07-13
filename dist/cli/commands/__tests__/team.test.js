@@ -24,12 +24,13 @@ async function initTeamState(teamName, wd) {
     await mkdir(join(base, 'mailbox'), { recursive: true });
     await mkdir(join(base, 'events'), { recursive: true });
     await writeFile(join(base, 'config.json'), JSON.stringify({
-        team_name: teamName,
+        name: teamName,
         task: 'test',
         agent_type: 'executor',
         worker_count: 1,
         workers: [{ name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [] }],
         created_at: new Date().toISOString(),
+        tmux_session: 'test-session:0',
     }));
 }
 describe('teamCommand help output', () => {
@@ -162,14 +163,34 @@ describe('teamCommand api operations', () => {
     });
     it('blocks team start when running inside worker context', async () => {
         const previousWorker = process.env.OMC_TEAM_WORKER;
+        const errors = [];
+        const originalError = console.error;
         try {
+            console.error = (...args) => errors.push(args.map(String).join(' '));
             process.env.OMC_TEAM_WORKER = 'demo-team/worker-1';
             const logs = await captureLog(() => teamCommand(['1:executor', 'do work']));
-            expect(logs[0]).toContain('omc team [N:agent-type[:role]]');
+            expect(logs.join('\n')).not.toContain('Usage: omc team');
+            expect(errors.join('\n')).toContain('nested_teams_allowed is false');
             expect(process.exitCode).toBe(1);
         }
         finally {
+            console.error = originalError;
             process.env.OMC_TEAM_WORKER = previousWorker;
+            process.exitCode = 0;
+        }
+    });
+    it('reports malformed worker specs without dumping generic team usage', async () => {
+        const errors = [];
+        const originalError = console.error;
+        try {
+            console.error = (...args) => errors.push(args.map(String).join(' '));
+            const logs = await captureLog(() => teamCommand(['1:claude:executor:extra', 'do work']));
+            expect(errors.join('\n')).toContain('Invalid worker spec "1:claude:executor:extra"');
+            expect(logs.join('\n')).not.toContain('Usage: omc team');
+            expect(process.exitCode).toBe(1);
+        }
+        finally {
+            console.error = originalError;
             process.exitCode = 0;
         }
     });
@@ -184,6 +205,7 @@ describe('teamCommand api operations', () => {
             worker_count: 1,
             workers: [{ name: 'worker-1', index: 1, role: 'claude', assigned_tasks: [] }],
             created_at: new Date().toISOString(),
+            tmux_session: 'stale-session:0',
             next_task_id: 1,
         }, null, 2));
         delete process.env.OMC_TEAM_WORKER;

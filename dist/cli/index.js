@@ -22,7 +22,9 @@ import { install as installOmc, isInstalled, getInstallInfo } from '../installer
 import { waitCommand, waitStatusCommand, waitDaemonCommand, waitDetectCommand } from './commands/wait.js';
 import { doctorConflictsCommand } from './commands/doctor-conflicts.js';
 import { doctorTeamRoutingCommand } from './commands/doctor-team-routing.js';
+import { capabilitiesCheckCommand, capabilitiesLockCommand } from './commands/capabilities.js';
 import { sessionSearchCommand } from './commands/session-search.js';
+import { sessionFrictionReportCommand } from './commands/session-friction-report.js';
 import { teamCommand } from './commands/team.js';
 import { ralphthonCommand } from './commands/ralphthon.js';
 import { ultragoalCommand, ULTRAGOAL_HELP } from './commands/ultragoal.js';
@@ -1034,7 +1036,9 @@ const sessionCmd = program
 Examples:
   $ omc session search "team leader stale"
   $ omc session search notify-hook --since 7d
-  $ omc session search provider-routing --project all --json`);
+  $ omc session search provider-routing --project all --json
+  $ omc session friction report --since 24h
+  $ omc session friction report --json`);
 sessionCmd
     .command('search <query>')
     .description('Search prior local session transcripts and OMC session artifacts')
@@ -1056,6 +1060,55 @@ sessionCmd
         context: parseInt(options.context, 10),
         workingDirectory: process.cwd(),
     });
+});
+sessionCmd
+    .command('friction')
+    .description('Report local session context-bloat and operator-friction signals')
+    .command('report')
+    .description('Summarize local session/context bloat and friction without raw prompt content')
+    .option('-l, --limit <number>', 'Maximum number of sessions to return', '10')
+    .option('-s, --session <id>', 'Restrict report to a specific session id')
+    .option('--since <duration|date>', 'Only include artifacts since a duration (e.g. 7d, 24h) or absolute date')
+    .option('--project <scope>', 'Project scope. Defaults to current project. Use "all" to inspect all local projects')
+    .option('--json', 'Output report as JSON')
+    .action(async (options) => {
+    await sessionFrictionReportCommand({
+        limit: parseInt(options.limit, 10),
+        session: options.session,
+        since: options.since,
+        project: options.project,
+        json: options.json,
+        workingDirectory: process.cwd(),
+    });
+});
+/**
+ * Capabilities command - deterministic tool/skill/capability lockfile preflight
+ */
+const capabilitiesCmd = program
+    .command('capabilities')
+    .description('Create or verify deterministic tool/skill/capability lockfiles')
+    .addHelpText('after', `
+Examples:
+  $ omc capabilities lock
+  $ omc capabilities lock --json --lockfile .omc/capabilities.lock.json
+  $ omc capabilities check --json`);
+capabilitiesCmd
+    .command('lock')
+    .description('Write the current deterministic tool/skill/capability lockfile')
+    .option('--json', 'Output as JSON')
+    .option('--lockfile <path>', 'Lockfile path (default: omc-capabilities.lock.json)')
+    .action(async (options) => {
+    const exitCode = await capabilitiesLockCommand(options);
+    process.exit(exitCode);
+});
+capabilitiesCmd
+    .command('check')
+    .description('Check current deterministic tool/skill/capability surface against a lockfile')
+    .option('--json', 'Output as JSON')
+    .option('--lockfile <path>', 'Lockfile path (default: omc-capabilities.lock.json)')
+    .action(async (options) => {
+    const exitCode = await capabilitiesCheckCommand(options);
+    process.exit(exitCode);
 });
 /**
  * Doctor command - Diagnostic tools

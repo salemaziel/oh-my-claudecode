@@ -133,7 +133,7 @@ const CONTRACTS = {
             if (model) {
                 // Provider-specific model IDs (Bedrock, Vertex) must be passed as-is.
                 // Normalizing them to aliases like "sonnet" causes Claude Code to expand
-                // them to Anthropic API names (claude-sonnet-4-6) which are invalid on
+                // them to Anthropic API names (claude-sonnet-5) which are invalid on
                 // these providers. (issue #1695)
                 const resolved = isProviderSpecificModelId(model) ? model : normalizeToCcAlias(model);
                 args.push('--model', resolved);
@@ -337,6 +337,36 @@ export function buildWorkerArgv(agentType, config) {
     const args = buildLaunchArgs(agentType, config);
     return [binary, ...args];
 }
+export function validateWorkerLaunchDescriptor(value) {
+    const descriptor = value;
+    if (!descriptor || descriptor.schema_version !== 1
+        || typeof descriptor.provider !== 'string'
+        || !Object.prototype.hasOwnProperty.call(descriptor, 'model')
+        || (descriptor.model !== null && (typeof descriptor.model !== 'string' || descriptor.model.length === 0))
+        || typeof descriptor.binary !== 'string' || descriptor.binary.length === 0 || descriptor.binary.includes('\0')
+        || !(isAbsolute(descriptor.binary) || win32Path.isAbsolute(descriptor.binary))
+        || !Array.isArray(descriptor.args) || descriptor.args.some(arg => typeof arg !== 'string' || arg.includes('\0'))) {
+        throw new Error('Invalid worker launch descriptor');
+    }
+    getContract(descriptor.provider);
+    return {
+        schema_version: 1,
+        provider: descriptor.provider,
+        model: descriptor.model,
+        binary: descriptor.binary,
+        args: [...descriptor.args],
+    };
+}
+export function buildValidatedWorkerLaunchDescriptor(agentType, config, appendedArgs = []) {
+    const [binary, ...args] = buildWorkerArgv(agentType, config);
+    return validateWorkerLaunchDescriptor({
+        schema_version: 1,
+        provider: agentType,
+        model: config.model ?? null,
+        binary,
+        args: [...args, ...appendedArgs],
+    });
+}
 export function buildWorkerCommand(agentType, config) {
     return buildWorkerArgv(agentType, config)
         .map((part) => `'${part.replace(/'/g, `'\"'\"'`)}'`)
@@ -396,7 +426,7 @@ export function isPromptModeAgent(agentType) {
  *
  * When running on a non-standard provider (Bedrock, Vertex), workers need
  * the provider-specific model ID passed explicitly via --model. Without it,
- * Claude Code falls back to its built-in default (claude-sonnet-4-6) which
+ * Claude Code falls back to its built-in default (claude-sonnet-5) which
  * is invalid on these providers.
  *
  * Resolution order:

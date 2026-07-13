@@ -9,7 +9,7 @@ English (US) | [Español (LatAm)](README.es.md)
 [![GitHub stars](https://img.shields.io/github/stars/salemaziel/oh-my-claudecode?style=flat&color=yellow)](https://github.com/salemaziel/oh-my-claudecode/stargazers)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 [![Sponsor](https://img.shields.io/badge/Sponsor-❤️-red?style=flat&logo=github)](https://github.com/sponsors/Yeachan-Heo)
-[![Discord](https://img.shields.io/discord/1452487457085063218?color=5865F2&logo=discord&logoColor=white&label=Discord)](https://discord.gg/sj4exxQ9v)
+[![Discord](https://img.shields.io/discord/1452487457085063218?color=5865F2&logo=discord&logoColor=white&label=Discord)](https://discord.gg/PUwSMR9XNk)
 
 > **For Codex users:** Check out [oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex) — the same orchestration experience for OpenAI Codex CLI.
 
@@ -17,7 +17,7 @@ English (US) | [Español (LatAm)](README.es.md)
 
 _Don't learn Claude Code. Just use OMC._
 
-[Get Started](#quick-start) • [Documentation](https://yeachan-heo.github.io/oh-my-claudecode-website) • [CLI Reference](https://yeachan-heo.github.io/oh-my-claudecode-website/docs/#cli-reference) • [Workflows](https://yeachan-heo.github.io/oh-my-claudecode-website/docs/#workflows) • [Migration Guide](docs/MIGRATION.md) • [Discord](https://discord.gg/sj4exxQ9v)
+[Get Started](#quick-start) • [Documentation](https://yeachan-heo.github.io/oh-my-claudecode-website) • [CLI Reference](https://yeachan-heo.github.io/oh-my-claudecode-website/docs/#cli-reference) • [Workflows](https://yeachan-heo.github.io/oh-my-claudecode-website/docs/#workflows) • [Migration Guide](docs/MIGRATION.md) • [Discord](https://discord.gg/PUwSMR9XNk)
 
 ---
 
@@ -177,7 +177,7 @@ omc team shutdown auth-review
 
 `/omc-teams` remains as a legacy compatibility skill and now routes to `omc team ...`.
 
-For mixed Codex + Antigravity work in one command, use the **`/ccg`** skill (routes via `/ask codex` + `/ask antigravity`, then Claude synthesizes):
+For mixed Codex + Antigravity work in one command, use the **`/ccg`** skill (routes via `/ask codex` + `/ask antigravity`, then Claude synthesizes; Gemini remains available as an enterprise/API-key fallback):
 
 ```bash
 /ccg Review this PR — architecture (Codex) and UI components (Antigravity)
@@ -273,7 +273,7 @@ Multiple strategies for different use cases — from Team-backed orchestration t
 | --------------------------- | --------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
 | **Team (recommended)**      | Canonical staged pipeline (`team-plan → team-prd → team-exec → team-verify → team-fix`) | Coordinated Claude agents on a shared task list                         |
 | **omc team (CLI)**          | tmux CLI workers — real `claude`/`codex`/`gemini`/`antigravity`/`grok`/`cursor-agent` processes in split-panes       | Codex/Gemini/Antigravity/Grok/Cursor CLI tasks; on-demand spawn, die when done             |
-| **ccg**                     | Tri-model advisors via `/ask codex` + `/ask antigravity`, Claude synthesizes            | Mixed backend+UI work needing both Codex and Antigravity                |
+| **ccg**                     | Tri-model advisors via `/ask codex` + `/ask antigravity`, Claude synthesizes             | Mixed backend+UI work needing both Codex and Antigravity                     |
 | **Autopilot**               | Autonomous execution (single lead agent)                                                | End-to-end feature work with minimal ceremony                           |
 | **Ultrawork**               | Maximum parallelism (non-team)                                                          | Burst parallel fixes/refactors where Team isn't needed                  |
 | **Ralph**                   | Persistent mode with verify/fix loops                                                   | Tasks that must complete fully (no silent partials)                     |
@@ -367,7 +367,7 @@ These shortcuts run **inside a Claude Code / OMC session**, not as terminal CLI 
 | In-session form            | Kind                   | Effect                                 | Example                                        |
 | -------------------------- | ---------------------- | -------------------------------------- | ---------------------------------------------- |
 | `/team`                    | Slash skill            | Canonical Team orchestration           | `/team 3:executor "fix all TypeScript errors"` |
-| `/ccg`                     | Slash skill            | `/ask codex` + `/ask antigravity` synthesis | `/ccg review this PR`                     |
+| `/ccg`                     | Slash skill            | `/ask codex` + `/ask antigravity` synthesis | `/ccg review this PR`                          |
 | `/autopilot` / `autopilot` | Skill / prompt trigger | Full autonomous execution              | `/autopilot "build a todo app"`                |
 | `/ralph` / `ralph`         | Skill / prompt trigger | Persistence mode                       | `/ralph "refactor auth"`                       |
 | `/ultrawork` / `ulw`       | Skill / prompt trigger | Maximum parallelism                    | `/ultrawork "fix all errors"`                  |
@@ -393,8 +393,8 @@ Run local provider CLIs and save a markdown artifact under `.omc/artifacts/ask/`
 # Terminal CLI
 omc ask claude "review this migration plan"
 omc ask codex --prompt "identify architecture risks"
-omc ask antigravity --prompt "propose UI polish ideas"
 omc ask gemini --prompt "propose UI polish ideas"
+omc ask antigravity --prompt "propose UI polish ideas"
 omc ask grok --prompt "cross-check this code review"
 omc ask cursor --prompt "apply this implementation plan"
 omc ask claude --agent-prompt executor --prompt "draft implementation steps"
@@ -448,6 +448,7 @@ Use the HUD for live observability and the current session/replay artifacts for 
 - Session summaries: `.omc/sessions/*.json`
 - Replay logs: `.omc/state/agent-replay-*.jsonl`
 - Live HUD rendering: `omc hud`
+- Local friction reports: `omc session friction report --since 24h` summarizes context-bloat and operator-friction signals from local session artifacts without printing raw prompts or tool output; add `--json` for automation.
 
 ### Notification Tags (Telegram/Discord/Slack)
 

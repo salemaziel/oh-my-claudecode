@@ -1,3 +1,4 @@
+import type { WorkerLaunchDescriptor } from './types.js';
 export type CliAgentType = 'claude' | 'codex' | 'gemini' | 'cursor' | 'grok' | 'antigravity';
 export interface CliAgentContract {
     agentType: CliAgentType;
@@ -64,6 +65,8 @@ export declare function validateCliAvailable(agentType: CliAgentType): void;
 export declare function resolveValidatedBinaryPath(agentType: CliAgentType): string;
 export declare function buildLaunchArgs(agentType: CliAgentType, config: WorkerLaunchConfig): string[];
 export declare function buildWorkerArgv(agentType: CliAgentType, config: WorkerLaunchConfig): string[];
+export declare function validateWorkerLaunchDescriptor(value: unknown): WorkerLaunchDescriptor;
+export declare function buildValidatedWorkerLaunchDescriptor(agentType: CliAgentType, config: WorkerLaunchConfig, appendedArgs?: readonly string[]): WorkerLaunchDescriptor;
 export declare function buildWorkerCommand(agentType: CliAgentType, config: WorkerLaunchConfig): string;
 export declare function getWorkerEnv(teamName: string, workerName: string, agentType: CliAgentType, env?: NodeJS.ProcessEnv): Record<string, string>;
 export declare function parseCliOutput(agentType: CliAgentType, rawOutput: string): string;
@@ -76,7 +79,7 @@ export declare function isPromptModeAgent(agentType: CliAgentType): boolean;
  *
  * When running on a non-standard provider (Bedrock, Vertex), workers need
  * the provider-specific model ID passed explicitly via --model. Without it,
- * Claude Code falls back to its built-in default (claude-sonnet-4-6) which
+ * Claude Code falls back to its built-in default (claude-sonnet-5) which
  * is invalid on these providers.
  *
  * Resolution order:

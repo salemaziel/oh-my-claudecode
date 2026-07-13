@@ -338,6 +338,7 @@ const INFORMATIONAL_INTENT_PATTERNS = [
   /(?:뭐야|뭔데|무엇(?:이야|인가요)?|어떻게|설명(?!서\s*(?:작성|만들|생성|추가|업데이트|수정|편집|쓰))|사용법|알려\s?줘|알려줄래|소개해?\s?줘|소개\s*부탁|설명해\s?줘|뭐가\s*달라|어떤\s*기능|기능\s*(?:알려|설명|뭐)|방법\s*(?:알려|설명|뭐))/u,
   /(?:とは|って何|使い方|説明|(?:について|に関して|違い)[^\n]{0,24}(?:教えて|説明|知りたい)|(?:どう|何が|どこが)違う)/u,
   /(?:什么是|什麼是|怎(?:么|樣)用|如何使用|解释|說明|说明)/u,
+  /(?:ทำไม|อะไร|ยังไง|อย่างไร|คืออะไร|หมายถึง|แปลว่า|อธิบาย|มั้ย|ไหม|เหรอ|หรอ|หรือไม่|หรือเปล่า|ใช่ไหม|ถูกมั้ย|เกี่ยวกับ|เหมือน)/u,
 ];
 const INFORMATIONAL_CONTEXT_WINDOW = 80;
 const QUOTED_SPAN_PATTERN =
@@ -346,6 +347,7 @@ const REFERENCE_META_PATTERNS = [
   /\b(?:vs\.?|versus|compared\s+to|comparison|compare|article|blog\s+post|documentation|docs?|reference)\b/i,
   /(?:비교|차이|설명|정리|문서|자료|가이드|이\s*(?:글|비교|문서)는|블로그)/u,
   /\b(?:this\s+(?:article|comparison|guide|documentation|doc)|quoted|quote(?:d)?)\b/i,
+  /(?:เปรียบเทียบ|ต่างกัน|ความต่าง|เอกสาร|บทความ|ไกด์|คู่มือ|เกี่ยวกับ|เหมือน)/u,
 ];
 const REFERENCE_EXPLANATION_PATTERNS = [
   /(?:^|\n)\s*(?:결론|특징|예시|요약|장점|단점|설명)\s*[:：]/u,
@@ -356,6 +358,7 @@ const REFERENCE_EXPLANATION_PATTERNS = [
 const QUESTION_FOLLOWUP_PATTERNS = [
   /\b(?:how\s+many|how\s+much|why|what\s+happened|what\s+went\s+wrong|token\s+budget|cost|pricing)\b/i,
   /(?:왜|얼마|몇\s*번|몇번|토큰|가격|비용|질문)/u,
+  /(?:ทำไม|อะไร|ยังไง|อย่างไร|เท่าไหร่|กี่|มั้ย|ไหม|เหรอ|หรอ|หรือไม่|หรือเปล่า|ใช่ไหม|ถูกมั้ย)/u,
 ];
 
 // Patterns that identify system-generated echoes (hook outputs) which users may
@@ -482,6 +485,24 @@ function isWithinQuotedSpan(text, position) {
   return false;
 }
 
+// Bounds of the specific quoted span containing `position`, or null if none.
+// Used to scope the execution-directive check for the quote exemption to
+// this keyword's own quote — not the generic ±80-char context window, which
+// can otherwise pick up an unrelated genuine command elsewhere in the same
+// message and wrongly neutralize the exemption for a keyword that is purely
+// quoted as an example.
+function findQuotedSpanBounds(text, position) {
+  for (const match of text.matchAll(QUOTED_SPAN_PATTERN)) {
+    if (match.index === undefined) continue;
+    const start = match.index;
+    const end = start + match[0].length;
+    if (position >= start && position < end) {
+      return { start, end };
+    }
+  }
+  return null;
+}
+
 function stripQuotedSpans(text) {
   return text.replace(QUOTED_SPAN_PATTERN, ' ');
 }
@@ -528,6 +549,23 @@ function hasDirectInvocationPrefix(text, position) {
   return /^\s*(?:[$/!]\s*|force:\s*|oh-my-(?:claudecode|codex):\s*)?$/i.test(prefix);
 }
 
+function hasConversationalInvocationNearKeyword(text, position, _keywordLength, _keywordText) {
+  if (isWithinQuotedSpan(text, position)) {
+    return false;
+  }
+
+  const start = Math.max(0, position - INFORMATIONAL_CONTEXT_WINDOW);
+  const prefix = stripQuotedSpans(text.slice(start, position));
+  const conversationalInvocationPatterns = [
+    /\bplease\s+$/i,
+    /\blet['’]?s\s+$/i,
+    /\bi\s+(?:want|need|would\s+like)\s+(?:a|an)\s+$/i,
+    /\b(?:can|could|would|will)\s+you\s+$/i,
+  ];
+
+  return conversationalInvocationPatterns.some((pattern) => pattern.test(prefix));
+}
+
 function hasExplicitInvocationContext(text, position, keywordLength, keywordText) {
   if (hasDirectInvocationPrefix(text, position)) {
     return true;
@@ -536,7 +574,42 @@ function hasExplicitInvocationContext(text, position, keywordLength, keywordText
   const start = Math.max(0, position - INFORMATIONAL_CONTEXT_WINDOW);
   const end = Math.min(text.length, position + keywordLength + INFORMATIONAL_CONTEXT_WINDOW);
   const context = text.slice(start, end);
-  return hasActivationIntentNearKeyword(context, keywordText);
+  if (hasActivationIntentNearKeyword(context, keywordText)) {
+    return true;
+  }
+
+  return hasConversationalInvocationNearKeyword(text, position, keywordLength, keywordText);
+}
+
+function hasExplicitRalphInvocationContext(text, position, keywordLength, keywordText) {
+  const normalizedKeyword = (keywordText || '').toLowerCase().replace(/\s+/g, '');
+  const prefix = text.slice(0, position);
+  const suffix = text.slice(position + keywordLength);
+
+  if (/^\s*(?:[$/!]\s*|force:\s*|\/?oh-my-(?:claudecode|codex):\s*)$/i.test(prefix)) {
+    return true;
+  }
+
+  const start = Math.max(0, position - INFORMATIONAL_CONTEXT_WINDOW);
+  const end = Math.min(text.length, position + keywordLength + INFORMATIONAL_CONTEXT_WINDOW);
+  const context = text.slice(start, end);
+  if (hasActivationIntentNearKeyword(context, keywordText)) {
+    return true;
+  }
+
+  if (normalizedKeyword === '랄프' || normalizedKeyword === 'ラルフ') {
+    return /^\s*(?:켜|켜줘|실행|시작|돌려|돌려줘|써|써줘|사용해|진행해|起動|開始|実行|使って|やって|を?実行|を?起動|を?開始)/u.test(suffix);
+  }
+
+  if (normalizedKeyword !== 'ralph') {
+    return false;
+  }
+
+  if (/^\s*[:：]\s*\S/.test(suffix)) {
+    return true;
+  }
+
+  return /^['"]?\s+(?:this\b|and\s+)?(?:fix\b|debug\b|investigate\b|resolve\b|handle\b|patch\b|address\b|implement\b|run\b|start\b|enable\b|activate\b|invoke\b|trigger\b|launch\b)|^['"]?\s+this\b|^\s+the\s+[^.?!\n]{0,60}\buntil\b/i.test(suffix);
 }
 
 function hasDiagnosticIntentNearKeyword(context, keyword) {
@@ -553,6 +626,19 @@ function hasDiagnosticIntentNearKeyword(context, keyword) {
   ];
 
   return patterns.some((pattern) => pattern.test(context));
+}
+
+function isAutopilotCreationAlias(keywordText) {
+  const normalized = (keywordText || '').toLowerCase().trim();
+  return /^(?:build|create|make)\s+me\b/.test(normalized) || /^i\s+want\s+an?(?:\s+(?:app|feature|project|tool|plugin|website|api|server|cli|script|system|service|dashboard|bot|extension))?\s*$/.test(normalized);
+}
+
+function hasActionableCommandAfterSeparator(text, position, keywordLength) {
+  const suffix = text.slice(position + keywordLength).match(/^\s*[:：]\s*([^\n]{0,80})/u)?.[1] ?? '';
+  if (/\?|？|\b(?:what(?:'s|\s+is)|how\s+(?:to|do\s+i)\s+use|explain|describe|tell\s+me\s+about)\b/iu.test(suffix)) {
+    return false;
+  }
+  return /\b(?:fix|debug|investigate|resolve|handle|patch|address|implement|build|create|make|run|start|enable|activate|invoke|trigger|launch)\b|(?:ทำ|ทํา|สร้าง|แก้|เปิด|รัน|เรียก|เริ่ม)/iu.test(suffix);
 }
 
 function isRalphUltraworkMetaOrBanterContext(context, keywordText) {
@@ -589,13 +675,77 @@ function isInformationalKeywordContext(text, position, keywordLength, keywordTex
   const start = Math.max(0, position - INFORMATIONAL_CONTEXT_WINDOW);
   const end = Math.min(text.length, position + keywordLength + INFORMATIONAL_CONTEXT_WINDOW);
   const context = text.slice(start, end);
+  const hasInformationalIntent = INFORMATIONAL_INTENT_PATTERNS.some((pattern) => pattern.test(context));
+  const hasStrongHelpQueryIntent = /\?|？|\b(?:how\s+(?:to|do\s+i)\s+use|what(?:'s|\s+is)|explain|describe|tell\s+me\s+about)\b|(?:사용법|使い方|什么是|怎么用|如何使用)/iu.test(context);
   const lineBounds = getLineBounds(text, position);
   const line = text.slice(lineBounds.start, lineBounds.end);
   const questionOutsideQuotes = stripQuotedSpans(text);
   const keywordInsideQuotes = isWithinQuotedSpan(text, position);
+  const hasExecutionDirective = /\b(?:fix|debug|investigate|resolve|handle|patch|address|implement|build)\b/i.test(context);
+  const hasCommandSeparatorInvocation =
+    hasDirectInvocationPrefix(text, position) && /^\s*[:：]/.test(text.slice(position + keywordLength));
+  const hasActionableCommandSeparatorInvocation =
+    hasCommandSeparatorInvocation && hasActionableCommandAfterSeparator(text, position, keywordLength);
+
+  // A keyword occurrence inside a quoted span is usually reported/example
+  // text, not a command directed at the assistant — e.g. an example sentence
+  // like `"use autopilot"` inside a paragraph discussing that exact phrasing.
+  // But a quoted keyword paired with a nearby execution directive OR
+  // activation verb (e.g. `"ralph" fix the auth bug`, or `run "ralph" on
+  // this issue`) is still a genuine request stylistically wrapped in quotes,
+  // so the exemption only applies when neither is present.
+  //
+  // This check is scoped to text immediately OUTSIDE this keyword's own
+  // quoted span (±28 chars before/after the span's bounds), not the generic
+  // ±80-char context window used elsewhere in this function, and NOT the
+  // quote's own interior. Three failure modes this avoids:
+  // - Scoping to the wide window: an unrelated genuine command elsewhere in
+  //   the same message could sit inside it and wrongly neutralize the
+  //   exemption for a keyword that is purely quoted as an example.
+  // - Scoping to (or including) the quote's own interior: a directive or
+  //   activation word used INSIDE the quoted text itself — extremely common
+  //   in narrated examples and bug reports, e.g. `"please fix autopilot"
+  //   they said` or `"...told it to use autopilot..."` — would make the
+  //   quote self-report as command-bearing and defeat the exemption for
+  //   exactly the reported-speech case it exists to catch.
+  // - Checking only execution-directive verbs (fix/debug/...) and not
+  //   activation verbs (use/run/start/...): genuine commands stylistically
+  //   quoting just the mode name, e.g. `run "ralph" on this issue` or
+  //   `use "autopilot" on this task`, would be wrongly suppressed even
+  //   though they activated before this exemption existed.
+  if (keywordInsideQuotes) {
+    const span = findQuotedSpanBounds(text, position);
+    const hasGenuineCommandNearQuote = span
+      ? /\b(?:fix|debug|investigate|resolve|handle|patch|address|implement|build|use|run|start|enable|activate|invoke|trigger|launch)\b/i.test(
+          text.slice(Math.max(0, span.start - 28), span.start) +
+            ' ' +
+            text.slice(span.end, Math.min(text.length, span.end + 28)),
+        )
+      : hasExecutionDirective;
+    if (!hasGenuineCommandNearQuote) {
+      return true;
+    }
+  }
 
   if (keywordText) {
-    if (hasActivationIntentNearKeyword(context, keywordText)) {
+    const hasActivationIntent = hasActivationIntentNearKeyword(context, keywordText);
+    if (hasActionableCommandSeparatorInvocation) {
+      return false;
+    }
+
+    if (isAutopilotCreationAlias(keywordText)) {
+      return false;
+    }
+    if (hasActivationIntent && hasExecutionDirective) {
+      return false;
+    }
+    if (hasInformationalIntent && hasStrongHelpQueryIntent) {
+      return true;
+    }
+    if (hasActivationIntent) {
+      return false;
+    }
+    if (hasConversationalInvocationNearKeyword(text, position, keywordLength, keywordText)) {
       return false;
     }
     if (isRalphUltraworkMetaOrBanterContext(context, keywordText)) {
@@ -618,7 +768,7 @@ function isInformationalKeywordContext(text, position, keywordLength, keywordTex
     return true;
   }
 
-  return INFORMATIONAL_INTENT_PATTERNS.some((pattern) => pattern.test(context));
+  return hasInformationalIntent;
 }
 
 function hasActionableKeyword(text, pattern) {
@@ -639,6 +789,33 @@ function hasActionableKeyword(text, pattern) {
     }
 
     if (isInformationalKeywordContext(searchText, match.index, match[0].length, match[0])) {
+      continue;
+    }
+
+    return true;
+  }
+
+  return false;
+}
+
+function hasActionableRalphKeyword(text, pattern) {
+  const searchText = looksLikeSystemEcho(text)
+    ? stripSystemEchoes(text)
+    : text;
+
+  const flags = pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`;
+  const globalPattern = new RegExp(pattern.source, flags);
+
+  for (const match of searchText.matchAll(globalPattern)) {
+    if (match.index === undefined) {
+      continue;
+    }
+
+    if (isInformationalKeywordContext(searchText, match.index, match[0].length, match[0])) {
+      continue;
+    }
+
+    if (!hasExplicitRalphInvocationContext(searchText, match.index, match[0].length, match[0])) {
       continue;
     }
 
@@ -909,6 +1086,116 @@ function isTeamEnabled() {
   } catch { return false; }
 }
 
+// Read the OMC JSONC config the way src/config/loader.ts does, inlined so the
+// standalone hook stays build-independent (mirrors scripts/lib/agent-model-config.mjs).
+function getOmcUserConfigDir() {
+  if (process.platform === 'win32') {
+    return process.env.APPDATA || join(homedir(), 'AppData', 'Roaming');
+  }
+  return process.env.XDG_CONFIG_HOME || join(homedir(), '.config');
+}
+
+// Mirrors src/utils/jsonc.ts:stripJsoncComments (strips comments AND trailing commas)
+function stripJsoncComments(content) {
+  return stripTrailingCommas(stripComments(content));
+}
+
+function stripComments(content) {
+  let result = '';
+  let i = 0;
+  while (i < content.length) {
+    if (content[i] === '/' && content[i + 1] === '/') {
+      while (i < content.length && content[i] !== '\n') i++;
+      continue;
+    }
+    if (content[i] === '/' && content[i + 1] === '*') {
+      i += 2;
+      while (i < content.length && !(content[i] === '*' && content[i + 1] === '/')) i++;
+      i += 2;
+      continue;
+    }
+    if (content[i] === '"') {
+      result += content[i++];
+      while (i < content.length && content[i] !== '"') {
+        if (content[i] === '\\') {
+          result += content[i++];
+          if (i < content.length) result += content[i++];
+          continue;
+        }
+        result += content[i++];
+      }
+      if (i < content.length) result += content[i++];
+      continue;
+    }
+    result += content[i++];
+  }
+  return result;
+}
+
+// Mirrors src/utils/jsonc.ts:stripTrailingCommas (comma before a closing } or ]).
+function stripTrailingCommas(content) {
+  let result = '';
+  let i = 0;
+  while (i < content.length) {
+    if (content[i] === '"') {
+      result += content[i++];
+      while (i < content.length && content[i] !== '"') {
+        if (content[i] === '\\') {
+          result += content[i++];
+          if (i < content.length) result += content[i++];
+          continue;
+        }
+        result += content[i++];
+      }
+      if (i < content.length) result += content[i++];
+      continue;
+    }
+    if (content[i] === ',') {
+      let j = i + 1;
+      while (j < content.length && /\s/.test(content[j])) j++;
+      if (content[j] === '}' || content[j] === ']') {
+        i++;
+        continue;
+      }
+    }
+    result += content[i++];
+  }
+  return result;
+}
+
+function loadJsoncConfig(path) {
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(stripJsoncComments(readFileSync(path, 'utf-8')));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Skills the user opted out of via `keywordDetector.disabled` in the OMC
+ * config: project `.claude/omc.jsonc` first, then user
+ * `~/.config/claude-omc/config.jsonc`, the same JSONC surface
+ * src/config/loader.ts reads. Empty when unset, so default behavior is
+ * unchanged. `cancel` is never disableable: it is the emergency stop.
+ * @param {string} directory project working directory
+ * @returns {Set<string>} disabled skill names (never includes 'cancel')
+ */
+function loadDisabledKeywords(directory) {
+  const configPaths = [
+    join(directory || process.cwd(), '.claude', 'omc.jsonc'),
+    join(getOmcUserConfigDir(), 'claude-omc', 'config.jsonc'),
+  ];
+  for (const configPath of configPaths) {
+    const config = loadJsoncConfig(configPath);
+    const disabled = config?.keywordDetector?.disabled;
+    if (Array.isArray(disabled)) {
+      return new Set(disabled.filter((name) => name !== 'cancel'));
+    }
+  }
+  return new Set();
+}
+
 // Main
 async function main() {
   // Skip guard: check OMC_SKIP_HOOKS env var (see issue #838)
@@ -961,12 +1248,15 @@ async function main() {
     }
 
     // Ralph keywords
-    if (hasActionableKeyword(cleanPrompt, /\b(ralph)\b|(랄프)(?!로렌)|(ラルフ)(?!・?ローレン)/i)) {
+    if (hasActionableRalphKeyword(cleanPrompt, /\b(ralph)\b|(랄프)(?!로렌)|(ラルフ)(?!・?ローレン)/i)) {
       matches.push({ name: 'ralph', args: '' });
     }
 
     // Autopilot keywords
-    if (hasActionableKeyword(cleanPrompt, /\b(autopilot|auto[\s-]?pilot|fullsend|full\s+auto)\b|(오토파일럿)|(オートパイロット)/i)) {
+    if (hasActionableKeyword(cleanPrompt, /\b(autopilot|auto[\s-]?pilot|fullsend|full\s+auto)\b|(오토파일럿)|(オートパイロット)/i) ||
+        hasActionableKeyword(cleanPrompt, /\b(build|create|make)\s+me\s+(an?\s+)?(app|feature|project|tool|plugin|website|api|server|cli|script|system|service|dashboard|bot|extension)\b/i) ||
+        hasActionableKeyword(cleanPrompt, /\bi\s+want\s+a\s+(app|feature|project|tool|plugin|website|api|server|cli|script|system|service|dashboard|bot|extension)\b/i) ||
+        hasActionableKeyword(cleanPrompt, /\bi\s+want\s+an\s+(app|feature|project|tool|plugin|website|api|server|cli|script|system|service|dashboard|bot|extension)\b/i)) {
       matches.push({ name: 'autopilot', args: '' });
     }
 
@@ -1042,8 +1332,14 @@ async function main() {
       matches.push({ name: 'analyze', args: '' });
     }
 
+    // Drop user-disabled keywords, then pass through if nothing is left.
+    const disabledKeywords = loadDisabledKeywords(directory);
+    const enabledMatches = disabledKeywords.size > 0
+      ? matches.filter((m) => !disabledKeywords.has(m.name))
+      : matches;
+
     // No matches - pass through
-    if (matches.length === 0) {
+    if (enabledMatches.length === 0) {
       console.log(JSON.stringify({ continue: true, suppressOutput: true }));
       return;
     }
@@ -1051,7 +1347,7 @@ async function main() {
     // Deduplicate matches by keyword name before conflict resolution
     const seen = new Set();
     const uniqueMatches = [];
-    for (const m of matches) {
+    for (const m of enabledMatches) {
       if (!seen.has(m.name)) {
         seen.add(m.name);
         uniqueMatches.push(m);

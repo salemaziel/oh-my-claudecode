@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 const RUN_CJS_PATH = join(__dirname, '..', '..', 'scripts', 'run.cjs');
 const NODE = process.execPath;
 /**
@@ -31,27 +31,36 @@ describe('run.cjs — graceful fallback for stale plugin paths', () => {
         }
         return versionDir;
     }
-    function runCjs(target, env = {}) {
-        try {
-            const stdout = execFileSync(NODE, [RUN_CJS_PATH, target], {
-                encoding: 'utf-8',
-                env: {
-                    ...process.env,
-                    ...env,
-                },
-                timeout: 10000,
-                input: '{}',
-            });
-            return { status: 0, stdout: stdout || '', stderr: '' };
-        }
-        catch (err) {
-            return {
-                status: err.status ?? 1,
-                stdout: err.stdout || '',
-                stderr: err.stderr || '',
-            };
-        }
+    function runCjs(target, env = {}, args = []) {
+        const result = spawnSync(NODE, [RUN_CJS_PATH, target, ...args], {
+            encoding: 'utf-8',
+            env: {
+                ...process.env,
+                ...env,
+            },
+            timeout: 30000,
+            input: '{}',
+        });
+        return {
+            status: result.status ?? (result.error || result.signal ? 1 : 0),
+            stdout: result.stdout || '',
+            stderr: result.stderr || '',
+        };
     }
+    it('keeps UserPromptSubmit manifest timeouts aligned for prompt hooks', () => {
+        const hooksJson = JSON.parse(readFileSync(join(__dirname, '..', '..', 'hooks', 'hooks.json'), 'utf-8'));
+        const promptHooks = hooksJson.hooks.UserPromptSubmit.flatMap((entry) => entry.hooks);
+        const keywordDetector = promptHooks.find((hook) => hook.command.includes('keyword-detector.mjs'));
+        const skillInjector = promptHooks.find((hook) => hook.command.includes('skill-injector.mjs'));
+        expect(keywordDetector?.timeout).toBe(10);
+        expect(skillInjector?.timeout).toBe(15);
+        const hooksDoc = readFileSync(join(__dirname, '..', '..', 'docs', 'HOOKS.md'), 'utf-8');
+        const referenceDoc = readFileSync(join(__dirname, '..', '..', 'docs', 'REFERENCE.md'), 'utf-8');
+        expect(hooksDoc).toContain('| `keyword-detector.mjs` | Detects magic keywords and invokes the corresponding skill | 10s |');
+        expect(hooksDoc).toContain('| `skill-injector.mjs` | Injects skill prompts | 15s |');
+        expect(referenceDoc).toContain('| **UserPromptSubmit**   | `keyword-detector.mjs`, `skill-injector.mjs`');
+        expect(referenceDoc).toContain('| 10s, 15s');
+    });
     it('exits 0 when no target argument is provided', () => {
         try {
             execFileSync(NODE, [RUN_CJS_PATH], {
@@ -167,7 +176,7 @@ describe('run.cjs — graceful fallback for stale plugin paths', () => {
         // No version has test-hook.cjs, so exit 0 gracefully
         expect(result.status).toBe(0);
     });
-    it('honors hooks.json timeouts so wrapped hooks fail open instead of blocking', () => {
+    it('uses an inner timeout below the hooks.json outer budget so wrapped hooks fail open with output', () => {
         const pluginRoot = join(tmpDir, 'plugin-root');
         const scriptsDir = join(pluginRoot, 'scripts');
         const hooksDir = join(pluginRoot, 'hooks');
@@ -184,7 +193,7 @@ describe('run.cjs — graceful fallback for stale plugin paths', () => {
                             {
                                 type: 'command',
                                 command: 'node "$CLAUDE_PLUGIN_ROOT"/scripts/run.cjs "$CLAUDE_PLUGIN_ROOT"/scripts/slow-stop-hook.cjs',
-                                timeout: 1,
+                                timeout: 2,
                             },
                         ],
                     },
@@ -198,7 +207,133 @@ describe('run.cjs — graceful fallback for stale plugin paths', () => {
         const elapsedMs = Date.now() - startedAt;
         expect(result.status).toBe(0);
         expect(result.stdout).not.toContain('slow-stop-done');
-        expect(elapsedMs).toBeLessThan(2500);
+        expect(result.stderr).toContain('[run.cjs] Hook slow-stop-hook.cjs timed out after 1500ms; exiting fail-open.');
+        expect(result.stderr).not.toContain('timed out after 2000ms');
+        expect(elapsedMs).toBeLessThan(2000);
+    });
+    it('uses prompt-scoped inner timeout cushions for UserPromptSubmit hooks', () => {
+        const pluginRoot = join(tmpDir, 'prompt-plugin-root');
+        const scriptsDir = join(pluginRoot, 'scripts');
+        const hooksDir = join(pluginRoot, 'hooks');
+        mkdirSync(scriptsDir, { recursive: true });
+        mkdirSync(hooksDir, { recursive: true });
+        const tenSecondTarget = join(scriptsDir, 'prompt-ten.cjs');
+        const fifteenSecondTarget = join(scriptsDir, 'prompt-fifteen.cjs');
+        writeFileSync(tenSecondTarget, 'setTimeout(() => { process.stdout.write("prompt-ten-done\\n"); process.exit(0); }, 9000);');
+        writeFileSync(fifteenSecondTarget, 'setTimeout(() => { process.stdout.write("prompt-fifteen-done\\n"); process.exit(0); }, 13000);');
+        writeFileSync(join(hooksDir, 'hooks.json'), JSON.stringify({
+            hooks: {
+                UserPromptSubmit: [
+                    {
+                        matcher: '',
+                        hooks: [
+                            {
+                                type: 'command',
+                                command: 'node "$CLAUDE_PLUGIN_ROOT"/scripts/run.cjs "$CLAUDE_PLUGIN_ROOT"/scripts/prompt-ten.cjs',
+                                timeout: 10,
+                            },
+                            {
+                                type: 'command',
+                                command: 'node "$CLAUDE_PLUGIN_ROOT"/scripts/run.cjs "$CLAUDE_PLUGIN_ROOT"/scripts/prompt-fifteen.cjs',
+                                timeout: 15,
+                            },
+                        ],
+                    },
+                ],
+            },
+        }, null, 2));
+        const tenStartedAt = Date.now();
+        const tenResult = runCjs(tenSecondTarget, {
+            CLAUDE_PLUGIN_ROOT: pluginRoot,
+        });
+        const tenElapsedMs = Date.now() - tenStartedAt;
+        expect(tenResult.status).toBe(0);
+        expect(tenResult.stdout).not.toContain('prompt-ten-done');
+        expect(tenResult.stderr).toBe('');
+        expect(tenElapsedMs).toBeGreaterThanOrEqual(7500);
+        expect(tenElapsedMs).toBeLessThan(10000);
+        const fifteenStartedAt = Date.now();
+        const fifteenResult = runCjs(fifteenSecondTarget, {
+            CLAUDE_PLUGIN_ROOT: pluginRoot,
+        });
+        const fifteenElapsedMs = Date.now() - fifteenStartedAt;
+        expect(fifteenResult.status).toBe(0);
+        expect(fifteenResult.stdout).not.toContain('prompt-fifteen-done');
+        expect(fifteenResult.stderr).toBe('');
+        expect(fifteenElapsedMs).toBeGreaterThanOrEqual(11500);
+        expect(fifteenElapsedMs).toBeLessThan(15000);
+    });
+    it('keeps the existing 500ms inner timeout cushion for non-prompt hooks', () => {
+        const pluginRoot = join(tmpDir, 'non-prompt-plugin-root');
+        const scriptsDir = join(pluginRoot, 'scripts');
+        const hooksDir = join(pluginRoot, 'hooks');
+        mkdirSync(scriptsDir, { recursive: true });
+        mkdirSync(hooksDir, { recursive: true });
+        const slowTarget = join(scriptsDir, 'non-prompt-slow.cjs');
+        writeFileSync(slowTarget, 'setTimeout(() => { process.stdout.write("non-prompt-done\\n"); process.exit(0); }, 3000);');
+        writeFileSync(join(hooksDir, 'hooks.json'), JSON.stringify({
+            hooks: {
+                Stop: [
+                    {
+                        matcher: '',
+                        hooks: [
+                            {
+                                type: 'command',
+                                command: 'node "$CLAUDE_PLUGIN_ROOT"/scripts/run.cjs "$CLAUDE_PLUGIN_ROOT"/scripts/non-prompt-slow.cjs',
+                                timeout: 2,
+                            },
+                        ],
+                    },
+                ],
+            },
+        }, null, 2));
+        const startedAt = Date.now();
+        const result = runCjs(slowTarget, {
+            CLAUDE_PLUGIN_ROOT: pluginRoot,
+        });
+        const elapsedMs = Date.now() - startedAt;
+        expect(result.status).toBe(0);
+        expect(result.stdout).not.toContain('non-prompt-done');
+        expect(result.stderr).toContain('[run.cjs] Hook non-prompt-slow.cjs timed out after 1500ms; exiting fail-open.');
+        expect(elapsedMs).toBeLessThan(2000);
+    });
+    it('keeps prompt hook timeout diagnostics quiet by default and visible in hook debug mode', () => {
+        const pluginRoot = join(tmpDir, 'prompt-debug-plugin-root');
+        const scriptsDir = join(pluginRoot, 'scripts');
+        const hooksDir = join(pluginRoot, 'hooks');
+        mkdirSync(scriptsDir, { recursive: true });
+        mkdirSync(hooksDir, { recursive: true });
+        const slowTarget = join(scriptsDir, 'prompt-debug-slow.cjs');
+        writeFileSync(slowTarget, 'setTimeout(() => { process.stdout.write("prompt-debug-done\\n"); process.exit(0); }, 3000);');
+        writeFileSync(join(hooksDir, 'hooks.json'), JSON.stringify({
+            hooks: {
+                UserPromptSubmit: [
+                    {
+                        matcher: '',
+                        hooks: [
+                            {
+                                type: 'command',
+                                command: 'node "$CLAUDE_PLUGIN_ROOT"/scripts/run.cjs "$CLAUDE_PLUGIN_ROOT"/scripts/prompt-debug-slow.cjs',
+                                timeout: 1,
+                            },
+                        ],
+                    },
+                ],
+            },
+        }, null, 2));
+        const quietResult = runCjs(slowTarget, {
+            CLAUDE_PLUGIN_ROOT: pluginRoot,
+        });
+        const debugResult = runCjs(slowTarget, {
+            CLAUDE_PLUGIN_ROOT: pluginRoot,
+            OMC_DEBUG_HOOKS: '1',
+        });
+        expect(quietResult.status).toBe(0);
+        expect(quietResult.stdout).not.toContain('prompt-debug-done');
+        expect(quietResult.stderr).toBe('');
+        expect(debugResult.status).toBe(0);
+        expect(debugResult.stdout).not.toContain('prompt-debug-done');
+        expect(debugResult.stderr).toContain('[run.cjs] Hook prompt-debug-slow.cjs timed out after 1ms; exiting fail-open.');
     });
 });
 //# sourceMappingURL=run-cjs-graceful-fallback.test.js.map

@@ -25,16 +25,82 @@ import { spawn } from "child_process";
 import { join, dirname, resolve, normalize } from "path";
 import { homedir } from "os";
 import { fileURLToPath, pathToFileURL } from "url";
-import { getClaudeConfigDir } from "./lib/config-dir.mjs";
-import { resolveOmcStateRoot } from "./lib/state-root.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-// Dynamic import for the shared stdin module
+const SAFE_CONTINUE = { continue: true, suppressOutput: true };
+const DEFAULT_SAFETY_TIMEOUT_MS = 8500;
+const SAFE_EXIT_FLUSH_TIMEOUT_MS = 100;
+
+
+function getSafetyTimeoutMs() {
+  const parsed = Number.parseInt(process.env.OMC_PERSISTENT_MODE_TIMEOUT_MS || "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_SAFETY_TIMEOUT_MS;
+}
+
+function writeSafeContinue(onFlushed) {
+  let settled = false;
+  const finish = () => {
+    if (settled) return;
+    settled = true;
+    if (onFlushed) onFlushed();
+  };
+
+  try {
+    const ok = process.stdout.write(JSON.stringify(SAFE_CONTINUE) + "\n", finish);
+    if (!ok) {
+      process.stdout.once("drain", finish);
+    }
+    const timeout = setTimeout(finish, SAFE_EXIT_FLUSH_TIMEOUT_MS);
+    if (!onFlushed) timeout.unref?.();
+  } catch {
+    // If stdout is unavailable, exiting still prevents a wedged Stop hook.
+    finish();
+  }
+}
+
+function shouldSkipPersistentModeHook() {
+  const skipHooks = (process.env.OMC_SKIP_HOOKS || "")
+    .split(",")
+    .map((hook) => hook.trim())
+    .filter(Boolean);
+
+  return (
+    process.env.DISABLE_OMC === "1" ||
+    process.env.DISABLE_OMC === "true" ||
+    skipHooks.includes("persistent-mode") ||
+    skipHooks.includes("stop-continuation")
+  );
+}
+
+function forceSafeExit(message) {
+  try {
+    if (message) process.stderr.write(message + "\n");
+  } catch {
+    // Ignore stderr failures; the JSON decision is what matters.
+  }
+  writeSafeContinue(() => process.exit(0));
+}
+
+
+const safetyTimeout = setTimeout(() => {
+  forceSafeExit("[persistent-mode] Safety timeout reached, forcing exit");
+}, getSafetyTimeoutMs());
+
+process.on("uncaughtException", (error) => {
+  forceSafeExit(`[persistent-mode] Uncaught exception: ${error?.message || error}`);
+});
+
+process.on("unhandledRejection", (error) => {
+  forceSafeExit(`[persistent-mode] Unhandled rejection: ${error?.message || error}`);
+});
+
+const { getClaudeConfigDir } = await import(pathToFileURL(join(__dirname, "lib", "config-dir.mjs")).href);
 const { readStdin } = await import(
   pathToFileURL(join(__dirname, "lib", "stdin.mjs")).href
 );
+const { resolveOmcStateRoot } = await import(pathToFileURL(join(__dirname, "lib", "state-root.mjs")).href);
 
 function readJsonFile(path) {
   try {
@@ -243,6 +309,11 @@ Do NOT skip this step. Do NOT move on without fixing the error.
  */
 const STALE_STATE_THRESHOLD_MS = 2 * 60 * 60 * 1000; // 2 hours
 const PENDING_ASYNC_STATE_STALE_MS = 24 * 60 * 60 * 1000;
+// A delegated subagent counts as pending owned async work while its tracking
+// entry stays "running". Bound by 30 min so an orphaned entry (subagent killed
+// without SubagentStop) eventually releases the gate; over-suppression is the
+// benign direction (the agent stops cleanly instead of being nagged mid-work).
+const RUNNING_SUBAGENT_STALE_MS = 30 * 60 * 1000;
 const CANCEL_SIGNAL_TTL_MS = 30_000;
 const TEAM_TERMINAL_PHASES = new Set([
   "completed",
@@ -357,8 +428,25 @@ function hasPendingScheduledWakeup(stateDir, sessionId) {
   });
 }
 
+function hasRunningSubagent(stateDir) {
+  // subagent-tracking.json is per-directory (not session-scoped), written by the
+  // wired SubagentStart/SubagentStop hooks. A "running" entry means a delegated
+  // agent is still working, so persistent modes must not inject a "stalled"
+  // reinforcement while we wait for it (mirrors the background-task gate).
+  const tracking = readJsonFile(join(stateDir, "subagent-tracking.json"));
+  const agents = Array.isArray(tracking?.agents) ? tracking.agents : [];
+  return agents.some((agent) => {
+    if (agent?.status !== "running") return false;
+    return isFreshTimestamp(agent.started_at, RUNNING_SUBAGENT_STALE_MS);
+  });
+}
+
 function hasPendingOwnedAsyncWork(stateDir, sessionId) {
-  return hasPendingBackgroundTask(stateDir, sessionId) || hasPendingScheduledWakeup(stateDir, sessionId);
+  return (
+    hasPendingBackgroundTask(stateDir, sessionId) ||
+    hasRunningSubagent(stateDir) ||
+    hasPendingScheduledWakeup(stateDir, sessionId)
+  );
 }
 
 function normalizeTeamPhase(state) {
@@ -940,11 +1028,19 @@ function isScheduledWakeupStop(data) {
 
 async function main() {
   try {
+    if (shouldSkipPersistentModeHook()) {
+      writeSafeContinue();
+      return;
+    }
+
     const input = await readStdin();
     let data = {};
     try {
       data = JSON.parse(input);
-    } catch {}
+    } catch {
+      writeSafeContinue();
+      return;
+    }
 
     // Claude Code sets stop_hook_active when a Stop hook is already running.
     // Never emit another decision:block in that re-entrant path: doing so trips
@@ -1516,9 +1612,15 @@ async function main() {
     console.log(JSON.stringify({ continue: true, suppressOutput: true }));
   } catch (error) {
     // On any error, allow stop rather than blocking forever
-    console.error(`[persistent-mode] Error: ${error.message}`);
-    console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+    try {
+      process.stderr.write(`[persistent-mode] Error: ${error?.message || error}\n`);
+    } catch {
+      // Ignore stderr errors - we just need to return valid JSON
+    }
+    writeSafeContinue();
   }
 }
 
-main();
+main().finally(() => {
+  clearTimeout(safetyTimeout);
+});

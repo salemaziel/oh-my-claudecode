@@ -38,6 +38,7 @@ interface UsageApiResponse {
         used_credits?: number;
         monthly_limit?: number | null;
         currency?: string;
+        decimal_places?: number;
     };
 }
 interface ParseUsageResponseOptions {
