@@ -48,9 +48,36 @@ export declare const TeamPaths: {
     readonly summarySnapshot: (teamName: string) => string;
     readonly phaseState: (teamName: string) => string;
     readonly scalingLock: (teamName: string) => string;
+    readonly configMutationLock: (teamName: string) => string;
     readonly workerIdentity: (teamName: string, workerName: string) => string;
     readonly workerAgentsMd: (teamName: string) => string;
     readonly shutdownRequest: (teamName: string, workerName: string) => string;
+    readonly checkpoints: (teamName: string, taskId: string, claimTokenHash: string) => string;
+    readonly checkpoint: (teamName: string, taskId: string, claimTokenHash: string, sequence: number) => string;
+    readonly checkpointLatest: (teamName: string, taskId: string, claimTokenHash: string) => string;
+    readonly taskRecoverySidecar: (teamName: string, recoveryId: string, taskId: string) => string;
+    readonly taskRecoveryReservation: (teamName: string, taskId: string) => string;
+    readonly ownerEpochs: (teamName: string) => string;
+    readonly ownerEpoch: (teamName: string, epoch: number) => string;
+    readonly recoveryOwnerBootstrapCandidate: (teamName: string, expectedEpoch: number, nonce: string) => string;
+    readonly recoveryIntents: (teamName: string) => string;
+    readonly recoveryIntent: (teamName: string, recoveryId: string) => string;
+    readonly recoveryAttempts: (teamName: string) => string;
+    readonly recoveryAttempt: (teamName: string, recoveryId: string) => string;
+    readonly recoveryActivation: (teamName: string, recoveryId: string, paneAttemptId: string) => string;
+    readonly recoveryReady: (teamName: string, recoveryId: string, paneAttemptId: string) => string;
+    readonly recoveryActivate: (teamName: string, recoveryId: string, paneAttemptId: string) => string;
+    readonly recoveryRun: (teamName: string, recoveryId: string, paneAttemptId: string) => string;
+    readonly recoveryRequestsRoot: () => string;
+    readonly recoveryAdmissionLock: (payloadHash: string) => string;
+    readonly recoveryLifecycleLock: (workspaceHash: string, teamName: string) => string;
+    readonly recoveryRequestPending: (requestId: string) => string;
+    readonly recoveryRequestResult: (requestId: string) => string;
+    readonly recoveryResultByTeam: (workspaceHash: string, teamName: string, recoveryId: string) => string;
+    readonly recoveryFinalIndexLock: (workspaceHash: string, teamName: string, recoveryId: string) => string;
+    readonly scalingRollbackFailure: (teamName: string, recordedAt: number) => string;
+    readonly recoveryPaneRollbackFailure: (teamName: string, recoveryId: string, paneAttemptId: string, recordedAt: number) => string;
+    readonly recoveryAuditIndex: () => string;
 };
 /**
  * Get absolute path for a team state file.
