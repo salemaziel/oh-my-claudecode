@@ -792,7 +792,7 @@ export async function performUpdate(options) {
                 success: false,
                 previousVersion,
                 newVersion: 'unknown',
-                message: 'Running inside an active Claude Code plugin session. Use "/plugin install oh-my-claudecode@vdw" to update, or pass --standalone to force npm update.',
+                message: 'Running inside an active Claude Code plugin session. Use "/plugin install oh-my-claudecode" to update, or pass --standalone to force npm update.',
             };
         }
         // Fetch the latest release to get the version
@@ -889,7 +889,7 @@ export async function performUpdate(options) {
         catch (npmError) {
             throw new Error('Auto-update via npm failed. Please run manually:\n' +
                 '  npm install -g oh-my-claude-sisyphus@latest\n' +
-                'Or use: /plugin install oh-my-claudecode@vdw\n' +
+                'Or use: /plugin install oh-my-claudecode\n' +
                 `Error: ${npmError instanceof Error ? npmError.message : npmError}`);
         }
     }
@@ -920,7 +920,7 @@ export function formatUpdateNotification(checkResult) {
         `  Latest version:  ${checkResult.latestVersion}`,
         '',
         '  To update, run: /update',
-        '  Or reinstall via: /plugin install oh-my-claudecode@vdw',
+        '  Or reinstall via: /plugin install oh-my-claudecode',
         ''
     ];
     // Add truncated release notes if available

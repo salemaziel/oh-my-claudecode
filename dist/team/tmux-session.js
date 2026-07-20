@@ -133,7 +133,12 @@ async function cmuxSplitSurface(targetSurfaceId, direction, _cwd) {
     if (process.env.CMUX_WORKSPACE_ID)
         args.push('--workspace', process.env.CMUX_WORKSPACE_ID);
     const result = await cmuxExecAsync(args);
-    return parseCmuxSurfaceId(result.stdout);
+    let paneId = null;
+    try {
+        paneId = parseCmuxSurfaceId(result.stdout);
+    }
+    catch { /* successful split with unparseable identity */ }
+    return { ...result, paneId };
 }
 async function cmuxSendSurface(surfaceId, text) {
     // cmux 0.64.x targets a specific surface with the dedicated
@@ -302,6 +307,23 @@ function paneCurrentCommandLooksReady(command) {
     return SUPPORTED_POSIX_SHELLS.has(normalized)
         || ['cmd', 'powershell', 'pwsh', 'nu', 'elvish'].includes(normalized);
 }
+async function getPaneCurrentCommandStatus(paneId) {
+    try {
+        const result = await tmuxCmdAsync([
+            'display-message', '-p', '-t', paneId,
+            '#{pane_dead} #{pane_current_command}',
+        ], { timeout: 1000 });
+        const status = result.stdout.trim();
+        const [dead, ...commandParts] = status.split(/\s+/);
+        return { dead: dead === '1', command: commandParts.join(' ') };
+    }
+    catch {
+        return null;
+    }
+}
+function paneCurrentCommandLooksSubmitted(command) {
+    return command.length > 0 && !paneCurrentCommandLooksReady(command);
+}
 async function waitForShellReady(paneId, opts = {}) {
     if (isCmuxSurfaceTarget(paneId))
         return true;
@@ -315,22 +337,14 @@ async function waitForShellReady(paneId, opts = {}) {
     const deadline = Date.now() + timeoutMs;
     let lastStatus = '';
     while (Date.now() < deadline) {
-        try {
-            const result = await tmuxCmdAsync([
-                'display-message', '-p', '-t', paneId,
-                '#{pane_dead} #{pane_current_command}',
-            ], { timeout: 1000 });
-            lastStatus = result.stdout.trim();
-            const [dead, ...commandParts] = lastStatus.split(/\s+/);
-            if (dead === '1')
+        const status = await getPaneCurrentCommandStatus(paneId);
+        if (status) {
+            lastStatus = `${status.dead ? '1' : '0'} ${status.command}`.trim();
+            if (status.dead)
                 return false;
-            const currentCommand = commandParts.join(' ');
-            if (currentCommand && paneCurrentCommandLooksReady(currentCommand)) {
+            if (paneCurrentCommandLooksReady(status.command)) {
                 return true;
             }
-        }
-        catch (error) {
-            lastStatus = error instanceof Error ? error.message : String(error);
         }
         await sleep(pollIntervalMs);
     }
@@ -380,6 +394,13 @@ async function verifyWorkerStartCommandSubmitted(paneId, startCmd, opts = {}) {
         const commandStillBuffered = normalizedCaptured.includes(expected)
             || (compactExpected.length > 0 && normalizeTmuxCaptureForDelivery(captured).includes(compactExpected));
         if (!commandStillBuffered) {
+            return true;
+        }
+        const status = await getPaneCurrentCommandStatus(paneId);
+        if (status?.dead) {
+            return false;
+        }
+        if (status && paneCurrentCommandLooksSubmitted(status.command)) {
             return true;
         }
         const remainingMs = deadline - Date.now();
@@ -631,44 +652,37 @@ export function spawnBridgeInSession(tmuxSession, bridgeScriptPath, configFilePa
         .join(' ');
     tmuxExec(['send-keys', '-t', tmuxSession, cmd, 'Enter'], { stripTmux: true, stdio: 'pipe', timeout: 5000 });
 }
-/**
- * Create a tmux team topology for a team leader/worker layout.
- *
- * When running inside a classic tmux session, creates splits in the CURRENT
- * window so panes appear immediately in the user's view. When options.newWindow
- * is true, creates a detached dedicated tmux window first and then splits worker
- * panes there.
- *
- * When running inside cmux (CMUX_SURFACE_ID without TMUX), creates native
- * cmux splits from the current surface. When running in a plain terminal, falls
- * back to a detached tmux session. Returns sessionName in "session:window" form
- * for tmux and "cmux:<workspace>" form for cmux.
- *
- * Layout: leader pane on the left, worker panes stacked vertically on the right.
- * IMPORTANT: Uses pane IDs (%N format) not pane indices for stable targeting.
- */
-/**
- * Split a new worker pane off `splitTarget`, honoring the active multiplexer.
- *
- * Under cmux a worker MUST be a native cmux surface (UUID), not a tmux pane id
- * (`%N`). Otherwise spawnWorkerInPane()/waitForShellReady() classify the worker
- * as a tmux pane, poll tmux for shell readiness, and time out after 5s with
- * `worker_start_shell_not_ready` — abandoning the worker's git worktree.
- * createTeamSession() already branches this way for panes created up front; the
- * on-demand worker spawns in both team runtimes must do the same. (#3267)
- */
-export async function splitTeamWorkerPane(splitTarget, direction, cwd) {
-    if (isCmuxContext()) {
-        return cmuxSplitSurface(splitTarget, direction, cwd);
+export async function splitTeamWorkerPaneWithEvidence(splitTarget, direction, cwd) {
+    const provider = isCmuxContext() ? 'cmux' : 'tmux';
+    try {
+        if (provider === 'cmux') {
+            const splitResult = await cmuxSplitSurface(splitTarget, direction, cwd);
+            return { commandSucceeded: true, provider, splitTarget, direction, rawOutput: splitResult.stdout,
+                stderr: splitResult.stderr, paneId: splitResult.paneId };
+        }
+        const splitType = direction === 'right' ? '-h' : '-v';
+        const splitResult = await tmuxExecAsync([
+            'split-window', splitType, '-t', splitTarget,
+            '-d', '-P', '-F', '#{pane_id}',
+            '-c', cwd,
+            ...workerPaneShellCommand(),
+        ]);
+        const rawOutput = splitResult.stdout;
+        const candidate = rawOutput.split('\n')[0]?.trim() ?? '';
+        return { commandSucceeded: true, provider, splitTarget, direction, rawOutput, stderr: splitResult.stderr,
+            paneId: /^%\d+$/.test(candidate) ? candidate : null };
     }
-    const splitType = direction === 'right' ? '-h' : '-v';
-    const splitResult = await tmuxExecAsync([
-        'split-window', splitType, '-t', splitTarget,
-        '-d', '-P', '-F', '#{pane_id}',
-        '-c', cwd,
-        ...workerPaneShellCommand(),
-    ]);
-    return splitResult.stdout.split('\n')[0]?.trim() || null;
+    catch (error) {
+        const failure = error;
+        return { commandSucceeded: false, provider, splitTarget, direction,
+            rawOutput: typeof failure.stdout === 'string' ? failure.stdout : '',
+            stderr: typeof failure.stderr === 'string' ? failure.stderr
+                : typeof failure.message === 'string' ? failure.message : String(error),
+            paneId: null };
+    }
+}
+export async function splitTeamWorkerPane(splitTarget, direction, cwd) {
+    return (await splitTeamWorkerPaneWithEvidence(splitTarget, direction, cwd)).paneId;
 }
 export async function createTeamSession(teamName, workerCount, cwd, options = {}) {
     const multiplexerContext = detectTeamMultiplexerContext();
@@ -786,7 +800,10 @@ export async function createTeamSession(teamName, workerCount, cwd, options = {}
         const splitTarget = i === 0 ? leaderPaneId : workerPaneIds[i - 1];
         if (inCmux) {
             const direction = i === 0 ? 'right' : 'down';
-            workerPaneIds.push(await cmuxSplitSurface(splitTarget, direction, cwd));
+            const split = await cmuxSplitSurface(splitTarget, direction, cwd);
+            if (!split.paneId)
+                throw new Error(`Failed to resolve cmux surface id: ${JSON.stringify(split.stdout.trim())}`);
+            workerPaneIds.push(split.paneId);
             continue;
         }
         const splitType = i === 0 ? '-h' : '-v';

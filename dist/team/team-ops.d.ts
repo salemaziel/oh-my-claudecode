@@ -9,9 +9,17 @@
  * Modeled after oh-my-codex/src/team/team-ops.ts.
  */
 import type { TeamTaskStatus } from './contracts.js';
-import type { TeamTask, TeamTaskV2, TeamTaskClaim, TeamConfig, TeamManifestV2, WorkerInfo, WorkerStatus, WorkerHeartbeat, TeamEvent, TeamMailboxMessage, TeamMailbox, TaskApprovalRecord, ClaimTaskResult, TransitionTaskResult, ReleaseTaskClaimResult, TaskReadiness, TeamSummary, ShutdownAck, TeamMonitorSnapshotState } from './types.js';
-export type { TeamConfig, WorkerInfo, WorkerHeartbeat, WorkerStatus, TeamTask, TeamTaskV2, TeamTaskClaim, TeamManifestV2, TeamEvent, TeamMailboxMessage, TeamMailbox, TaskApprovalRecord, ClaimTaskResult, TransitionTaskResult, ReleaseTaskClaimResult, TaskReadiness, TeamSummary, ShutdownAck, TeamMonitorSnapshotState, };
+import type { TeamTask, TeamTaskV2, TeamTaskClaim, TeamConfig, TeamManifestV2, WorkerInfo, WorkerStatus, WorkerHeartbeat, TeamEvent, TeamMailboxMessage, TeamMailbox, TaskApprovalRecord, ClaimTaskResult, TransitionTaskResult, ReleaseTaskClaimResult, TaskReadiness, TeamSummary, ShutdownAck, TeamMonitorSnapshotState, TaskRecoveryAdoptionProof, TaskRecoveryAdoptionResult, TaskRecoveryCheckpoint, TaskRecoveryRequeueResult, TaskRecoveryRequeueSidecar, TaskRecoveryCheckpointValidation, TeamTaskRecoveryReservation, RecoverDeadWorkerV2Error, RecoverDeadWorkerV2Result, RecoverDeadWorkerV2Warning } from './types.js';
+import { type PublishTaskRecoveryCheckpointInput } from './task-recovery-checkpoint.js';
+export type { TeamConfig, WorkerInfo, WorkerHeartbeat, WorkerStatus, TeamTask, TeamTaskV2, TeamTaskClaim, TeamManifestV2, TeamEvent, TeamMailboxMessage, TeamMailbox, TaskApprovalRecord, ClaimTaskResult, TransitionTaskResult, ReleaseTaskClaimResult, TaskReadiness, TeamSummary, ShutdownAck, TeamMonitorSnapshotState, TaskRecoveryAdoptionProof, TaskRecoveryAdoptionResult, TaskRecoveryCheckpoint, TaskRecoveryRequeueResult, TaskRecoveryRequeueSidecar, TaskRecoveryCheckpointValidation, TeamTaskRecoveryReservation, RecoverDeadWorkerV2Error, RecoverDeadWorkerV2Result, RecoverDeadWorkerV2Warning, };
+export type { PublishTaskRecoveryCheckpointInput } from './task-recovery-checkpoint.js';
 declare function writeAtomic(path: string, data: string): Promise<void>;
+export declare function withTaskClaimLock<T>(teamName: string, taskId: string, cwd: string, fn: () => Promise<T>): Promise<{
+    ok: true;
+    value: T;
+} | {
+    ok: false;
+}>;
 export declare function teamReadConfig(teamName: string, cwd: string): Promise<TeamConfig | null>;
 export declare function teamReadManifest(teamName: string, cwd: string): Promise<TeamManifestV2 | null>;
 export declare function teamCleanup(teamName: string, cwd: string): Promise<void>;
@@ -30,6 +38,17 @@ export declare function teamTransitionTaskStatus(teamName: string, taskId: strin
     error?: string;
 }): Promise<TransitionTaskResult>;
 export declare function teamReleaseTaskClaim(teamName: string, taskId: string, claimToken: string, workerName: string, cwd: string): Promise<ReleaseTaskClaimResult>;
+export declare function teamPublishTaskRecoveryCheckpoint(input: PublishTaskRecoveryCheckpointInput, cwd: string): Promise<import("./task-recovery-checkpoint.js").PublishTaskRecoveryCheckpointResult>;
+export declare function teamRequeueRecoveredTask(teamName: string, cwd: string, input: {
+    recoveryId: string;
+    requestId: string;
+    taskId: string;
+    replacementWorker: string;
+    replacementGeneration: number;
+    adoptionTokenHash: string;
+}): Promise<TaskRecoveryRequeueResult>;
+/** Runtime-owner-only continuation adoption; call before provider launch. */
+export declare function teamAdoptRecoveryReservations(teamName: string, cwd: string, taskIds: string[], workerName: string, proof: TaskRecoveryAdoptionProof): Promise<TaskRecoveryAdoptionResult[]>;
 export declare function teamSendMessage(teamName: string, fromWorker: string, toWorker: string, body: string, cwd: string): Promise<TeamMailboxMessage>;
 export declare function teamBroadcast(teamName: string, fromWorker: string, body: string, cwd: string): Promise<TeamMailboxMessage[]>;
 export declare function teamListMailbox(teamName: string, workerName: string, cwd: string): Promise<TeamMailboxMessage[]>;
