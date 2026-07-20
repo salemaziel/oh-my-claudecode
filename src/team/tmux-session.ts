@@ -81,6 +81,66 @@ async function cmuxExecAsync(args: string[]): Promise<{ stdout: string; stderr: 
   };
 }
 
+function getCmuxErrorText(error: unknown): string {
+  if (error instanceof Error) {
+    const stderr = typeof (error as { stderr?: unknown }).stderr === 'string'
+      ? (error as { stderr?: string }).stderr
+      : '';
+    return `${error.message}\n${stderr}`.trim();
+  }
+  return String(error);
+}
+
+function isCmuxDialectFailure(error: unknown): boolean {
+  const text = getCmuxErrorText(error);
+  return /(?:unknown|unrecognized|invalid|unsupported) (?:command|subcommand|option)|no such (?:command|subcommand)|Found argument .*--surface.*wasn't expected|unexpected argument|unexpected option/i.test(text);
+}
+
+function redactCmuxFailureMessage(error: unknown, argLists: string[][]): string {
+  let message = getCmuxErrorText(error);
+  const commandNames = new Set(argLists.map(args => args[0]).filter(Boolean));
+  const sensitiveArgs = [...new Set(argLists.flatMap(args => args).flatMap(arg => {
+    if (!arg || commandNames.has(arg)) return [];
+    const fragments = arg.match(/[A-Za-z0-9_./:@=-]{4,}/g) ?? [];
+    return [arg, ...fragments];
+  }))].sort((a, b) => b.length - a.length);
+
+  for (const arg of sensitiveArgs) {
+    message = message.split(arg).join('[redacted]');
+  }
+
+  return message;
+}
+
+async function cmuxExecPrimaryWithLegacyFallback(
+  primaryArgs: string[],
+  legacyArgs: string[],
+): Promise<{ stdout: string; stderr: string }> {
+  try {
+    return await cmuxExecAsync(primaryArgs);
+  } catch (primaryError) {
+    if (!isCmuxDialectFailure(primaryError)) {
+      const primaryMessage = redactCmuxFailureMessage(primaryError, [primaryArgs]);
+      const error = new Error(
+        `cmux command failed for current form: current=${primaryArgs[0] ?? '<unknown>'} (${primaryMessage})`,
+      );
+      (error as { cause?: unknown }).cause = primaryError;
+      throw error;
+    }
+
+    try {
+      return await cmuxExecAsync(legacyArgs);
+    } catch (legacyError) {
+      const primaryMessage = redactCmuxFailureMessage(primaryError, [primaryArgs, legacyArgs]);
+      const legacyMessage = redactCmuxFailureMessage(legacyError, [primaryArgs, legacyArgs]);
+      throw new Error(
+        `cmux command failed for both current and legacy forms: current=${primaryArgs[0] ?? '<unknown>'} (${primaryMessage}); ` +
+        `legacy=${legacyArgs[0] ?? '<unknown>'} (${legacyMessage})`,
+      );
+    }
+  }
+}
+
 function parseCmuxSurfaceId(output: string): string {
   const trimmed = output.trim();
   const uuidMatch = trimmed.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
@@ -91,23 +151,65 @@ function parseCmuxSurfaceId(output: string): string {
   return token;
 }
 
-async function cmuxSplitSurface(targetSurfaceId: string, direction: 'right' | 'down', _cwd: string): Promise<string> {
+async function cmuxSplitSurface(targetSurfaceId: string, direction: 'right' | 'down', _cwd: string): Promise<{ stdout: string; stderr: string; paneId: string | null }> {
   const args = ['new-split', direction, '--surface', targetSurfaceId];
   if (process.env.CMUX_WORKSPACE_ID) args.push('--workspace', process.env.CMUX_WORKSPACE_ID);
   const result = await cmuxExecAsync(args);
-  return parseCmuxSurfaceId(result.stdout);
+  let paneId: string | null = null;
+  try { paneId = parseCmuxSurfaceId(result.stdout); } catch { /* successful split with unparseable identity */ }
+  return { ...result, paneId };
 }
 
 async function cmuxSendSurface(surfaceId: string, text: string): Promise<void> {
-  await cmuxExecAsync(['send', '--surface', surfaceId, text]);
+  // cmux 0.64.x targets a specific surface with the dedicated
+  // `send-surface` subcommand. `cmux send --surface ...` is parsed as the
+  // focused-surface form plus an unknown option in current cmux builds, which
+  // makes worker startup fail after the split/worktree has already been
+  // created. The top-level `omc team` catch then prints generic usage and the
+  // startup rollback tears the empty worktree down. (#3325)
+  await cmuxExecPrimaryWithLegacyFallback(
+    ['send-surface', '--surface', surfaceId, text],
+    ['send', '--surface', surfaceId, text],
+  );
+}
+
+function normalizeCmuxKey(key: string): string {
+  const normalized = key.trim();
+  const lower = normalized.toLowerCase();
+  switch (lower) {
+    case 'enter':
+    case 'return':
+    case 'tab':
+    case 'escape':
+    case 'esc':
+    case 'backspace':
+    case 'delete':
+    case 'up':
+    case 'down':
+    case 'left':
+    case 'right':
+      return lower === 'return' ? 'enter' : lower === 'esc' ? 'escape' : lower;
+    default:
+      return normalized;
+  }
 }
 
 async function cmuxSendSurfaceKey(surfaceId: string, key: string): Promise<void> {
-  await cmuxExecAsync(['send-key', '--surface', surfaceId, key]);
+  // See cmuxSendSurface(): targeting a surface uses `send-key-surface`, not a
+  // `--surface` option on `send-key`. Key names are lower-case in the cmux CLI
+  // reference; normalize common names while leaving advanced chord strings alone.
+  const normalizedKey = normalizeCmuxKey(key);
+  await cmuxExecPrimaryWithLegacyFallback(
+    ['send-key-surface', '--surface', surfaceId, normalizedKey],
+    ['send-key', '--surface', surfaceId, key],
+  );
 }
 
 async function cmuxCaptureSurface(surfaceId: string): Promise<string> {
-  const result = await cmuxExecAsync(['capture-pane', '--surface', surfaceId, '--scrollback']);
+  const result = await cmuxExecPrimaryWithLegacyFallback(
+    ['read-screen', '--surface', surfaceId],
+    ['capture-pane', '--surface', surfaceId, '--scrollback'],
+  );
   return result.stdout;
 }
 
@@ -285,6 +387,25 @@ function paneCurrentCommandLooksReady(command: string): boolean {
     || ['cmd', 'powershell', 'pwsh', 'nu', 'elvish'].includes(normalized);
 }
 
+async function getPaneCurrentCommandStatus(paneId: string): Promise<{ dead: boolean; command: string } | null> {
+  try {
+    const result = await tmuxCmdAsync([
+      'display-message', '-p', '-t', paneId,
+      '#{pane_dead} #{pane_current_command}',
+    ], { timeout: 1000 });
+    const status = result.stdout.trim();
+    const [dead, ...commandParts] = status.split(/\s+/);
+    return { dead: dead === '1', command: commandParts.join(' ') };
+  } catch {
+    return null;
+  }
+}
+
+function paneCurrentCommandLooksSubmitted(command: string): boolean {
+  return command.length > 0 && !paneCurrentCommandLooksReady(command);
+}
+
+
 export interface WaitForShellReadyOptions {
   timeoutMs?: number;
   pollIntervalMs?: number;
@@ -303,20 +424,13 @@ async function waitForShellReady(paneId: string, opts: WaitForShellReadyOptions 
   const deadline = Date.now() + timeoutMs;
   let lastStatus = '';
   while (Date.now() < deadline) {
-    try {
-      const result = await tmuxCmdAsync([
-        'display-message', '-p', '-t', paneId,
-        '#{pane_dead} #{pane_current_command}',
-      ], { timeout: 1000 });
-      lastStatus = result.stdout.trim();
-      const [dead, ...commandParts] = lastStatus.split(/\s+/);
-      if (dead === '1') return false;
-      const currentCommand = commandParts.join(' ');
-      if (currentCommand && paneCurrentCommandLooksReady(currentCommand)) {
+    const status = await getPaneCurrentCommandStatus(paneId);
+    if (status) {
+      lastStatus = `${status.dead ? '1' : '0'} ${status.command}`.trim();
+      if (status.dead) return false;
+      if (paneCurrentCommandLooksReady(status.command)) {
         return true;
       }
-    } catch (error) {
-      lastStatus = error instanceof Error ? error.message : String(error);
     }
     await sleep(pollIntervalMs);
   }
@@ -345,11 +459,38 @@ async function verifyWorkerStartCommandDelivered(paneId: string, startCmd: strin
   return false;
 }
 
-async function verifyWorkerStartCommandSubmitted(paneId: string, startCmd: string): Promise<boolean> {
+function resolvePositiveIntegerEnv(name: string, fallback: number): number {
+  const value = Number.parseInt(process.env[name] ?? '', 10);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+
+interface WorkerStartSubmitVerificationOptions {
+  timeoutMs?: number;
+  initialPollIntervalMs?: number;
+  maxPollIntervalMs?: number;
+}
+
+async function verifyWorkerStartCommandSubmitted(
+  paneId: string,
+  startCmd: string,
+  opts: WorkerStartSubmitVerificationOptions = {},
+): Promise<boolean> {
   if (isCmuxSurfaceTarget(paneId)) return true;
   const expected = normalizeTmuxCapture(startCmd);
   const compactExpected = normalizeTmuxCaptureForDelivery(startCmd);
-  for (let attempt = 1; attempt <= 5; attempt++) {
+  const timeoutMs = Number.isFinite(opts.timeoutMs) && (opts.timeoutMs ?? 0) > 0
+    ? Number(opts.timeoutMs)
+    : resolvePositiveIntegerEnv('OMC_TEAM_START_SUBMIT_TIMEOUT_MS', 8_000);
+  const maxPollIntervalMs = Number.isFinite(opts.maxPollIntervalMs) && (opts.maxPollIntervalMs ?? 0) > 0
+    ? Number(opts.maxPollIntervalMs)
+    : 500;
+  let pollIntervalMs = Number.isFinite(opts.initialPollIntervalMs) && (opts.initialPollIntervalMs ?? 0) > 0
+    ? Number(opts.initialPollIntervalMs)
+    : 50;
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
     const captured = await capturePaneAsync(paneId, { joinWrappedLines: true });
     const normalizedCaptured = normalizeTmuxCapture(captured);
     const commandStillBuffered = normalizedCaptured.includes(expected)
@@ -357,7 +498,17 @@ async function verifyWorkerStartCommandSubmitted(paneId: string, startCmd: strin
     if (!commandStillBuffered) {
       return true;
     }
-    await sleep(50);
+    const status = await getPaneCurrentCommandStatus(paneId);
+    if (status?.dead) {
+      return false;
+    }
+    if (status && paneCurrentCommandLooksSubmitted(status.command)) {
+      return true;
+    }
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) break;
+    await sleep(Math.min(pollIntervalMs, remainingMs));
+    pollIntervalMs = Math.min(Math.max(pollIntervalMs * 2, pollIntervalMs + 1), maxPollIntervalMs);
   }
   return false;
 }
@@ -667,22 +818,55 @@ export function spawnBridgeInSession(
  * createTeamSession() already branches this way for panes created up front; the
  * on-demand worker spawns in both team runtimes must do the same. (#3267)
  */
+export interface WorkerPaneSplitEvidence {
+  commandSucceeded: boolean;
+  provider: 'tmux' | 'cmux';
+  splitTarget: string;
+  direction: 'right' | 'down';
+  rawOutput: string;
+  stderr: string;
+  paneId: string | null;
+}
+
+export async function splitTeamWorkerPaneWithEvidence(
+  splitTarget: string,
+  direction: 'right' | 'down',
+  cwd: string,
+): Promise<WorkerPaneSplitEvidence> {
+  const provider = isCmuxContext() ? 'cmux' as const : 'tmux' as const;
+  try {
+    if (provider === 'cmux') {
+      const splitResult = await cmuxSplitSurface(splitTarget, direction, cwd);
+      return { commandSucceeded: true, provider, splitTarget, direction, rawOutput: splitResult.stdout,
+        stderr: splitResult.stderr, paneId: splitResult.paneId };
+    }
+    const splitType = direction === 'right' ? '-h' : '-v';
+    const splitResult = await tmuxExecAsync([
+      'split-window', splitType, '-t', splitTarget,
+      '-d', '-P', '-F', '#{pane_id}',
+      '-c', cwd,
+      ...workerPaneShellCommand(),
+    ]);
+    const rawOutput = splitResult.stdout;
+    const candidate = rawOutput.split('\n')[0]?.trim() ?? '';
+    return { commandSucceeded: true, provider, splitTarget, direction, rawOutput, stderr: splitResult.stderr,
+      paneId: /^%\d+$/.test(candidate) ? candidate : null };
+  } catch (error) {
+    const failure = error as { stdout?: unknown; stderr?: unknown; message?: unknown };
+    return { commandSucceeded: false, provider, splitTarget, direction,
+      rawOutput: typeof failure.stdout === 'string' ? failure.stdout : '',
+      stderr: typeof failure.stderr === 'string' ? failure.stderr
+        : typeof failure.message === 'string' ? failure.message : String(error),
+      paneId: null };
+  }
+}
+
 export async function splitTeamWorkerPane(
   splitTarget: string,
   direction: 'right' | 'down',
   cwd: string,
 ): Promise<string | null> {
-  if (isCmuxContext()) {
-    return cmuxSplitSurface(splitTarget, direction, cwd);
-  }
-  const splitType = direction === 'right' ? '-h' : '-v';
-  const splitResult = await tmuxExecAsync([
-    'split-window', splitType, '-t', splitTarget,
-    '-d', '-P', '-F', '#{pane_id}',
-    '-c', cwd,
-    ...workerPaneShellCommand(),
-  ]);
-  return splitResult.stdout.split('\n')[0]?.trim() || null;
+  return (await splitTeamWorkerPaneWithEvidence(splitTarget, direction, cwd)).paneId;
 }
 
 export async function createTeamSession(
@@ -811,7 +995,9 @@ export async function createTeamSession(
     const splitTarget = i === 0 ? leaderPaneId : workerPaneIds[i - 1];
     if (inCmux) {
       const direction = i === 0 ? 'right' : 'down';
-      workerPaneIds.push(await cmuxSplitSurface(splitTarget, direction, cwd));
+      const split = await cmuxSplitSurface(splitTarget, direction, cwd);
+      if (!split.paneId) throw new Error(`Failed to resolve cmux surface id: ${JSON.stringify(split.stdout.trim())}`);
+      workerPaneIds.push(split.paneId);
       continue;
     }
 

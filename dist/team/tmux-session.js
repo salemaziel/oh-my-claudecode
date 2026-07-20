@@ -68,6 +68,55 @@ async function cmuxExecAsync(args) {
         stderr: typeof result.stderr === 'string' ? result.stderr : String(result.stderr ?? ''),
     };
 }
+function getCmuxErrorText(error) {
+    if (error instanceof Error) {
+        const stderr = typeof error.stderr === 'string'
+            ? error.stderr
+            : '';
+        return `${error.message}\n${stderr}`.trim();
+    }
+    return String(error);
+}
+function isCmuxDialectFailure(error) {
+    const text = getCmuxErrorText(error);
+    return /(?:unknown|unrecognized|invalid|unsupported) (?:command|subcommand|option)|no such (?:command|subcommand)|Found argument .*--surface.*wasn't expected|unexpected argument|unexpected option/i.test(text);
+}
+function redactCmuxFailureMessage(error, argLists) {
+    let message = getCmuxErrorText(error);
+    const commandNames = new Set(argLists.map(args => args[0]).filter(Boolean));
+    const sensitiveArgs = [...new Set(argLists.flatMap(args => args).flatMap(arg => {
+            if (!arg || commandNames.has(arg))
+                return [];
+            const fragments = arg.match(/[A-Za-z0-9_./:@=-]{4,}/g) ?? [];
+            return [arg, ...fragments];
+        }))].sort((a, b) => b.length - a.length);
+    for (const arg of sensitiveArgs) {
+        message = message.split(arg).join('[redacted]');
+    }
+    return message;
+}
+async function cmuxExecPrimaryWithLegacyFallback(primaryArgs, legacyArgs) {
+    try {
+        return await cmuxExecAsync(primaryArgs);
+    }
+    catch (primaryError) {
+        if (!isCmuxDialectFailure(primaryError)) {
+            const primaryMessage = redactCmuxFailureMessage(primaryError, [primaryArgs]);
+            const error = new Error(`cmux command failed for current form: current=${primaryArgs[0] ?? '<unknown>'} (${primaryMessage})`);
+            error.cause = primaryError;
+            throw error;
+        }
+        try {
+            return await cmuxExecAsync(legacyArgs);
+        }
+        catch (legacyError) {
+            const primaryMessage = redactCmuxFailureMessage(primaryError, [primaryArgs, legacyArgs]);
+            const legacyMessage = redactCmuxFailureMessage(legacyError, [primaryArgs, legacyArgs]);
+            throw new Error(`cmux command failed for both current and legacy forms: current=${primaryArgs[0] ?? '<unknown>'} (${primaryMessage}); ` +
+                `legacy=${legacyArgs[0] ?? '<unknown>'} (${legacyMessage})`);
+        }
+    }
+}
 function parseCmuxSurfaceId(output) {
     const trimmed = output.trim();
     const uuidMatch = trimmed.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
@@ -87,13 +136,43 @@ async function cmuxSplitSurface(targetSurfaceId, direction, _cwd) {
     return parseCmuxSurfaceId(result.stdout);
 }
 async function cmuxSendSurface(surfaceId, text) {
-    await cmuxExecAsync(['send', '--surface', surfaceId, text]);
+    // cmux 0.64.x targets a specific surface with the dedicated
+    // `send-surface` subcommand. `cmux send --surface ...` is parsed as the
+    // focused-surface form plus an unknown option in current cmux builds, which
+    // makes worker startup fail after the split/worktree has already been
+    // created. The top-level `omc team` catch then prints generic usage and the
+    // startup rollback tears the empty worktree down. (#3325)
+    await cmuxExecPrimaryWithLegacyFallback(['send-surface', '--surface', surfaceId, text], ['send', '--surface', surfaceId, text]);
+}
+function normalizeCmuxKey(key) {
+    const normalized = key.trim();
+    const lower = normalized.toLowerCase();
+    switch (lower) {
+        case 'enter':
+        case 'return':
+        case 'tab':
+        case 'escape':
+        case 'esc':
+        case 'backspace':
+        case 'delete':
+        case 'up':
+        case 'down':
+        case 'left':
+        case 'right':
+            return lower === 'return' ? 'enter' : lower === 'esc' ? 'escape' : lower;
+        default:
+            return normalized;
+    }
 }
 async function cmuxSendSurfaceKey(surfaceId, key) {
-    await cmuxExecAsync(['send-key', '--surface', surfaceId, key]);
+    // See cmuxSendSurface(): targeting a surface uses `send-key-surface`, not a
+    // `--surface` option on `send-key`. Key names are lower-case in the cmux CLI
+    // reference; normalize common names while leaving advanced chord strings alone.
+    const normalizedKey = normalizeCmuxKey(key);
+    await cmuxExecPrimaryWithLegacyFallback(['send-key-surface', '--surface', surfaceId, normalizedKey], ['send-key', '--surface', surfaceId, key]);
 }
 async function cmuxCaptureSurface(surfaceId) {
-    const result = await cmuxExecAsync(['capture-pane', '--surface', surfaceId, '--scrollback']);
+    const result = await cmuxExecPrimaryWithLegacyFallback(['read-screen', '--surface', surfaceId], ['capture-pane', '--surface', surfaceId, '--scrollback']);
     return result.stdout;
 }
 async function cmuxCloseSurface(surfaceId) {
@@ -276,12 +355,26 @@ async function verifyWorkerStartCommandDelivered(paneId, startCmd) {
     }
     return false;
 }
-async function verifyWorkerStartCommandSubmitted(paneId, startCmd) {
+function resolvePositiveIntegerEnv(name, fallback) {
+    const value = Number.parseInt(process.env[name] ?? '', 10);
+    return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+async function verifyWorkerStartCommandSubmitted(paneId, startCmd, opts = {}) {
     if (isCmuxSurfaceTarget(paneId))
         return true;
     const expected = normalizeTmuxCapture(startCmd);
     const compactExpected = normalizeTmuxCaptureForDelivery(startCmd);
-    for (let attempt = 1; attempt <= 5; attempt++) {
+    const timeoutMs = Number.isFinite(opts.timeoutMs) && (opts.timeoutMs ?? 0) > 0
+        ? Number(opts.timeoutMs)
+        : resolvePositiveIntegerEnv('OMC_TEAM_START_SUBMIT_TIMEOUT_MS', 8_000);
+    const maxPollIntervalMs = Number.isFinite(opts.maxPollIntervalMs) && (opts.maxPollIntervalMs ?? 0) > 0
+        ? Number(opts.maxPollIntervalMs)
+        : 500;
+    let pollIntervalMs = Number.isFinite(opts.initialPollIntervalMs) && (opts.initialPollIntervalMs ?? 0) > 0
+        ? Number(opts.initialPollIntervalMs)
+        : 50;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
         const captured = await capturePaneAsync(paneId, { joinWrappedLines: true });
         const normalizedCaptured = normalizeTmuxCapture(captured);
         const commandStillBuffered = normalizedCaptured.includes(expected)
@@ -289,7 +382,11 @@ async function verifyWorkerStartCommandSubmitted(paneId, startCmd) {
         if (!commandStillBuffered) {
             return true;
         }
-        await sleep(50);
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0)
+            break;
+        await sleep(Math.min(pollIntervalMs, remainingMs));
+        pollIntervalMs = Math.min(Math.max(pollIntervalMs * 2, pollIntervalMs + 1), maxPollIntervalMs);
     }
     return false;
 }

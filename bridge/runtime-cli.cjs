@@ -237,12 +237,37 @@ function readWorkspaceMarkerConfig(workspaceRoot) {
     return {};
   }
 }
-function getWorktreeRoot(cwd) {
+function resolveSuperprojectRoot(cwd) {
+  let anchor = null;
+  let probeCwd = cwd;
+  for (let depth = 0; depth < 32; depth++) {
+    let superRoot;
+    try {
+      superRoot = (0, import_child_process3.execSync)("git rev-parse --show-superproject-working-tree", {
+        cwd: probeCwd,
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+        timeout: 5e3
+      }).trim();
+    } catch {
+      break;
+    }
+    if (!superRoot) break;
+    anchor = superRoot;
+    probeCwd = superRoot;
+  }
+  return anchor;
+}
+function resolveStateAnchorRoot(worktreeRoot) {
+  if (worktreeRoot) return resolveSuperprojectRoot(worktreeRoot) || worktreeRoot;
+  return getWorktreeRoot() || process.cwd();
+}
+function getGitTopLevel(cwd) {
   const effectiveCwd = cwd || process.cwd();
-  if (worktreeCacheMap.has(effectiveCwd)) {
-    const root = worktreeCacheMap.get(effectiveCwd);
-    worktreeCacheMap.delete(effectiveCwd);
-    worktreeCacheMap.set(effectiveCwd, root);
+  if (toplevelCacheMap.has(effectiveCwd)) {
+    const root = toplevelCacheMap.get(effectiveCwd);
+    toplevelCacheMap.delete(effectiveCwd);
+    toplevelCacheMap.set(effectiveCwd, root);
     return root || null;
   }
   try {
@@ -252,20 +277,39 @@ function getWorktreeRoot(cwd) {
       stdio: ["pipe", "pipe", "pipe"],
       timeout: 5e3
     }).trim();
-    if (worktreeCacheMap.size >= MAX_WORKTREE_CACHE_SIZE) {
-      const oldest = worktreeCacheMap.keys().next().value;
-      if (oldest !== void 0) {
-        worktreeCacheMap.delete(oldest);
-      }
+    if (toplevelCacheMap.size >= MAX_WORKTREE_CACHE_SIZE) {
+      const oldest = toplevelCacheMap.keys().next().value;
+      if (oldest !== void 0) toplevelCacheMap.delete(oldest);
     }
-    worktreeCacheMap.set(effectiveCwd, root);
+    toplevelCacheMap.set(effectiveCwd, root);
     return root;
   } catch {
     return null;
   }
 }
+function getWorktreeRoot(cwd) {
+  const effectiveCwd = cwd || process.cwd();
+  if (worktreeCacheMap.has(effectiveCwd)) {
+    const root2 = worktreeCacheMap.get(effectiveCwd);
+    worktreeCacheMap.delete(effectiveCwd);
+    worktreeCacheMap.set(effectiveCwd, root2);
+    return root2 || null;
+  }
+  const root = resolveSuperprojectRoot(effectiveCwd) || getGitTopLevel(effectiveCwd);
+  if (!root) {
+    return null;
+  }
+  if (worktreeCacheMap.size >= MAX_WORKTREE_CACHE_SIZE) {
+    const oldest = worktreeCacheMap.keys().next().value;
+    if (oldest !== void 0) {
+      worktreeCacheMap.delete(oldest);
+    }
+  }
+  worktreeCacheMap.set(effectiveCwd, root);
+  return root;
+}
 function getProjectIdentifier(worktreeRoot) {
-  const root = worktreeRoot || getWorktreeRoot() || process.cwd();
+  const root = worktreeRoot || getGitTopLevel() || process.cwd();
   const workspaceRoot = findWorkspaceRoot(root);
   if (workspaceRoot) {
     const cfg = readWorkspaceMarkerConfig(workspaceRoot);
@@ -314,7 +358,7 @@ function getProjectIdentifier(worktreeRoot) {
 function getOmcRoot(worktreeRoot) {
   const customDir = process.env.OMC_STATE_DIR;
   if (customDir) {
-    const root2 = worktreeRoot || getWorktreeRoot() || process.cwd();
+    const root2 = worktreeRoot || getGitTopLevel() || process.cwd();
     const projectId = getProjectIdentifier(root2);
     const centralizedPath = (0, import_path8.join)(customDir, projectId);
     const legacyPath = (0, import_path8.join)(root2, OmcPaths.ROOT);
@@ -331,10 +375,10 @@ function getOmcRoot(worktreeRoot) {
   if (workspaceAnchor) {
     return (0, import_path8.join)(workspaceAnchor, OmcPaths.ROOT);
   }
-  const root = worktreeRoot || getWorktreeRoot() || process.cwd();
+  const root = resolveStateAnchorRoot(worktreeRoot);
   return (0, import_path8.join)(root, OmcPaths.ROOT);
 }
-var import_crypto, import_child_process3, import_fs5, import_os3, import_path8, WORKSPACE_MARKER, OmcPaths, MAX_WORKTREE_CACHE_SIZE, worktreeCacheMap, workspaceCacheMap, dualDirWarnings;
+var import_crypto, import_child_process3, import_fs5, import_os3, import_path8, WORKSPACE_MARKER, OmcPaths, MAX_WORKTREE_CACHE_SIZE, worktreeCacheMap, toplevelCacheMap, workspaceCacheMap, dualDirWarnings;
 var init_worktree_paths = __esm({
   "src/lib/worktree-paths.ts"() {
     "use strict";
@@ -365,6 +409,7 @@ var init_worktree_paths = __esm({
     };
     MAX_WORKTREE_CACHE_SIZE = 8;
     worktreeCacheMap = /* @__PURE__ */ new Map();
+    toplevelCacheMap = /* @__PURE__ */ new Map();
     workspaceCacheMap = /* @__PURE__ */ new Map();
     dualDirWarnings = /* @__PURE__ */ new Set();
   }
@@ -489,6 +534,54 @@ async function cmuxExecAsync(args) {
     stderr: typeof result.stderr === "string" ? result.stderr : String(result.stderr ?? "")
   };
 }
+function getCmuxErrorText(error) {
+  if (error instanceof Error) {
+    const stderr = typeof error.stderr === "string" ? error.stderr : "";
+    return `${error.message}
+${stderr}`.trim();
+  }
+  return String(error);
+}
+function isCmuxDialectFailure(error) {
+  const text = getCmuxErrorText(error);
+  return /(?:unknown|unrecognized|invalid|unsupported) (?:command|subcommand|option)|no such (?:command|subcommand)|Found argument .*--surface.*wasn't expected|unexpected argument|unexpected option/i.test(text);
+}
+function redactCmuxFailureMessage(error, argLists) {
+  let message = getCmuxErrorText(error);
+  const commandNames = new Set(argLists.map((args) => args[0]).filter(Boolean));
+  const sensitiveArgs = [...new Set(argLists.flatMap((args) => args).flatMap((arg) => {
+    if (!arg || commandNames.has(arg)) return [];
+    const fragments = arg.match(/[A-Za-z0-9_./:@=-]{4,}/g) ?? [];
+    return [arg, ...fragments];
+  }))].sort((a, b) => b.length - a.length);
+  for (const arg of sensitiveArgs) {
+    message = message.split(arg).join("[redacted]");
+  }
+  return message;
+}
+async function cmuxExecPrimaryWithLegacyFallback(primaryArgs, legacyArgs) {
+  try {
+    return await cmuxExecAsync(primaryArgs);
+  } catch (primaryError) {
+    if (!isCmuxDialectFailure(primaryError)) {
+      const primaryMessage = redactCmuxFailureMessage(primaryError, [primaryArgs]);
+      const error = new Error(
+        `cmux command failed for current form: current=${primaryArgs[0] ?? "<unknown>"} (${primaryMessage})`
+      );
+      error.cause = primaryError;
+      throw error;
+    }
+    try {
+      return await cmuxExecAsync(legacyArgs);
+    } catch (legacyError) {
+      const primaryMessage = redactCmuxFailureMessage(primaryError, [primaryArgs, legacyArgs]);
+      const legacyMessage = redactCmuxFailureMessage(legacyError, [primaryArgs, legacyArgs]);
+      throw new Error(
+        `cmux command failed for both current and legacy forms: current=${primaryArgs[0] ?? "<unknown>"} (${primaryMessage}); legacy=${legacyArgs[0] ?? "<unknown>"} (${legacyMessage})`
+      );
+    }
+  }
+}
 function parseCmuxSurfaceId(output) {
   const trimmed = output.trim();
   const uuidMatch = trimmed.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
@@ -505,13 +598,43 @@ async function cmuxSplitSurface(targetSurfaceId, direction, _cwd) {
   return parseCmuxSurfaceId(result.stdout);
 }
 async function cmuxSendSurface(surfaceId, text) {
-  await cmuxExecAsync(["send", "--surface", surfaceId, text]);
+  await cmuxExecPrimaryWithLegacyFallback(
+    ["send-surface", "--surface", surfaceId, text],
+    ["send", "--surface", surfaceId, text]
+  );
+}
+function normalizeCmuxKey(key) {
+  const normalized = key.trim();
+  const lower = normalized.toLowerCase();
+  switch (lower) {
+    case "enter":
+    case "return":
+    case "tab":
+    case "escape":
+    case "esc":
+    case "backspace":
+    case "delete":
+    case "up":
+    case "down":
+    case "left":
+    case "right":
+      return lower === "return" ? "enter" : lower === "esc" ? "escape" : lower;
+    default:
+      return normalized;
+  }
 }
 async function cmuxSendSurfaceKey(surfaceId, key) {
-  await cmuxExecAsync(["send-key", "--surface", surfaceId, key]);
+  const normalizedKey = normalizeCmuxKey(key);
+  await cmuxExecPrimaryWithLegacyFallback(
+    ["send-key-surface", "--surface", surfaceId, normalizedKey],
+    ["send-key", "--surface", surfaceId, key]
+  );
 }
 async function cmuxCaptureSurface(surfaceId) {
-  const result = await cmuxExecAsync(["capture-pane", "--surface", surfaceId, "--scrollback"]);
+  const result = await cmuxExecPrimaryWithLegacyFallback(
+    ["read-screen", "--surface", surfaceId],
+    ["capture-pane", "--surface", surfaceId, "--scrollback"]
+  );
   return result.stdout;
 }
 async function cmuxCloseSurface(surfaceId) {
@@ -651,18 +774,29 @@ async function verifyWorkerStartCommandDelivered(paneId, startCmd) {
   }
   return false;
 }
-async function verifyWorkerStartCommandSubmitted(paneId, startCmd) {
+function resolvePositiveIntegerEnv(name, fallback) {
+  const value = Number.parseInt(process.env[name] ?? "", 10);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+async function verifyWorkerStartCommandSubmitted(paneId, startCmd, opts = {}) {
   if (isCmuxSurfaceTarget(paneId)) return true;
   const expected = normalizeTmuxCapture(startCmd);
   const compactExpected = normalizeTmuxCaptureForDelivery(startCmd);
-  for (let attempt = 1; attempt <= 5; attempt++) {
+  const timeoutMs = Number.isFinite(opts.timeoutMs) && (opts.timeoutMs ?? 0) > 0 ? Number(opts.timeoutMs) : resolvePositiveIntegerEnv("OMC_TEAM_START_SUBMIT_TIMEOUT_MS", 8e3);
+  const maxPollIntervalMs = Number.isFinite(opts.maxPollIntervalMs) && (opts.maxPollIntervalMs ?? 0) > 0 ? Number(opts.maxPollIntervalMs) : 500;
+  let pollIntervalMs = Number.isFinite(opts.initialPollIntervalMs) && (opts.initialPollIntervalMs ?? 0) > 0 ? Number(opts.initialPollIntervalMs) : 50;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
     const captured = await capturePaneAsync(paneId, { joinWrappedLines: true });
     const normalizedCaptured = normalizeTmuxCapture(captured);
     const commandStillBuffered = normalizedCaptured.includes(expected) || compactExpected.length > 0 && normalizeTmuxCaptureForDelivery(captured).includes(compactExpected);
     if (!commandStillBuffered) {
       return true;
     }
-    await sleep(50);
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) break;
+    await sleep(Math.min(pollIntervalMs, remainingMs));
+    pollIntervalMs = Math.min(Math.max(pollIntervalMs * 2, pollIntervalMs + 1), maxPollIntervalMs);
   }
   return false;
 }
@@ -2103,7 +2237,7 @@ var TIER_ENV_KEYS = {
 };
 var CLAUDE_FAMILY_DEFAULTS = {
   HAIKU: "claude-haiku-4-5",
-  SONNET: "claude-sonnet-4-6",
+  SONNET: "claude-sonnet-5",
   OPUS: "claude-opus-4-8",
   FABLE: "claude-fable-5"
 };
@@ -8618,30 +8752,32 @@ async function spawnV2Worker(opts) {
 }
 async function rollbackUnpersistedNativeWorktreeStartup(teamName, cwd, cause) {
   const safety = inspectTeamWorktreeCleanupSafety(teamName, cwd);
-  if (!safety.hasEvidence) return;
   const teamRoot = absPath(cwd, TeamPaths.root(teamName));
   const errorMessage = cause instanceof Error ? cause.message : String(cause);
+  const recordedAt = (/* @__PURE__ */ new Date()).toISOString();
+  const writeFailureMarker = async (extra = {}) => {
+    await (0, import_promises10.mkdir)(teamRoot, { recursive: true });
+    await (0, import_promises10.writeFile)((0, import_path22.join)(teamRoot, "startup-failure.json"), JSON.stringify({
+      reason: "startup_failed_before_config_persisted",
+      error: errorMessage,
+      recorded_at: recordedAt,
+      ...extra
+    }, null, 2), "utf-8");
+  };
+  if (!safety.hasEvidence) {
+    await writeFailureMarker();
+    return;
+  }
   try {
     const cleanup = cleanupTeamWorktrees(teamName, cwd);
     if (cleanup.preserved.length === 0) {
       await (0, import_promises10.rm)(teamRoot, { recursive: true, force: true });
-      return;
     }
-    await (0, import_promises10.mkdir)(teamRoot, { recursive: true });
-    await (0, import_promises10.writeFile)((0, import_path22.join)(teamRoot, "startup-failure.json"), JSON.stringify({
-      reason: "startup_failed_before_config_persisted",
-      error: errorMessage,
-      preserved: cleanup.preserved,
-      recorded_at: (/* @__PURE__ */ new Date()).toISOString()
-    }, null, 2), "utf-8");
+    await writeFailureMarker({ preserved: cleanup.preserved });
   } catch (rollbackError) {
-    await (0, import_promises10.mkdir)(teamRoot, { recursive: true });
-    await (0, import_promises10.writeFile)((0, import_path22.join)(teamRoot, "startup-failure.json"), JSON.stringify({
-      reason: "startup_failed_before_config_persisted",
-      error: errorMessage,
-      rollback_error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
-      recorded_at: (/* @__PURE__ */ new Date()).toISOString()
-    }, null, 2), "utf-8");
+    await writeFailureMarker({
+      rollback_error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
+    });
   }
 }
 async function rollbackStartedNativeWorktreeStartup(args) {

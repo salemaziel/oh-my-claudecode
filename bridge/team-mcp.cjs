@@ -17920,6 +17920,7 @@ var OmcPaths = {
 };
 var MAX_WORKTREE_CACHE_SIZE = 8;
 var worktreeCacheMap = /* @__PURE__ */ new Map();
+var toplevelCacheMap = /* @__PURE__ */ new Map();
 var workspaceCacheMap = /* @__PURE__ */ new Map();
 function findWorkspaceRoot(startDir) {
   if (process.env.OMC_DISABLE_MULTIREPO === "1") return null;
@@ -17975,12 +17976,37 @@ function readWorkspaceMarkerConfig(workspaceRoot) {
     return {};
   }
 }
-function getWorktreeRoot(cwd) {
+function resolveSuperprojectRoot(cwd) {
+  let anchor = null;
+  let probeCwd = cwd;
+  for (let depth = 0; depth < 32; depth++) {
+    let superRoot;
+    try {
+      superRoot = (0, import_child_process.execSync)("git rev-parse --show-superproject-working-tree", {
+        cwd: probeCwd,
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+        timeout: 5e3
+      }).trim();
+    } catch {
+      break;
+    }
+    if (!superRoot) break;
+    anchor = superRoot;
+    probeCwd = superRoot;
+  }
+  return anchor;
+}
+function resolveStateAnchorRoot(worktreeRoot) {
+  if (worktreeRoot) return resolveSuperprojectRoot(worktreeRoot) || worktreeRoot;
+  return getWorktreeRoot() || process.cwd();
+}
+function getGitTopLevel(cwd) {
   const effectiveCwd = cwd || process.cwd();
-  if (worktreeCacheMap.has(effectiveCwd)) {
-    const root = worktreeCacheMap.get(effectiveCwd);
-    worktreeCacheMap.delete(effectiveCwd);
-    worktreeCacheMap.set(effectiveCwd, root);
+  if (toplevelCacheMap.has(effectiveCwd)) {
+    const root = toplevelCacheMap.get(effectiveCwd);
+    toplevelCacheMap.delete(effectiveCwd);
+    toplevelCacheMap.set(effectiveCwd, root);
     return root || null;
   }
   try {
@@ -17990,21 +18016,40 @@ function getWorktreeRoot(cwd) {
       stdio: ["pipe", "pipe", "pipe"],
       timeout: 5e3
     }).trim();
-    if (worktreeCacheMap.size >= MAX_WORKTREE_CACHE_SIZE) {
-      const oldest = worktreeCacheMap.keys().next().value;
-      if (oldest !== void 0) {
-        worktreeCacheMap.delete(oldest);
-      }
+    if (toplevelCacheMap.size >= MAX_WORKTREE_CACHE_SIZE) {
+      const oldest = toplevelCacheMap.keys().next().value;
+      if (oldest !== void 0) toplevelCacheMap.delete(oldest);
     }
-    worktreeCacheMap.set(effectiveCwd, root);
+    toplevelCacheMap.set(effectiveCwd, root);
     return root;
   } catch {
     return null;
   }
 }
+function getWorktreeRoot(cwd) {
+  const effectiveCwd = cwd || process.cwd();
+  if (worktreeCacheMap.has(effectiveCwd)) {
+    const root2 = worktreeCacheMap.get(effectiveCwd);
+    worktreeCacheMap.delete(effectiveCwd);
+    worktreeCacheMap.set(effectiveCwd, root2);
+    return root2 || null;
+  }
+  const root = resolveSuperprojectRoot(effectiveCwd) || getGitTopLevel(effectiveCwd);
+  if (!root) {
+    return null;
+  }
+  if (worktreeCacheMap.size >= MAX_WORKTREE_CACHE_SIZE) {
+    const oldest = worktreeCacheMap.keys().next().value;
+    if (oldest !== void 0) {
+      worktreeCacheMap.delete(oldest);
+    }
+  }
+  worktreeCacheMap.set(effectiveCwd, root);
+  return root;
+}
 var dualDirWarnings = /* @__PURE__ */ new Set();
 function getProjectIdentifier(worktreeRoot) {
-  const root = worktreeRoot || getWorktreeRoot() || process.cwd();
+  const root = worktreeRoot || getGitTopLevel() || process.cwd();
   const workspaceRoot = findWorkspaceRoot(root);
   if (workspaceRoot) {
     const cfg = readWorkspaceMarkerConfig(workspaceRoot);
@@ -18053,7 +18098,7 @@ function getProjectIdentifier(worktreeRoot) {
 function getOmcRoot(worktreeRoot) {
   const customDir = process.env.OMC_STATE_DIR;
   if (customDir) {
-    const root2 = worktreeRoot || getWorktreeRoot() || process.cwd();
+    const root2 = worktreeRoot || getGitTopLevel() || process.cwd();
     const projectId = getProjectIdentifier(root2);
     const centralizedPath = (0, import_path2.join)(customDir, projectId);
     const legacyPath = (0, import_path2.join)(root2, OmcPaths.ROOT);
@@ -18070,7 +18115,7 @@ function getOmcRoot(worktreeRoot) {
   if (workspaceAnchor) {
     return (0, import_path2.join)(workspaceAnchor, OmcPaths.ROOT);
   }
-  const root = worktreeRoot || getWorktreeRoot() || process.cwd();
+  const root = resolveStateAnchorRoot(worktreeRoot);
   return (0, import_path2.join)(root, OmcPaths.ROOT);
 }
 
@@ -18178,14 +18223,92 @@ async function cmuxExecAsync(args) {
     stderr: typeof result.stderr === "string" ? result.stderr : String(result.stderr ?? "")
   };
 }
+function getCmuxErrorText(error2) {
+  if (error2 instanceof Error) {
+    const stderr = typeof error2.stderr === "string" ? error2.stderr : "";
+    return `${error2.message}
+${stderr}`.trim();
+  }
+  return String(error2);
+}
+function isCmuxDialectFailure(error2) {
+  const text = getCmuxErrorText(error2);
+  return /(?:unknown|unrecognized|invalid|unsupported) (?:command|subcommand|option)|no such (?:command|subcommand)|Found argument .*--surface.*wasn't expected|unexpected argument|unexpected option/i.test(text);
+}
+function redactCmuxFailureMessage(error2, argLists) {
+  let message = getCmuxErrorText(error2);
+  const commandNames = new Set(argLists.map((args) => args[0]).filter(Boolean));
+  const sensitiveArgs = [...new Set(argLists.flatMap((args) => args).flatMap((arg) => {
+    if (!arg || commandNames.has(arg)) return [];
+    const fragments = arg.match(/[A-Za-z0-9_./:@=-]{4,}/g) ?? [];
+    return [arg, ...fragments];
+  }))].sort((a, b) => b.length - a.length);
+  for (const arg of sensitiveArgs) {
+    message = message.split(arg).join("[redacted]");
+  }
+  return message;
+}
+async function cmuxExecPrimaryWithLegacyFallback(primaryArgs, legacyArgs) {
+  try {
+    return await cmuxExecAsync(primaryArgs);
+  } catch (primaryError) {
+    if (!isCmuxDialectFailure(primaryError)) {
+      const primaryMessage = redactCmuxFailureMessage(primaryError, [primaryArgs]);
+      const error2 = new Error(
+        `cmux command failed for current form: current=${primaryArgs[0] ?? "<unknown>"} (${primaryMessage})`
+      );
+      error2.cause = primaryError;
+      throw error2;
+    }
+    try {
+      return await cmuxExecAsync(legacyArgs);
+    } catch (legacyError) {
+      const primaryMessage = redactCmuxFailureMessage(primaryError, [primaryArgs, legacyArgs]);
+      const legacyMessage = redactCmuxFailureMessage(legacyError, [primaryArgs, legacyArgs]);
+      throw new Error(
+        `cmux command failed for both current and legacy forms: current=${primaryArgs[0] ?? "<unknown>"} (${primaryMessage}); legacy=${legacyArgs[0] ?? "<unknown>"} (${legacyMessage})`
+      );
+    }
+  }
+}
 async function cmuxSendSurface(surfaceId, text) {
-  await cmuxExecAsync(["send", "--surface", surfaceId, text]);
+  await cmuxExecPrimaryWithLegacyFallback(
+    ["send-surface", "--surface", surfaceId, text],
+    ["send", "--surface", surfaceId, text]
+  );
+}
+function normalizeCmuxKey(key) {
+  const normalized = key.trim();
+  const lower = normalized.toLowerCase();
+  switch (lower) {
+    case "enter":
+    case "return":
+    case "tab":
+    case "escape":
+    case "esc":
+    case "backspace":
+    case "delete":
+    case "up":
+    case "down":
+    case "left":
+    case "right":
+      return lower === "return" ? "enter" : lower === "esc" ? "escape" : lower;
+    default:
+      return normalized;
+  }
 }
 async function cmuxSendSurfaceKey(surfaceId, key) {
-  await cmuxExecAsync(["send-key", "--surface", surfaceId, key]);
+  const normalizedKey = normalizeCmuxKey(key);
+  await cmuxExecPrimaryWithLegacyFallback(
+    ["send-key-surface", "--surface", surfaceId, normalizedKey],
+    ["send-key", "--surface", surfaceId, key]
+  );
 }
 async function cmuxCaptureSurface(surfaceId) {
-  const result = await cmuxExecAsync(["capture-pane", "--surface", surfaceId, "--scrollback"]);
+  const result = await cmuxExecPrimaryWithLegacyFallback(
+    ["read-screen", "--surface", surfaceId],
+    ["capture-pane", "--surface", surfaceId, "--scrollback"]
+  );
   return result.stdout;
 }
 async function cmuxCloseSurface(surfaceId) {
