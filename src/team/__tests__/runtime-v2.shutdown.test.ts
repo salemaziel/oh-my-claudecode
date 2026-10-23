@@ -20,6 +20,7 @@ import * as processIdentityLockModule from '../process-identity-lock.js';
 import { resolveRuntimeCliPath } from '../runtime-owner-client.js';
 import { absPath, TeamPaths, teamStateRoot } from '../state-paths.js';
 import { getOmcRoot } from '../../lib/worktree-paths.js';
+import { readShutdownAck } from '../monitor.js';
 
 const TEAM_INSTANCE_ID = '11111111-1111-4111-8111-111111111111';
 const REPLACEMENT_INSTANCE_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
@@ -130,6 +131,57 @@ async function prepareAcceptedLaunch(cwd: string, teamName: string, workerName: 
   }
   return attempt;
 }
+
+describe('readShutdownAck validation', () => {
+  let cwd: string;
+  const requestedAt = '2026-01-01T00:00:00.000Z';
+
+  beforeEach(() => {
+    cwd = mkdtempSync(join(tmpdir(), 'omc-monitor-shutdown-ack-'));
+    vi.stubEnv('OMC_STATE_DIR', join(cwd, 'omc-state'));
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it.each([
+    ['missing file', undefined, undefined, false],
+    ['valid legacy', { status: 'accept' }, undefined, true],
+    ['valid legacy reject', { status: 'reject' }, undefined, true],
+    ['valid extra field', { status: 'accept', source: 'legacy' }, undefined, true],
+    ['valid timestamped', { status: 'reject', reason: 'still working', updated_at: requestedAt }, undefined, true],
+    ['malformed JSON', '{', undefined, false],
+    ['null', null, undefined, false],
+    ['array', [], undefined, false],
+    ['primitive', 1, undefined, false],
+    ['missing status', {}, undefined, false],
+    ['unknown status', { status: 'pending' }, undefined, false],
+    ['non-string reason', { status: 'accept', reason: 1 }, undefined, false],
+    ['null updated_at', { status: 'accept', updated_at: null }, undefined, false],
+    ['numeric updated_at', { status: 'accept', updated_at: 1 }, undefined, false],
+    ['empty updated_at', { status: 'accept', updated_at: '' }, undefined, false],
+    ['invalid updated_at', { status: 'accept', updated_at: 'not-a-date' }, undefined, false],
+    ['missing fresh timestamp', { status: 'reject' }, requestedAt, false],
+    ['stale timestamp', { status: 'reject', updated_at: '2025-12-31T23:59:59.999Z' }, requestedAt, false],
+    ['equal timestamp', { status: 'accept', updated_at: requestedAt }, requestedAt, true],
+    ['equal timezone timestamp', { status: 'accept', updated_at: '2025-12-31T19:00:00.000-05:00' }, requestedAt, true],
+    ['newer timestamp', { status: 'reject', updated_at: '2026-01-01T00:00:00.001Z' }, requestedAt, true],
+    ['stale timezone timestamp', { status: 'reject', updated_at: '2026-01-01T01:59:59.999+02:00' }, requestedAt, false],
+    ['invalid fresh timestamp', { status: 'accept', updated_at: 'not-a-date' }, requestedAt, false],
+    ['empty requestedAfter', { status: 'accept', updated_at: requestedAt }, '', false],
+    ['invalid requestedAfter', { status: 'accept', updated_at: requestedAt }, 'not-a-date', false],
+  ])('validates %s', async (_label, value, requestedAfter, accepted) => {
+    if (value !== undefined) {
+      const path = absPath(cwd, TeamPaths.shutdownAck('shutdown-ack-team', 'worker-1'));
+      mkdirSync(join(path, '..'), { recursive: true });
+      writeFileSync(path, typeof value === 'string' ? value : JSON.stringify(value), 'utf8');
+    }
+    await expect(readShutdownAck('shutdown-ack-team', 'worker-1', cwd, requestedAfter))
+      .resolves.toStrictEqual(accepted ? value : null);
+  });
+});
 
 describe('shutdownTeamV2 detached worktree cleanup', () => {
   let repoDir: string;
@@ -774,7 +826,61 @@ describe('shutdownTeamV2 detached worktree cleanup', () => {
     expect(JSON.parse(readFileSync(configPath, 'utf8')).lifecycle_state).toBe('active');
   });
 
+  it('does not promise survival to a rejecting worker when forced shutdown proceeds with cleanup', async () => {
+    tmuxMocks.killOwnedWorkerPane.mockClear();
+    const teamName = 'shutdown-worker-rejected-force';
+    await reserveFixtureInstance(teamName, repoDir);
+    const teamRoot = fixtureTeamRoot(repoDir, teamName);
+    const workerRoot = join(teamRoot, 'workers', 'worker-1');
+    mkdirSync(workerRoot, { recursive: true });
+    const launchAttempt = await prepareAcceptedLaunch(repoDir, teamName, 'worker-1', '%77');
+    writeFileSync(join(teamRoot, 'config.json'), JSON.stringify({
+      name: teamName, instance_id: TEAM_INSTANCE_ID, tmux_server_identity: tmuxMocks.tmuxServerIdentity,
+      task: 'demo', agent_type: 'claude', worker_launch_mode: 'interactive',
+      worker_count: 1, max_workers: 20,
+      workers: [{
+        name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [], pane_id: '%77',
+        worker_cli: 'claude', launch_attempt_id: launchAttempt.attempt_id,
+        launch_descriptor: { schema_version: 1, provider: 'claude', model: null, binary: '/bin/echo', args: [] },
+      }],
+      created_at: new Date().toISOString(), tmux_session: `${teamName}:0`, lifecycle_state: 'active', state_revision: 4,
+      next_task_id: 1,
+    }));
+    writeFileSync(join(workerRoot, 'shutdown-ack.json'), JSON.stringify({
+      status: 'reject', reason: 'still working', updated_at: '2099-01-01T00:00:00.000Z',
+    }));
+    let inbox = '';
+    let events = '';
+    tmuxMocks.getWorkerLiveness.mockResolvedValue('alive');
+    tmuxMocks.killOwnedWorkerPane.mockImplementationOnce(async () => {
+      inbox = readFileSync(join(workerRoot, 'inbox.md'), 'utf8');
+      events = readFileSync(join(teamRoot, 'events.jsonl'), 'utf8');
+      tmuxMocks.getWorkerLiveness.mockResolvedValue('dead');
+    });
+
+    const { shutdownTeamV2 } = await import('../runtime-v2.js');
+    await expect(shutdownTeamV2(teamName, repoDir, { timeoutMs: 1_000, force: true }))
+      .resolves.toEqual({ outcome: 'cleaned' });
+
+    expect(tmuxMocks.killOwnedWorkerPane).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      paneId: '%77', provider: 'tmux', tmuxServerIdentity: tmuxMocks.tmuxServerIdentity,
+    }));
+    expect(events.trim().split('\n').map(line => JSON.parse(line))).toContainEqual(expect.objectContaining({
+      type: 'shutdown_ack', worker: 'worker-1', reason: 'reject:still working',
+    }));
+    expect(existsSync(teamRoot)).toBe(false);
+    const shutdownRoot = process.platform === 'win32' ? teamRoot : '$OMC_TEAM_STATE_ROOT';
+    expect(inbox).toContain(`Write your ack to: ${shutdownRoot}/workers/worker-1/shutdown-ack.json`);
+    expect(inbox).toContain('Accept: {"status":"accept","reason":"ok","updated_at":"<iso>"}');
+    expect(inbox).not.toContain('remain active for task work and mailbox instructions');
+    expect(inbox).not.toContain('do not exit because of this request');
+    expect(inbox).toContain('forced shutdown');
+    expect(inbox).toContain('rejection does not veto termination');
+    expect(inbox).toContain('do not resume task work');
+  });
+
   it('restores active lifecycle when a worker rejects normal shutdown before pane cleanup', async () => {
+    tmuxMocks.killOwnedWorkerPane.mockClear();
     const teamName = 'shutdown-worker-rejected';
     await reserveFixtureInstance(teamName, repoDir);
     const teamRoot = fixtureTeamRoot(repoDir, teamName);
@@ -797,6 +903,14 @@ describe('shutdownTeamV2 detached worktree cleanup', () => {
     await expect(shutdownTeamV2(teamName, repoDir, { timeoutMs: 25 }))
       .rejects.toThrow('shutdown_rejected:worker-1:still working');
 
+    const inbox = readFileSync(join(workerRoot, 'inbox.md'), 'utf8');
+    expect(inbox).toContain('Accept: {"status":"accept","reason":"ok","updated_at":"<iso>"}');
+    expect(inbox).toContain('Reject: {"status":"reject","reason":"still working","updated_at":"<iso>"}');
+    expect(inbox).toContain('If you accept, exit your session');
+    expect(inbox).toContain('If you reject, remain active for task work and mailbox instructions; do not exit because of this request');
+    expect(inbox).not.toContain('Then exit your session.');
+    expect(inbox).not.toContain('All tasks are complete.');
+    expect(tmuxMocks.killOwnedWorkerPane).not.toHaveBeenCalled();
     expect(tmuxMocks.killWorkerPanes).not.toHaveBeenCalled();
     expect(tmuxMocks.killTeamSession).not.toHaveBeenCalled();
     const persisted = JSON.parse(readFileSync(configPath, 'utf8'));

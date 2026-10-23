@@ -3132,9 +3132,11 @@ async function readShutdownAck(teamName, workerName, cwd, requestedAfter) {
   const ack = await readJsonSafe(
     absPath(cwd, TeamPaths.shutdownAck(teamName, workerName))
   );
-  if (!ack) return null;
-  if (requestedAfter && ack.updated_at) {
-    if (new Date(ack.updated_at).getTime() < new Date(requestedAfter).getTime()) {
+  if (!isRecord2(ack) || ack.status !== "accept" && ack.status !== "reject") return null;
+  if (ack.reason !== void 0 && typeof ack.reason !== "string" || ack.updated_at !== void 0 && !isTimestamp2(ack.updated_at)) return null;
+  if (requestedAfter !== void 0) {
+    if (!isTimestamp2(requestedAfter) || ack.updated_at === void 0) return null;
+    if (Date.parse(ack.updated_at) < Date.parse(requestedAfter)) {
       return null;
     }
   }
@@ -6410,6 +6412,13 @@ var init_file_lock = __esm({
   }
 });
 
+// src/utils/semver-compare.ts
+var init_semver_compare = __esm({
+  "src/utils/semver-compare.ts"() {
+    "use strict";
+  }
+});
+
 // src/utils/cache-occupancy.ts
 import { readdirSync as readdirSync3, lstatSync as lstatSync4, readFileSync as readFileSync8, unlinkSync as unlinkSync6 } from "fs";
 import { mkdir as mkdir6, writeFile as writeFile5, rename as rename5, rm as rm5 } from "fs/promises";
@@ -6479,6 +6488,7 @@ var init_paths = __esm({
   "src/utils/paths.ts"() {
     "use strict";
     init_config_dir();
+    init_semver_compare();
     init_cache_occupancy();
     init_plugin_cache_validation();
     OCCUPIED_CODES = new Set(
@@ -6514,18 +6524,97 @@ function buildWindowsSupervisorSource() {
     'if ($hash -ne $payload.authority_digest) { throw "worker_launch_authority_digest_mismatch" }',
     'Add-Type @"',
     "using System; using System.Text; using System.Runtime.InteropServices;",
-    `public static class O { [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] public struct STARTUPINFO { public int cb; public IntPtr lpReserved; public IntPtr lpDesktop; public IntPtr lpTitle; public int dwX; public int dwY; public int dwXSize; public int dwYSize; public int dwXCountChars; public int dwYCountChars; public int dwFillAttribute; public int dwFlags; public short wShowWindow; public short cbReserved2; public IntPtr lpReserved2; public IntPtr hStdInput; public IntPtr hStdOutput; public IntPtr hStdError; } [StructLayout(LayoutKind.Sequential)] public struct PROCESS_INFORMATION { public IntPtr hProcess; public IntPtr hThread; public uint dwProcessId; public uint dwThreadId; } [StructLayout(LayoutKind.Sequential)] public struct JOBOBJECT_BASIC_LIMIT_INFORMATION { public long PerProcessUserTimeLimit; public long PerJobUserTimeLimit; public uint LimitFlags; public UIntPtr MinimumWorkingSetSize; public UIntPtr MaximumWorkingSetSize; public uint ActiveProcessLimit; public UIntPtr Affinity; public uint PriorityClass; public uint SchedulingClass; } [StructLayout(LayoutKind.Sequential)] public struct IO_COUNTERS { public ulong ReadOperationCount; public ulong WriteOperationCount; public ulong OtherOperationCount; public ulong ReadTransferCount; public ulong WriteTransferCount; public ulong OtherTransferCount; } [StructLayout(LayoutKind.Sequential)] public struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION { public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation; public IO_COUNTERS IoInfo; public UIntPtr ProcessMemoryLimit; public UIntPtr JobMemoryLimit; public UIntPtr PeakProcessMemoryUsed; public UIntPtr PeakJobMemoryUsed; } [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern bool CreateProcessW(string app, StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string dir, ref STARTUPINFO si, out PROCESS_INFORMATION pi); [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr CreateJobObjectW(IntPtr a, string n); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool SetInformationJobObject(IntPtr j, int c, IntPtr i, uint l); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool AssignProcessToJobObject(IntPtr j, IntPtr p); [DllImport("kernel32.dll", SetLastError=true)] public static extern uint ResumeThread(IntPtr h); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool TerminateJobObject(IntPtr j, uint c); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool TerminateProcess(IntPtr p, uint c); [DllImport("kernel32.dll", SetLastError=true)] public static extern uint WaitForSingleObject(IntPtr h, uint ms); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool GetExitCodeProcess(IntPtr h, out uint code); [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h); public static string Quote(string value) { var b = new StringBuilder(); b.Append('"'); int slashes = 0; foreach (var c in value) { if (c == '\\') { slashes++; continue; } if (c == '"') { b.Append('\\', slashes * 2 + 1); b.Append('"'); slashes = 0; continue; } b.Append('\\', slashes); slashes = 0; b.Append(c); } b.Append('\\', slashes * 2); b.Append('"'); return b.ToString(); } public static string BuildCommandLine(string[] argv) { var b = new StringBuilder(); for (var i = 0; i < argv.Length; i++) { if (i != 0) b.Append(' '); b.Append(Quote(argv[i])); } return b.ToString(); } }`,
+    String.raw`public static partial class O { [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] public struct STARTUPINFO { public int cb; public IntPtr lpReserved; public IntPtr lpDesktop; public IntPtr lpTitle; public int dwX; public int dwY; public int dwXSize; public int dwYSize; public int dwXCountChars; public int dwYCountChars; public int dwFillAttribute; public int dwFlags; public short wShowWindow; public short cbReserved2; public IntPtr lpReserved2; public IntPtr hStdInput; public IntPtr hStdOutput; public IntPtr hStdError; } [StructLayout(LayoutKind.Sequential)] public struct PROCESS_INFORMATION { public IntPtr hProcess; public IntPtr hThread; public uint dwProcessId; public uint dwThreadId; } [StructLayout(LayoutKind.Sequential)] public struct JOBOBJECT_BASIC_LIMIT_INFORMATION { public long PerProcessUserTimeLimit; public long PerJobUserTimeLimit; public uint LimitFlags; public UIntPtr MinimumWorkingSetSize; public UIntPtr MaximumWorkingSetSize; public uint ActiveProcessLimit; public UIntPtr Affinity; public uint PriorityClass; public uint SchedulingClass; } [StructLayout(LayoutKind.Sequential)] public struct IO_COUNTERS { public ulong ReadOperationCount; public ulong WriteOperationCount; public ulong OtherOperationCount; public ulong ReadTransferCount; public ulong WriteTransferCount; public ulong OtherTransferCount; } [StructLayout(LayoutKind.Sequential)] public struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION { public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation; public IO_COUNTERS IoInfo; public UIntPtr ProcessMemoryLimit; public UIntPtr JobMemoryLimit; public UIntPtr PeakProcessMemoryUsed; public UIntPtr PeakJobMemoryUsed; } [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr CreateJobObjectW(IntPtr a, string n); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool SetInformationJobObject(IntPtr j, int c, IntPtr i, uint l); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool AssignProcessToJobObject(IntPtr j, IntPtr p); [DllImport("kernel32.dll", SetLastError=true)] public static extern uint ResumeThread(IntPtr h); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool TerminateJobObject(IntPtr j, uint c); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool TerminateProcess(IntPtr p, uint c); [DllImport("kernel32.dll", SetLastError=true)] public static extern uint WaitForSingleObject(IntPtr h, uint ms); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool GetExitCodeProcess(IntPtr h, out uint code); [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h); public static System.Threading.Tasks.Task<string> ReadLineAsync() { return System.Threading.Tasks.Task.Run(() => Console.In.ReadLine()); } public static string Quote(string value) { var b = new StringBuilder(); b.Append('\"'); int slashes = 0; foreach (var c in value) { if (c == '\\') { slashes++; continue; } if (c == '\"') { b.Append('\\', slashes * 2 + 1); b.Append('\"'); slashes = 0; continue; } b.Append('\\', slashes); slashes = 0; b.Append(c); } b.Append('\\', slashes * 2); b.Append('\"'); return b.ToString(); } public static string BuildCommandLine(string[] argv) { var b = new StringBuilder(); for (var i = 0; i < argv.Length; i++) { if (i != 0) b.Append(' '); b.Append(Quote(argv[i])); } return b.ToString(); } }`.split("\n").map((line) => line.trim()).filter((line) => line.length > 0 && !line.startsWith("//")).join(" "),
+    String.raw`public static partial class O {
+  [StructLayout(LayoutKind.Sequential)]
+  private struct SECURITY_ATTRIBUTES {
+    public int nLength;
+    public IntPtr lpSecurityDescriptor;
+    [MarshalAs(UnmanagedType.Bool)] public bool bInheritHandle;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  private struct STARTUPINFOEX {
+    public STARTUPINFO StartupInfo;
+    public IntPtr lpAttributeList;
+  }
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  private static extern IntPtr CreateFileW(string name, uint access, uint share, ref SECURITY_ATTRIBUTES attributes, uint disposition, uint flags, IntPtr template);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  private static extern bool InitializeProcThreadAttributeList(IntPtr list, int count, uint flags, ref IntPtr size);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  private static extern bool UpdateProcThreadAttribute(IntPtr list, uint flags, IntPtr attribute, IntPtr value, IntPtr size, IntPtr previous, IntPtr returnedSize);
+  [DllImport("kernel32.dll")]
+  private static extern void DeleteProcThreadAttributeList(IntPtr list);
+  [DllImport("kernel32.dll", EntryPoint="CreateProcessW", CharSet=CharSet.Unicode, SetLastError=true)]
+  private static extern bool CreateProcessWithConsole(string app, StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string dir, ref STARTUPINFOEX si, out PROCESS_INFORMATION pi);
+  private static System.ComponentModel.Win32Exception LaunchError(string operation) {
+    int error = Marshal.GetLastWin32Error();
+    return new System.ComponentModel.Win32Exception(error, operation + ": Win32=" + error);
+  }
+  public static void CreateConsoleProcess(string app, string commandLine, IntPtr environment, string cwd, out PROCESS_INFORMATION pi) {
+    pi = new PROCESS_INFORMATION();
+    // lpApplicationName must never search a provider-controlled cwd or PATH.
+    // Accept only an existing executable at a fully qualified Windows path.
+    if (String.IsNullOrWhiteSpace(app)
+        || !System.Text.RegularExpressions.Regex.IsMatch(app, @"^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+[\\/])")
+        || !String.Equals(System.IO.Path.GetExtension(app), ".exe", StringComparison.OrdinalIgnoreCase)
+        || !System.IO.File.Exists(app)) {
+      throw new ArgumentException("worker_launch_provider_executable_invalid");
+    }
+    IntPtr input = new IntPtr(-1), output = new IntPtr(-1);
+    IntPtr attributeList = IntPtr.Zero, handles = IntPtr.Zero;
+    bool attributeListInitialized = false;
+    try {
+      var security = new SECURITY_ATTRIBUTES();
+      security.nLength = Marshal.SizeOf(security);
+      security.bInheritHandle = true;
+      // Open the existing pane console; supervisor standard handles remain
+      // dedicated to the authenticated JSON control protocol.
+      input = CreateFileW("CONIN$", 0xC0000000, 3, ref security, 3, 0, IntPtr.Zero);
+      if (input == new IntPtr(-1)) throw LaunchError("worker_launch_console_input_failed");
+      output = CreateFileW("CONOUT$", 0xC0000000, 3, ref security, 3, 0, IntPtr.Zero);
+      if (output == new IntPtr(-1)) throw LaunchError("worker_launch_console_output_failed");
+      IntPtr size = IntPtr.Zero;
+      InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref size);
+      if (size == IntPtr.Zero) throw LaunchError("worker_launch_attribute_size_failed");
+      attributeList = Marshal.AllocHGlobal(size);
+      if (!InitializeProcThreadAttributeList(attributeList, 1, 0, ref size)) throw LaunchError("worker_launch_attribute_init_failed");
+      attributeListInitialized = true;
+      handles = Marshal.AllocHGlobal(IntPtr.Size * 2);
+      Marshal.WriteIntPtr(handles, 0, input);
+      Marshal.WriteIntPtr(handles, IntPtr.Size, output);
+      if (!UpdateProcThreadAttribute(attributeList, 0, new IntPtr(0x20002), handles, new IntPtr(IntPtr.Size * 2), IntPtr.Zero, IntPtr.Zero)) throw LaunchError("worker_launch_handle_list_failed");
+      var startup = new STARTUPINFOEX();
+      startup.StartupInfo.cb = Marshal.SizeOf(startup);
+      // STARTF_USESTDHANDLES
+      startup.StartupInfo.dwFlags = 0x100;
+      startup.StartupInfo.hStdInput = input;
+      startup.StartupInfo.hStdOutput = output;
+      startup.StartupInfo.hStdError = output;
+      startup.lpAttributeList = attributeList;
+      // Only console input/output are inherited. In particular, neither
+      // the JSON pipes nor any supervisor Job handle enters the child.
+      if (!CreateProcessWithConsole(app, new StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero, true, 0x00000004 | 0x00000400 | 0x00080000, environment, cwd, ref startup, out pi)) throw LaunchError("worker_launch_create_process_failed");
+    } finally {
+      if (attributeListInitialized) DeleteProcThreadAttributeList(attributeList);
+      if (handles != IntPtr.Zero) Marshal.FreeHGlobal(handles);
+      if (attributeList != IntPtr.Zero) Marshal.FreeHGlobal(attributeList);
+      if (output != new IntPtr(-1)) CloseHandle(output);
+      if (input != new IntPtr(-1)) CloseHandle(input);
+    }
+  }
+}`,
     '"@',
-    "$pi = New-Object O+PROCESS_INFORMATION; $job = [IntPtr]::Zero; $envPtr = [IntPtr]::Zero; $cmd = $null",
+    "$pi = New-Object O+PROCESS_INFORMATION; $job = [IntPtr]::Zero; $jobAssigned = $false; $envPtr = [IntPtr]::Zero; $cmd = $null",
     "try {",
     "  $cmd = [O]::BuildCommandLine([string[]]$payload.provider_argv)",
     '  $envPairs = @($payload.provider_env.psobject.Properties | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }); $envText = (($envPairs -join [char]0) + [char]0 + [char]0); $envBytes = [Text.Encoding]::Unicode.GetBytes($envText); $envPtr = [Runtime.InteropServices.Marshal]::AllocHGlobal($envBytes.Length); [Runtime.InteropServices.Marshal]::Copy($envBytes, 0, $envPtr, $envBytes.Length)',
-    '  $si = New-Object O+STARTUPINFO; $si.cb = [Runtime.InteropServices.Marshal]::SizeOf($si); $flags = 0x00000004 -bor 0x00000400; if (-not [O]::CreateProcessW($null, $cmd, [IntPtr]::Zero, [IntPtr]::Zero, $false, $flags, $envPtr, $payload.cwd, [ref]$si, [ref]$pi)) { throw "worker_launch_create_process_failed" }',
-    '  $job = [O]::CreateJobObjectW([IntPtr]::Zero, $null); if ($job -eq [IntPtr]::Zero) { throw "worker_launch_create_job_failed" }; $info = New-Object O+JOBOBJECT_EXTENDED_LIMIT_INFORMATION; $info.BasicLimitInformation.LimitFlags = 0x2000; $ptr = [Runtime.InteropServices.Marshal]::AllocHGlobal([Runtime.InteropServices.Marshal]::SizeOf($info)); try { [Runtime.InteropServices.Marshal]::StructureToPtr($info, $ptr, $false); if (-not [O]::SetInformationJobObject($job, 9, $ptr, [Runtime.InteropServices.Marshal]::SizeOf($info))) { throw "worker_launch_job_config_failed" } } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($ptr) }; if (-not [O]::AssignProcessToJobObject($job, $pi.hProcess)) { throw "worker_launch_assign_job_failed" }; if ([O]::ResumeThread($pi.hThread) -eq [uint32]0xffffffff) { throw "worker_launch_resume_failed" }',
+    "  [O]::CreateConsoleProcess([string]$payload.provider_argv[0], $cmd, $envPtr, $payload.cwd, [ref]$pi)",
+    '  $job = [O]::CreateJobObjectW([IntPtr]::Zero, $null); if ($job -eq [IntPtr]::Zero) { throw "worker_launch_create_job_failed" }; $info = New-Object O+JOBOBJECT_EXTENDED_LIMIT_INFORMATION; $info.BasicLimitInformation.LimitFlags = 0x2000; $ptr = [Runtime.InteropServices.Marshal]::AllocHGlobal([Runtime.InteropServices.Marshal]::SizeOf($info)); try { [Runtime.InteropServices.Marshal]::StructureToPtr($info, $ptr, $false); if (-not [O]::SetInformationJobObject($job, 9, $ptr, [Runtime.InteropServices.Marshal]::SizeOf($info))) { throw "worker_launch_job_config_failed" } } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($ptr) }; if (-not [O]::AssignProcessToJobObject($job, $pi.hProcess)) { throw "worker_launch_assign_job_failed" }; $jobAssigned = $true; if ([O]::ResumeThread($pi.hThread) -eq [uint32]::MaxValue) { throw "worker_launch_resume_failed" }',
     '  $ticks = ([DateTime]((Get-Process -Id $pi.dwProcessId).StartTime)).ToUniversalTime().Ticks; $ready = @{ protocol="' + WINDOWS_SUPERVISOR_PROTOCOL + '"; kind="ready"; attempt_id=$payload.identity.attempt_id; instance_id=$payload.identity.instance_id; authority_digest=$payload.authority_digest; containment_nonce=$payload.containment_nonce; pid=$pi.dwProcessId; process_start_identity=("ticks:" + $ticks) } | ConvertTo-Json -Compress; [Console]::Out.WriteLine($ready); [Console]::Out.Flush()',
-    '  $readTask = [Console]::In.ReadLineAsync(); while ($true) { if ([O]::WaitForSingleObject($pi.hProcess, 50) -eq 0) { $exitCode = [uint32]0; [O]::GetExitCodeProcess($pi.hProcess, [ref]$exitCode) | Out-Null; if (-not [O]::TerminateJobObject($job, $exitCode)) { throw "worker_launch_job_terminate_failed" }; if ([O]::WaitForSingleObject($job, 5000) -ne 0) { throw "worker_launch_job_cleanup_timeout" }; $terminal = @{ protocol="' + WINDOWS_SUPERVISOR_PROTOCOL + '"; kind="terminal"; attempt_id=$payload.identity.attempt_id; instance_id=$payload.identity.instance_id; authority_digest=$payload.authority_digest; containment_nonce=$payload.containment_nonce; pid=$pi.dwProcessId; outcome="exit"; cleanup_verified=$true; exit_code=$exitCode } | ConvertTo-Json -Compress; [Console]::Out.WriteLine($terminal); [Console]::Out.Flush(); break }; if (-not $readTask.IsCompleted) { continue }; $line = $readTask.Result; if ($null -eq $line) { throw "worker_launch_authority_lost" }; $readTask = [Console]::In.ReadLineAsync(); if ([string]::IsNullOrWhiteSpace($line) -or $line.Length -gt 4096) { continue }; try { $msg = $line | ConvertFrom-Json } catch { continue }; if ($msg.protocol -ne "' + WINDOWS_SUPERVISOR_PROTOCOL + '" -or $msg.attempt_id -ne $payload.identity.attempt_id -or $msg.instance_id -ne $payload.identity.instance_id -or $msg.authority_digest -ne $payload.authority_digest -or $msg.containment_nonce -ne $payload.containment_nonce -or $msg.kind -ne "terminate") { continue }; if (-not [O]::TerminateJobObject($job, 1)) { throw "worker_launch_job_terminate_failed" }; if ([O]::WaitForSingleObject($job, 5000) -ne 0) { throw "worker_launch_job_cleanup_timeout" }; $terminal = @{ protocol="' + WINDOWS_SUPERVISOR_PROTOCOL + '"; kind="terminal"; attempt_id=$payload.identity.attempt_id; instance_id=$payload.identity.instance_id; authority_digest=$payload.authority_digest; containment_nonce=$payload.containment_nonce; pid=$pi.dwProcessId; outcome="terminated"; cleanup_verified=$true } | ConvertTo-Json -Compress; [Console]::Out.WriteLine($terminal); [Console]::Out.Flush(); break }',
-    "} catch { if ($pi.hProcess -ne [IntPtr]::Zero) { if ($job -ne [IntPtr]::Zero) { [O]::TerminateJobObject($job, 1) | Out-Null } else { [O]::TerminateProcess($pi.hProcess, 1) | Out-Null }; [O]::WaitForSingleObject($pi.hProcess, 5000) | Out-Null }; throw } finally { if ($envPtr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::FreeHGlobal($envPtr) }; if ($pi.hThread -ne [IntPtr]::Zero) { [O]::CloseHandle($pi.hThread) | Out-Null }; if ($pi.hProcess -ne [IntPtr]::Zero) { [O]::CloseHandle($pi.hProcess) | Out-Null }; if ($job -ne [IntPtr]::Zero) { [O]::CloseHandle($job) | Out-Null } }"
-  ].join("`n");
+    '  $readTask = [O]::ReadLineAsync(); while ($true) { if ([O]::WaitForSingleObject($pi.hProcess, 50) -eq 0) { $exitCode = [uint32]0; if (-not [O]::GetExitCodeProcess($pi.hProcess, [ref]$exitCode)) { throw "worker_launch_exit_code_failed" }; if (-not [O]::TerminateJobObject($job, $exitCode)) { throw "worker_launch_job_terminate_failed" }; if ([O]::WaitForSingleObject($job, 5000) -ne 0) { throw "worker_launch_job_cleanup_timeout" }; $terminal = @{ protocol="' + WINDOWS_SUPERVISOR_PROTOCOL + '"; kind="terminal"; attempt_id=$payload.identity.attempt_id; instance_id=$payload.identity.instance_id; authority_digest=$payload.authority_digest; containment_nonce=$payload.containment_nonce; pid=$pi.dwProcessId; outcome="exit"; cleanup_verified=$true; exit_code=$exitCode } | ConvertTo-Json -Compress; [Console]::Out.WriteLine($terminal); [Console]::Out.Flush(); break }; if (-not $readTask.IsCompleted) { continue }; $line = $readTask.Result; if ($null -eq $line) { throw "worker_launch_authority_lost" }; $readTask = [O]::ReadLineAsync(); if ([string]::IsNullOrWhiteSpace($line) -or $line.Length -gt 4096) { continue }; try { $msg = $line | ConvertFrom-Json } catch { continue }; if ($msg.protocol -ne "' + WINDOWS_SUPERVISOR_PROTOCOL + '" -or $msg.attempt_id -ne $payload.identity.attempt_id -or $msg.instance_id -ne $payload.identity.instance_id -or $msg.authority_digest -ne $payload.authority_digest -or $msg.containment_nonce -ne $payload.containment_nonce -or $msg.kind -ne "terminate") { continue }; if (-not [O]::TerminateJobObject($job, 1)) { throw "worker_launch_job_terminate_failed" }; if ([O]::WaitForSingleObject($job, 5000) -ne 0) { throw "worker_launch_job_cleanup_timeout" }; $terminal = @{ protocol="' + WINDOWS_SUPERVISOR_PROTOCOL + '"; kind="terminal"; attempt_id=$payload.identity.attempt_id; instance_id=$payload.identity.instance_id; authority_digest=$payload.authority_digest; containment_nonce=$payload.containment_nonce; pid=$pi.dwProcessId; outcome="terminated"; cleanup_verified=$true; exit_code=1 } | ConvertTo-Json -Compress; [Console]::Out.WriteLine($terminal); [Console]::Out.Flush(); break }',
+    "} catch { if ($pi.hProcess -ne [IntPtr]::Zero) { if ($jobAssigned) { [O]::TerminateJobObject($job, 1) | Out-Null } else { [O]::TerminateProcess($pi.hProcess, 1) | Out-Null }; [O]::WaitForSingleObject($pi.hProcess, 5000) | Out-Null }; throw } finally { if ($envPtr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::FreeHGlobal($envPtr) }; if ($pi.hThread -ne [IntPtr]::Zero) { [O]::CloseHandle($pi.hThread) | Out-Null }; if ($pi.hProcess -ne [IntPtr]::Zero) { [O]::CloseHandle($pi.hProcess) | Out-Null }; if ($job -ne [IntPtr]::Zero) { [O]::CloseHandle($job) | Out-Null } }"
+  ].join("\n");
 }
 function canonicalAuthorityDigest(input) {
   const env = Object.fromEntries(Object.entries(input.providerEnv).sort(([a], [b]) => a.localeCompare(b)));
@@ -7560,7 +7649,7 @@ var init_worker_launch_ack = __esm({
     WORKER_LAUNCH_AUTHORITY_PROTOCOL = "worker-launch-authority-v1";
     WINDOWS_SUPERVISOR_PROTOCOL = "worker-launch-windows-supervisor-v1";
     WINDOWS_RESERVED_ENV_KEYS = new Set([...WORKER_LAUNCH_INTERNAL_ENV_KEYS, "SystemRoot"].map((key) => key.toUpperCase()));
-    SAFE_BASELINE_ENV_KEYS = ["PATH", "TEMP", "TMP"];
+    SAFE_BASELINE_ENV_KEYS = ["PATH", "TEMP", "TMP", "TERM", "COLORTERM"];
   }
 });
 
@@ -8585,6 +8674,7 @@ __export(tmux_session_exports, {
   captureTmuxServerIdentity: () => captureTmuxServerIdentity,
   createTeamSession: () => createTeamSession,
   deliverStartupInbox: () => deliverStartupInbox,
+  detectPaneTrustPromptKind: () => detectPaneTrustPromptKind,
   detectTeamMultiplexerContext: () => detectTeamMultiplexerContext,
   getDefaultShell: () => getDefaultShell,
   getOwnedWorkerLiveness: () => getOwnedWorkerLiveness,
@@ -9140,6 +9230,11 @@ async function cmuxSendSurface(surfaceId, text) {
 function normalizeCmuxKey(key) {
   const normalized = key.trim();
   const lower = normalized.toLowerCase();
+  const controlKey = normalized.match(/^[Cc]-([A-Za-z])$/);
+  if (controlKey?.[1]) {
+    const character = controlKey[1].toLowerCase();
+    return character === "m" ? "enter" : `ctrl+${character}`;
+  }
   switch (lower) {
     case "enter":
     case "return":
@@ -9161,7 +9256,7 @@ async function cmuxSendSurfaceKey(surfaceId, key) {
   const normalizedKey = normalizeCmuxKey(key);
   await cmuxExecPrimaryWithLegacyFallback(
     ["send-key-surface", "--surface", surfaceId, normalizedKey],
-    ["send-key", "--surface", surfaceId, key]
+    ["send-key", "--surface", surfaceId, normalizedKey]
   );
 }
 async function cmuxCaptureSurface(surfaceId) {
@@ -9324,6 +9419,16 @@ async function verifyTeamTargetOwnership(target, dependencies = defaultMailboxTa
     return { kind: "unavailable" };
   }
 }
+async function verifyCmuxTargetOwnershipWithRetry(target, dependencies) {
+  let membership = await verifyTeamTargetOwnership(target, dependencies);
+  if (membership.kind === "owned" || membership.kind === "provider_mismatch") return membership;
+  for (let attempt = 1; attempt < CMUX_MEMBERSHIP_RETRY_ATTEMPTS; attempt++) {
+    await sleep3(CMUX_MEMBERSHIP_RETRY_INTERVAL_MS);
+    membership = await verifyTeamTargetOwnership(target, dependencies);
+    if (membership.kind === "owned" || membership.kind === "provider_mismatch") return membership;
+  }
+  return membership;
+}
 async function invokeDirectMailboxEffect(target, message, dependencies = defaultDirectMailboxEffectDependencies) {
   if (!target.paneId || !message) return { kind: "not_attempted", reason: "mailbox_target_missing" };
   if (target.provider === "cmux" && !isCmuxContext()) {
@@ -9348,6 +9453,12 @@ async function invokeDirectMailboxEffect(target, message, dependencies = default
     if (membership.kind !== "owned") {
       return { kind: "not_attempted", reason: "mailbox_membership_unresolvable" };
     }
+    const inputBlockReason = await paneInputBlockReason(
+      target.paneId,
+      tmuxServerIdentity,
+      dependencies.serverIdentityDependencies
+    );
+    if (inputBlockReason) return { kind: "not_attempted", reason: inputBlockReason };
     const text = target.recipientRole === "leader" ? `[OMC_TMUX_INJECT] ${message}`.slice(0, 200) : message;
     try {
       const literal = await runGuardedNativeTmuxCommand(
@@ -9356,6 +9467,19 @@ async function invokeDirectMailboxEffect(target, message, dependencies = default
       );
       if (literal.outcome !== "executed") {
         return literal.outcome === "not_executed" ? { kind: "not_attempted", reason: "mailbox_membership_unresolvable" } : {
+          kind: "attempted_unconfirmed",
+          transport: "tmux_send_keys",
+          reason: "notification_delivery_uncertain",
+          cause: "returned_false"
+        };
+      }
+      const postInputBlockReason = await paneInputBlockReason(
+        target.paneId,
+        tmuxServerIdentity,
+        dependencies.serverIdentityDependencies
+      );
+      if (postInputBlockReason) {
+        return {
           kind: "attempted_unconfirmed",
           transport: "tmux_send_keys",
           reason: "notification_delivery_uncertain",
@@ -9617,7 +9741,7 @@ function workerPaneShellCommand() {
   const passthrough = Object.fromEntries(
     Object.entries(baseline).filter(([key, value]) => inline[key] !== value)
   );
-  const inheritedPaneEnvironment = ["TERM", "TMUX", "TMUX_PANE", "TMUX_TMPDIR", "LANG", "LC_ALL", "LC_CTYPE"].map((key) => `${key}="$${key}"`);
+  const inheritedPaneEnvironment = ["TERM", "COLORTERM", "TMUX", "TMUX_PANE", "TMUX_TMPDIR", "LANG", "LC_ALL", "LC_CTYPE"].map((key) => `${key}="$${key}"`);
   const inlineAssignments = Object.entries(inline).map(([key, value]) => `${key}=${shellQuote(value)}`);
   if (Object.keys(passthrough).length === 0) {
     const command2 = [
@@ -9876,14 +10000,15 @@ async function adoptWorkerPaneOwnership(input) {
     ...membershipDependencies,
     serverIdentityDependencies: input.serverIdentityDependencies
   } : membershipDependencies;
-  const membership = await verifyTeamTargetOwnership({
+  const target = {
     provider: input.provider,
     providerTarget: input.providerTarget,
     recipient: "worker",
     recipientRole: "worker",
     paneId: input.paneId,
     ...input.provider === "tmux" ? { tmuxServerIdentity: input.tmuxServerIdentity } : {}
-  }, dependenciesWithIdentityProbe);
+  };
+  const membership = input.provider === "cmux" ? await verifyCmuxTargetOwnershipWithRetry(target, dependenciesWithIdentityProbe) : await verifyTeamTargetOwnership(target, dependenciesWithIdentityProbe);
   if (membership.kind === "foreign") return { ok: false, reason: "pane_foreign" };
   if (membership.kind !== "owned") return { ok: false, reason: "pane_membership_unavailable" };
   return {
@@ -9892,14 +10017,15 @@ async function adoptWorkerPaneOwnership(input) {
   };
 }
 async function workerPaneBelongsToProviderTarget(input, dependencies = input.dependencies ?? defaultMailboxTargetOwnershipDependencies) {
-  const membership = await verifyTeamTargetOwnership({
+  const target = {
     provider: input.provider,
     providerTarget: input.providerTarget,
     recipient: "worker",
     recipientRole: "worker",
     paneId: input.paneId,
     ...input.provider === "tmux" ? { tmuxServerIdentity: input.tmuxServerIdentity } : {}
-  }, dependencies);
+  };
+  const membership = input.provider === "cmux" ? await verifyCmuxTargetOwnershipWithRetry(target, dependencies) : await verifyTeamTargetOwnership(target, dependencies);
   return membership.kind === "owned";
 }
 async function workerPaneBelongsToOwnedProviderTarget(input) {
@@ -10806,7 +10932,7 @@ async function capturePaneObservation(paneId, opts = {}) {
       return { ok: true, captured: await cmuxCaptureSurface(paneId) };
     }
     if (opts.tmuxServerIdentity) {
-      if (!isValidTmuxServerIdentity(opts.tmuxServerIdentity) || await observeTmuxServerIdentity(opts.tmuxServerIdentity) !== "matching") {
+      if (!isValidTmuxServerIdentity(opts.tmuxServerIdentity) || await observeTmuxServerIdentity(opts.tmuxServerIdentity, opts.serverIdentityDependencies) !== "matching") {
         return { ok: false, error: "tmux_server_identity_unverified" };
       }
     }
@@ -10815,7 +10941,7 @@ async function capturePaneObservation(paneId, opts = {}) {
       tmuxArgsForIdentity(opts.tmuxServerIdentity, args),
       { timeout: 2e3, stripTmux: true }
     ) : await tmuxExecAsync(args);
-    if (opts.tmuxServerIdentity && await observeTmuxServerIdentity(opts.tmuxServerIdentity) !== "matching") {
+    if (opts.tmuxServerIdentity && await observeTmuxServerIdentity(opts.tmuxServerIdentity, opts.serverIdentityDependencies) !== "matching") {
       return { ok: false, error: "tmux_server_identity_changed" };
     }
     return { ok: true, captured: result.stdout };
@@ -10859,17 +10985,31 @@ async function sendTeamPaneKey(paneId, key, tmuxServerIdentity) {
   if (result.outcome !== "executed") throw new Error("tmux_server_guard_failed");
 }
 async function guardedSendLiteralAndEnter(paneId, text, tmuxServerIdentity) {
-  if (!isValidTmuxServerIdentity(tmuxServerIdentity) || await observeTmuxServerIdentity(tmuxServerIdentity) !== "matching") return false;
+  if (await paneInputBlockReason(paneId, tmuxServerIdentity)) return false;
   const literal = await runGuardedNativeTmuxCommand(
     tmuxServerIdentity,
     tmuxCommandString(["send-keys", "-t", paneId, "-l", "--", text])
   );
   if (literal.outcome !== "executed") return false;
+  if (await paneInputBlockReason(paneId, tmuxServerIdentity)) return false;
   const enter = await runGuardedNativeTmuxCommand(
     tmuxServerIdentity,
     tmuxCommandString(["send-keys", "-t", paneId, "Enter"])
   );
   return enter.outcome === "executed";
+}
+async function paneInputBlockReason(paneId, tmuxServerIdentity, serverIdentityDependencies) {
+  const observation = await capturePaneObservation(paneId, {
+    operation: "guarded-notification",
+    tmuxServerIdentity,
+    ...serverIdentityDependencies ? { serverIdentityDependencies } : {}
+  });
+  if (!observation.ok || !observation.captured.trim()) return "mailbox_membership_unresolvable";
+  const trustPrompt = detectPaneTrustPromptKind(observation.captured);
+  if (trustPrompt === "codex_directory") return "codex_workspace_untrusted";
+  if (trustPrompt === "cursor_workspace_trust") return "cursor_workspace_untrusted";
+  if (trustPrompt) return "trust_prompt_pending";
+  return void 0;
 }
 async function killTeamPane(paneId) {
   if (isCmuxSurfaceTarget(paneId)) {
@@ -10919,6 +11059,20 @@ async function killOwnedWorkerPane(ownership) {
 function detectPaneTrustPromptKind(captured, provider) {
   const lines = captured.split("\n").map((l) => l.replace(/\r/g, "").trim()).filter((l) => l.length > 0);
   const tail = lines.slice(-12);
+  const lastCodexPromptIndex = lines.findLastIndex((line) => paneLineLooksLikeIdlePrompt(line, "codex"));
+  const activeCodexPrompt = lastCodexPromptIndex >= 0 ? lines[lastCodexPromptIndex].replace(/^\s*(?:[│┃║▌▐▏▕╎┆┊]\s*)?[›>❯]\s*/, "") : "";
+  const lastCodexTrustQuestionIndex = lines.findLastIndex(
+    (line, index) => /Trust this folder\?/i.test(lines.slice(index, index + 2).join(" "))
+  );
+  const previousTrustChoiceWasRendered = lastCodexTrustQuestionIndex >= 0 && lines.slice(lastCodexTrustQuestionIndex + 1, lastCodexPromptIndex).some((line) => {
+    const prompt = line.replace(/^\s*(?:[│┃║▌▐▏▕╎┆┊]\s*)?[›>❯]\s*/, "");
+    return /^(?:1(?:\.|$)|2(?:\.|$))/i.test(prompt);
+  });
+  const lastCodexPromptIsTrustChoice = lastCodexPromptIndex >= 0 && (/^(?:1(?:\.|$)|2(?:\.|$))/i.test(activeCodexPrompt) || activeCodexPrompt === "" && !previousTrustChoiceWasRendered);
+  const codexTrustQuestionIsActive = lastCodexTrustQuestionIndex >= 0 && (lastCodexPromptIndex < lastCodexTrustQuestionIndex || lastCodexPromptIsTrustChoice);
+  if ((provider === void 0 || provider === "codex") && codexTrustQuestionIsActive) {
+    return "codex_directory";
+  }
   const hasCursorTrustBanner = tail.some((l) => /Workspace Trust Required/i.test(l));
   const hasCursorTrustHint = tail.some((l) => /Pass\s+--trust,\s*--yolo,\s*or\s+-f/i.test(l));
   if ((provider === void 0 || provider === "cursor") && hasCursorTrustBanner && (hasCursorTrustHint || tail.some((l) => /Do you trust the contents of this directory\?/i.test(l)))) {
@@ -10929,7 +11083,7 @@ function detectPaneTrustPromptKind(captured, provider) {
   );
   const hasClaudeDirectoryNoChoice = tail.some((l) => /\bNo,\s*exit\b/i.test(l));
   const hasClaudeDirectoryYesChoice = tail.some((l) => /\bYes,\s*(?:proceed|I trust this folder)\b/i.test(l));
-  if (provider === "claude" && hasClaudeDirectoryQuestion && hasClaudeDirectoryNoChoice && hasClaudeDirectoryYesChoice) {
+  if ((provider === void 0 || provider === "claude") && hasClaudeDirectoryQuestion && hasClaudeDirectoryNoChoice && hasClaudeDirectoryYesChoice) {
     return "claude_directory";
   }
   const hasDirectoryQuestion = tail.some((l) => /Do you trust the contents of this directory\?/i.test(l));
@@ -10978,7 +11132,8 @@ function paneLooksReady(captured, provider) {
   if (content === "") return false;
   const lines = content.split("\n").map((line) => line.replace(/\r/g, "").trimEnd()).filter((line) => line.trim() !== "");
   if (lines.length === 0) return false;
-  if (detectPaneTrustPromptKind(content, provider) === "cursor_workspace_trust") return false;
+  const trustPrompt = detectPaneTrustPromptKind(content, provider);
+  if (trustPrompt === "cursor_workspace_trust" || trustPrompt === "codex_directory") return false;
   if (paneHasTrustPrompt(content, provider)) return true;
   if (paneIsBootstrapping(content, provider)) return false;
   const lastLine = lines[lines.length - 1];
@@ -11074,6 +11229,7 @@ async function waitForStartupPaneReady(context, opts = {}) {
     const captured = observation.captured;
     const selector = detectPaneTrustPromptKind(captured, context.provider);
     if (selector) {
+      if (selector === "codex_directory") return { ok: false, reason: "codex_workspace_untrusted" };
       if (selector === "cursor_workspace_trust") {
         return { ok: false, reason: "cursor_workspace_untrusted" };
       }
@@ -11108,20 +11264,50 @@ async function waitForStartupPaneReady(context, opts = {}) {
   }
   return { ok: false, reason: "readiness_timeout" };
 }
+async function startupPaneSubmitBlockReason(context, attemptAlreadyFenced) {
+  if (!await startupContextIsActive(context, attemptAlreadyFenced)) return "attempt_inactive";
+  const copyMode = await paneCopyModeObservation(
+    context.ownership.paneId,
+    context.ownership.tmuxServerIdentity
+  );
+  if (copyMode === null) return "copy_mode_unknown";
+  if (copyMode) return "copy_mode";
+  const observation = await capturePaneObservation(context.ownership.paneId, {
+    operation: "startup-submit",
+    ...context.ownership.provider === "tmux" ? { tmuxServerIdentity: context.ownership.tmuxServerIdentity } : {}
+  });
+  if (!observation.ok || !observation.captured.trim()) return "capture_failed";
+  const selector = detectPaneTrustPromptKind(observation.captured, context.provider);
+  if (selector === "codex_directory") return "codex_workspace_untrusted";
+  if (selector === "cursor_workspace_trust") return "cursor_workspace_untrusted";
+  if (selector) return "selector_persistent";
+  return void 0;
+}
 async function deliverStartupInbox(context, message, options = {}) {
   if (message.length > 200) return { ok: false, reason: "message_too_long" };
   const ready = await waitForStartupPaneReady(context, { attemptAlreadyFenced: options.attemptAlreadyFenced });
   if (!ready.ok) return { ok: false, reason: ready.reason };
   try {
+    const preInputBlockReason = await startupPaneSubmitBlockReason(
+      context,
+      options.attemptAlreadyFenced ?? false
+    );
+    if (preInputBlockReason) return { ok: false, reason: preInputBlockReason };
     await sendLiteralPaneText(
       context.ownership.paneId,
       message,
       context.ownership.tmuxServerIdentity
     );
     await sleep3(100);
-    await sendTeamPaneKey(context.ownership.paneId, "C-m", context.ownership.tmuxServerIdentity);
-    await sleep3(120);
-    await sendTeamPaneKey(context.ownership.paneId, "C-m", context.ownership.tmuxServerIdentity);
+    for (let submitIndex = 0; submitIndex < 2; submitIndex++) {
+      const submitBlockReason = await startupPaneSubmitBlockReason(
+        context,
+        options.attemptAlreadyFenced ?? false
+      );
+      if (submitBlockReason) return { ok: false, reason: submitBlockReason };
+      await sendTeamPaneKey(context.ownership.paneId, "Enter", context.ownership.tmuxServerIdentity);
+      if (submitIndex === 0) await sleep3(120);
+    }
     return { ok: true, kind: "attempted_unconfirmed" };
   } catch (error) {
     logWorkerSpawnDiagnostic(
@@ -11204,15 +11390,14 @@ async function sendToWorker(_sessionName, paneId, message, tmuxServerIdentity) {
     if (await paneInCopyMode(paneId)) {
       return false;
     }
-    const initialCapture = await capturePaneAsync(paneId);
+    const initialObservation = await capturePaneObservation(paneId, { operation: "worker-direct-send" });
+    if (!initialObservation.ok || !initialObservation.captured.trim()) return false;
+    const initialCapture = initialObservation.captured;
     if (paneHasClaudeStartupBanner(initialCapture)) {
       return false;
     }
     const paneBusy = paneHasActiveTask(initialCapture);
     const trustPromptKind = detectPaneTrustPromptKind(initialCapture);
-    if (trustPromptKind === "cursor_workspace_trust") {
-      return false;
-    }
     if (trustPromptKind === "directory") {
       await sendKey("C-m");
       await sleep3(120);
@@ -11223,6 +11408,8 @@ async function sendToWorker(_sessionName, paneId, message, tmuxServerIdentity) {
       await sleep3(120);
       await sendKey("C-m");
       await sleep3(200);
+    } else if (trustPromptKind) {
+      return false;
     }
     if (isCmuxSurfaceTarget(paneId)) {
       await cmuxSendSurface(paneId, message);
@@ -11230,27 +11417,38 @@ async function sendToWorker(_sessionName, paneId, message, tmuxServerIdentity) {
       return false;
     }
     await sleep3(150);
+    const preSubmitObservation = await capturePaneObservation(paneId, { operation: "worker-direct-submit" });
+    if (!preSubmitObservation.ok || !preSubmitObservation.captured.trim() || paneHasTrustPrompt(preSubmitObservation.captured)) return false;
+    const sendSubmitKey = async (key) => {
+      const observation = await capturePaneObservation(paneId, { operation: "worker-direct-submit-key" });
+      if (!observation.ok || !observation.captured.trim() || paneHasTrustPrompt(observation.captured)) return false;
+      await sendKey(key);
+      return true;
+    };
     const submitRounds = 6;
     for (let round = 0; round < submitRounds; round++) {
       await sleep3(100);
       if (round === 0 && paneBusy) {
-        await sendKey("Tab");
+        if (!await sendSubmitKey("Tab")) return false;
         await sleep3(80);
-        await sendKey("C-m");
+        if (!await sendSubmitKey("C-m")) return false;
       } else {
-        await sendKey("C-m");
+        if (!await sendSubmitKey("C-m")) return false;
         await sleep3(200);
-        await sendKey("C-m");
+        if (!await sendSubmitKey("C-m")) return false;
       }
       await sleep3(140);
-      const checkCapture = await capturePaneAsync(paneId);
-      if (!paneTailContainsLiteralLine(checkCapture, message)) return true;
+      const checkObservation = await capturePaneObservation(paneId, { operation: "worker-direct-submit-check" });
+      if (!checkObservation.ok || !checkObservation.captured.trim() || paneHasTrustPrompt(checkObservation.captured)) return false;
+      if (!paneTailContainsLiteralLine(checkObservation.captured, message)) return true;
       await sleep3(140);
     }
     if (await paneInCopyMode(paneId)) {
       return false;
     }
-    const finalCapture = await capturePaneAsync(paneId);
+    const finalObservation = await capturePaneObservation(paneId, { operation: "worker-direct-final-submit" });
+    if (!finalObservation.ok || !finalObservation.captured.trim() || paneHasTrustPrompt(finalObservation.captured)) return false;
+    const finalCapture = finalObservation.captured;
     const paneModeBeforeAdaptiveRetry = await paneInCopyMode(paneId);
     if (shouldAttemptAdaptiveRetry({
       paneBusy,
@@ -11262,38 +11460,41 @@ async function sendToWorker(_sessionName, paneId, message, tmuxServerIdentity) {
       if (await paneInCopyMode(paneId)) {
         return false;
       }
-      await sendKey("C-u");
+      if (!await sendSubmitKey("C-u")) return false;
       await sleep3(80);
       if (await paneInCopyMode(paneId)) {
         return false;
       }
       if (isCmuxSurfaceTarget(paneId)) {
+        const retryInputObservation = await capturePaneObservation(paneId, { operation: "worker-direct-retry-input" });
+        if (!retryInputObservation.ok || !retryInputObservation.captured.trim() || paneHasTrustPrompt(retryInputObservation.captured)) return false;
         await cmuxSendSurface(paneId, message);
       } else {
         return false;
       }
       await sleep3(120);
       for (let round = 0; round < 4; round++) {
-        await sendKey("C-m");
+        if (!await sendSubmitKey("C-m")) return false;
         await sleep3(180);
-        await sendKey("C-m");
+        if (!await sendSubmitKey("C-m")) return false;
         await sleep3(140);
-        const retryCapture = await capturePaneAsync(paneId);
-        if (!paneTailContainsLiteralLine(retryCapture, message)) return true;
+        const retryObservation = await capturePaneObservation(paneId, { operation: "worker-direct-retry-check" });
+        if (!retryObservation.ok || !retryObservation.captured.trim() || paneHasTrustPrompt(retryObservation.captured)) return false;
+        if (!paneTailContainsLiteralLine(retryObservation.captured, message)) return true;
       }
     }
     if (await paneInCopyMode(paneId)) {
       return false;
     }
-    await sendKey("C-m");
+    if (!await sendSubmitKey("C-m")) return false;
     await sleep3(120);
-    await sendKey("C-m");
+    if (!await sendSubmitKey("C-m")) return false;
     await sleep3(140);
-    const finalCheckCapture = await capturePaneAsync(paneId);
-    if (!finalCheckCapture || finalCheckCapture.trim() === "") {
+    const finalCheckObservation = await capturePaneObservation(paneId, { operation: "worker-direct-final-check" });
+    if (!finalCheckObservation.ok || !finalCheckObservation.captured.trim() || paneHasTrustPrompt(finalCheckObservation.captured)) {
       return false;
     }
-    return !paneTailContainsLiteralLine(finalCheckCapture, message);
+    return !paneTailContainsLiteralLine(finalCheckObservation.captured, message);
   } catch {
     return false;
   }
@@ -11729,7 +11930,7 @@ async function killTeamSession(sessionName2, workerPaneIds, leaderPaneId, option
   if (result.outcome === "executed") return true;
   return await observeTmuxServerIdentity(identity) === "dead";
 }
-var sleep3, execFileAsync2, TMUX_SESSION_PREFIX, TMUX_LIVENESS_SERVER_RECHECK_ATTEMPTS, TMUX_LIVENESS_SERVER_RECHECK_DELAY_MS, defaultTmuxServerIdentityDependencies, guardMarkerCounter, TMUX_MAILBOX_PANE_ID, TMUX_MAILBOX_TARGET, defaultMailboxTargetOwnershipDependencies, defaultDirectMailboxEffectDependencies, TeamSessionCreationError, SUPPORTED_POSIX_SHELLS, ZSH_CANDIDATES, BASH_CANDIDATES, DANGEROUS_LAUNCH_BINARY_CHARS;
+var sleep3, execFileAsync2, TMUX_SESSION_PREFIX, TMUX_LIVENESS_SERVER_RECHECK_ATTEMPTS, TMUX_LIVENESS_SERVER_RECHECK_DELAY_MS, CMUX_MEMBERSHIP_RETRY_ATTEMPTS, CMUX_MEMBERSHIP_RETRY_INTERVAL_MS, defaultTmuxServerIdentityDependencies, guardMarkerCounter, TMUX_MAILBOX_PANE_ID, TMUX_MAILBOX_TARGET, defaultMailboxTargetOwnershipDependencies, defaultDirectMailboxEffectDependencies, TeamSessionCreationError, SUPPORTED_POSIX_SHELLS, ZSH_CANDIDATES, BASH_CANDIDATES, DANGEROUS_LAUNCH_BINARY_CHARS;
 var init_tmux_session = __esm({
   "src/team/tmux-session.ts"() {
     "use strict";
@@ -11746,6 +11947,8 @@ var init_tmux_session = __esm({
     TMUX_SESSION_PREFIX = "omc-team";
     TMUX_LIVENESS_SERVER_RECHECK_ATTEMPTS = 3;
     TMUX_LIVENESS_SERVER_RECHECK_DELAY_MS = 20;
+    CMUX_MEMBERSHIP_RETRY_ATTEMPTS = 20;
+    CMUX_MEMBERSHIP_RETRY_INTERVAL_MS = 50;
     defaultTmuxServerIdentityDependencies = {
       tmuxQuery: (args, options) => tmuxCmdAsync(args, options),
       processIdentity: currentStrictProcessStartIdentity,
@@ -12285,6 +12488,217 @@ var init_mcp_comm = __esm({
   }
 });
 
+// scripts/lib/utf8-bom.mjs
+function stripLeadingUtf8Bom(content) {
+  return content.startsWith("\uFEFF") ? content.slice(1) : content;
+}
+var init_utf8_bom = __esm({
+  "scripts/lib/utf8-bom.mjs"() {
+    "use strict";
+  }
+});
+
+// src/utils/frontmatter.ts
+function unquoteYamlScalar(value) {
+  if (value.startsWith('"') && value.endsWith('"')) return value.slice(1, -1);
+  if (value.startsWith("'") && value.endsWith("'"))
+    return value.slice(1, -1).replace(/''/g, "'");
+  return value;
+}
+function stripOptionalQuotes(value) {
+  const trimmed = value.trim();
+  return unquoteYamlScalar(trimmed).trim();
+}
+function parseBlockScalarHeader(rawValue) {
+  const match = BLOCK_SCALAR_HEADER.exec(rawValue);
+  if (!match) return null;
+  const chompingIndicator = match[2] ?? match[5];
+  const indentIndicator = match[3] ?? match[4];
+  return {
+    folded: match[1] === ">",
+    chomping: chompingIndicator === "+" ? "keep" : chompingIndicator === "-" ? "strip" : "clip",
+    ...indentIndicator ? { indentIndicator: Number(indentIndicator) } : {}
+  };
+}
+function countLeadingYamlSpaces(line) {
+  let count = 0;
+  while (line[count] === " ") count++;
+  return count;
+}
+function isBlankBlockScalarLine(line) {
+  return countLeadingYamlSpaces(line) === line.length;
+}
+function getBlockScalarContentIndent(lines, startIndex, parentIndent, header) {
+  if (header.indentIndicator !== void 0) {
+    return { value: parentIndent + header.indentIndicator, isDetermined: true };
+  }
+  let leadingBlankIndent = parentIndent;
+  for (let i = startIndex; i < lines.length; i++) {
+    const line = lines[i];
+    const indent = countLeadingYamlSpaces(line);
+    if (isBlankBlockScalarLine(line)) {
+      leadingBlankIndent = Math.max(leadingBlankIndent, indent);
+      continue;
+    }
+    if (indent > parentIndent) {
+      if (line[indent] === "#" && indent < leadingBlankIndent) {
+        return { value: leadingBlankIndent, isDetermined: false };
+      }
+      return { value: indent, isDetermined: true };
+    }
+    break;
+  }
+  return { value: parentIndent + 1, isDetermined: false };
+}
+function readBlockScalar(blockLines, header, contentIndent) {
+  const rows = blockLines.map((line) => {
+    const indent = countLeadingYamlSpaces(line);
+    if (isBlankBlockScalarLine(line) && !contentIndent.isDetermined)
+      return { text: "", moreIndented: false };
+    const moreIndented = indent > contentIndent.value || line[contentIndent.value] === "	";
+    return {
+      text: line.slice(Math.min(contentIndent.value, indent)),
+      moreIndented
+    };
+  });
+  let value;
+  if (header.folded) {
+    value = foldBlockScalarRows(rows);
+  } else {
+    value = rows.map((row) => row.text).join("\n") + (rows.length > 0 ? "\n" : "");
+  }
+  if (header.chomping === "keep") return value;
+  const withoutTrailingBreaks = value.replace(/\n+$/, "");
+  if (header.chomping === "strip" || !rows.some((row) => row.text !== ""))
+    return withoutTrailingBreaks;
+  return `${withoutTrailingBreaks}
+`;
+}
+function foldBlockScalarRows(rows) {
+  let value = "";
+  let previous;
+  let pendingEmptyLines = 0;
+  for (const row of rows) {
+    if (row.text === "") {
+      pendingEmptyLines++;
+      continue;
+    }
+    if (!previous) {
+      value += "\n".repeat(pendingEmptyLines);
+    } else if (pendingEmptyLines > 0) {
+      const preservedBreak = previous.moreIndented || row.moreIndented ? 1 : 0;
+      value += "\n".repeat(pendingEmptyLines + preservedBreak);
+    } else {
+      value += previous.moreIndented || row.moreIndented ? "\n" : " ";
+    }
+    value += row.text;
+    previous = row;
+    pendingEmptyLines = 0;
+  }
+  return value + "\n".repeat(previous ? pendingEmptyLines + 1 : pendingEmptyLines);
+}
+function parseFrontmatter(content) {
+  const frontmatterRegex = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)([\s\S]*)$/;
+  const match = stripLeadingUtf8Bom(content).match(frontmatterRegex);
+  if (!match) {
+    return { metadata: {}, body: content };
+  }
+  const [, yamlContent, body] = match;
+  const metadata = {};
+  const lines = yamlContent.split(/\r?\n/);
+  const rootLine = lines.find((line) => {
+    const trimmed = line.trimStart();
+    return trimmed.length > 0 && !trimmed.startsWith("#") && trimmed.includes(":");
+  });
+  const rootIndent = rootLine === void 0 ? void 0 : rootLine.length - rootLine.trimStart().length;
+  let flowDepth = 0;
+  let quote = null;
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+    const line = lines[lineIndex];
+    const trimmed = line.trimStart();
+    const indent = line.length - trimmed.length;
+    if (flowDepth === 0) {
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      if (indent !== rootIndent) continue;
+      const colonIndex = line.indexOf(":");
+      if (colonIndex === -1) continue;
+      const key = line.slice(0, colonIndex).trim();
+      const rawValue = line.slice(colonIndex + 1).trim();
+      const blockHeader = parseBlockScalarHeader(rawValue);
+      if (blockHeader) {
+        const contentIndent = getBlockScalarContentIndent(
+          lines,
+          lineIndex + 1,
+          rootIndent,
+          blockHeader
+        );
+        const blockLines = [];
+        while (lineIndex + 1 < lines.length) {
+          const nextLine = lines[lineIndex + 1];
+          const nextIndent = countLeadingYamlSpaces(nextLine);
+          if (!isBlankBlockScalarLine(nextLine) && nextIndent < contentIndent.value)
+            break;
+          blockLines.push(lines[++lineIndex]);
+        }
+        metadata[key] = readBlockScalar(blockLines, blockHeader, contentIndent);
+        continue;
+      }
+      metadata[key] = stripOptionalQuotes(rawValue);
+    } else {
+    }
+    let scanFrom = 0;
+    if (flowDepth === 0) {
+      const colonIndex = line.indexOf(":");
+      const valueStart = colonIndex === -1 ? -1 : line.slice(colonIndex + 1).search(/\S/);
+      if (colonIndex !== -1 && valueStart !== -1) {
+        const firstValueChar = line[colonIndex + 1 + valueStart];
+        if (firstValueChar === "{" || firstValueChar === "[") {
+          scanFrom = colonIndex + 1 + valueStart;
+        }
+      }
+      if (scanFrom === 0) continue;
+    }
+    for (let i = scanFrom; i < line.length; i++) {
+      const char = line[i];
+      if (quote) {
+        if (quote === '"' && char === "\\") {
+          i++;
+          continue;
+        }
+        if (char === quote) {
+          if (quote === "'" && line[i + 1] === "'") {
+            i++;
+            continue;
+          }
+          quote = null;
+        }
+        continue;
+      }
+      if (char === '"' || char === "'") {
+        quote = char;
+        continue;
+      }
+      if (char === "#" && (i === 0 || line[i - 1] === " " || line[i - 1] === "	")) {
+        break;
+      }
+      if (char === "{" || char === "[") {
+        flowDepth++;
+      } else if ((char === "}" || char === "]") && flowDepth > 0) {
+        flowDepth--;
+      }
+    }
+  }
+  return { metadata, body };
+}
+var BLOCK_SCALAR_HEADER;
+var init_frontmatter = __esm({
+  "src/utils/frontmatter.ts"() {
+    "use strict";
+    init_utf8_bom();
+    BLOCK_SCALAR_HEADER = /^([|>])(?:(?:([+-])([1-9])?)|(?:([1-9])([+-])?))?(?:[ \t]+#.*)?$/;
+  }
+});
+
 // src/agents/utils.ts
 import { readFileSync as readFileSync13 } from "fs";
 import { join as join21, dirname as dirname21, basename as basename12, resolve as resolve8, relative as relative5, isAbsolute as isAbsolute7 } from "path";
@@ -12313,8 +12727,7 @@ function getPackageDir() {
   return process.cwd();
 }
 function stripFrontmatter(content) {
-  const match = content.match(/^---[\s\S]*?---\s*([\s\S]*)$/);
-  return match ? match[1].trim() : content.trim();
+  return parseFrontmatter(content).body.trim();
 }
 function loadAgentPrompt(agentName) {
   if (!/^[a-z0-9-]+$/i.test(agentName)) {
@@ -12349,6 +12762,7 @@ Prompt unavailable.`;
 var init_utils = __esm({
   "src/agents/utils.ts"() {
     "use strict";
+    init_frontmatter();
   }
 });
 
@@ -12475,13 +12889,20 @@ var init_omc_cli_rendering = __esm({
   }
 });
 
+// src/utils/debug-flag.ts
+var init_debug_flag = __esm({
+  "src/utils/debug-flag.ts"() {
+    "use strict";
+  }
+});
+
 // src/utils/jsonc.ts
 function parseJsonc(content) {
   const cleaned = stripJsoncComments(content);
   return JSON.parse(cleaned);
 }
 function stripJsoncComments(content) {
-  return stripTrailingCommas(stripComments(content));
+  return stripTrailingCommas(stripComments(stripLeadingUtf8Bom(content)));
 }
 function stripComments(content) {
   let result = "";
@@ -12574,6 +12995,7 @@ function stripTrailingCommas(content) {
 var init_jsonc = __esm({
   "src/utils/jsonc.ts"() {
     "use strict";
+    init_utf8_bom();
   }
 });
 
@@ -13579,7 +14001,6 @@ var init_loader = __esm({
       "qa",
       "autoresearch",
       "ultraqa",
-      "merge-readiness",
       "self-improve",
       "ultrawork",
       "ultrapilot",
@@ -14206,13 +14627,6 @@ var init_definitions = __esm({
   }
 });
 
-// src/utils/frontmatter.ts
-var init_frontmatter = __esm({
-  "src/utils/frontmatter.ts"() {
-    "use strict";
-  }
-});
-
 // src/utils/skill-pipeline.ts
 var init_skill_pipeline = __esm({
   "src/utils/skill-pipeline.ts"() {
@@ -14571,6 +14985,7 @@ var FAMILY_TO_ALIAS, SKININTHEGAMEBROS_ONLY_SKILLS2;
 var init_delegation_enforcer = __esm({
   "src/features/delegation-enforcer.ts"() {
     "use strict";
+    init_debug_flag();
     init_definitions();
     init_types3();
     init_loader();
@@ -14594,6 +15009,20 @@ var init_delegation_enforcer = __esm({
 // src/lib/security-config.ts
 import { existsSync as existsSync21, readFileSync as readFileSync17 } from "fs";
 import { join as join26 } from "path";
+function sanitizeSecurityOverrides(raw) {
+  const result = {};
+  if (typeof raw.restrictToolPaths === "boolean") result.restrictToolPaths = raw.restrictToolPaths;
+  if (typeof raw.pythonSandbox === "boolean") result.pythonSandbox = raw.pythonSandbox;
+  if (typeof raw.disableProjectSkills === "boolean") result.disableProjectSkills = raw.disableProjectSkills;
+  if (typeof raw.disableAutoUpdate === "boolean") result.disableAutoUpdate = raw.disableAutoUpdate;
+  if (typeof raw.disableRemoteMcp === "boolean") result.disableRemoteMcp = raw.disableRemoteMcp;
+  if (typeof raw.disableExternalLLM === "boolean") result.disableExternalLLM = raw.disableExternalLLM;
+  const hardMaxIterations = raw.hardMaxIterations;
+  if (typeof hardMaxIterations === "number" && Number.isInteger(hardMaxIterations) && hardMaxIterations >= 0) {
+    result.hardMaxIterations = hardMaxIterations;
+  }
+  return result;
+}
 function loadSecurityFromConfigFiles() {
   const paths = [
     join26(process.cwd(), ".claude", "omc.jsonc"),
@@ -14604,8 +15033,8 @@ function loadSecurityFromConfigFiles() {
     try {
       const content = readFileSync17(configPath, "utf-8");
       const parsed = parseJsonc(content);
-      if (parsed?.security && typeof parsed.security === "object") {
-        return parsed.security;
+      if (parsed?.security && typeof parsed.security === "object" && !Array.isArray(parsed.security)) {
+        return sanitizeSecurityOverrides(parsed.security);
       }
     } catch {
     }
@@ -15104,6 +15533,7 @@ var init_model_contract = __esm({
     ];
     CLAUDE_WORKER_ENV_ALLOWLIST = [
       "CLAUDE_CONFIG_DIR",
+      "CLAUDE_SECURESTORAGE_CONFIG_DIR",
       "CLAUDE_CODE_EFFORT_LEVEL"
     ];
   }
@@ -15154,7 +15584,7 @@ function renderRecoveryContinuationInstruction(instruction) {
 function renderWorkerExitContract(agentType, reviewerRole = false) {
   const transitionTaskStatusCommand = formatOmcCliInvocation("team api transition-task-status");
   if (agentType === "cursor" && reviewerRole) {
-    return "Write the trusted structured verdict, ACK the leader, and keep waiting for mailbox instructions. Do not call transition-task-status or exit solely because the verdict was written.";
+    return "Write the trusted structured verdict, send a review completion report to the leader, and keep waiting for mailbox instructions. Do not call transition-task-status or exit solely because the verdict was written.";
   }
   if (agentType === "cursor") {
     return `Run \`${transitionTaskStatusCommand}\` when the assigned task is done, then keep waiting for the next mailbox message. Exit only when the leader sends an explicit shutdown.`;
@@ -15254,25 +15684,31 @@ function generateWorkerOverlay(params) {
   const cursorReviewer = agentType === "cursor" && reviewerRole === true;
   const persistentCursor = agentType === "cursor" && !cursorReviewer;
   const mandatoryWorkflow = cursorReviewer ? [
-    "You MUST complete the reviewer steps below. Do NOT skip any step.",
+    "For an owner-adopted recovery task, follow Recovery Continuation in place of steps 1 and 2 only: do not claim the task again or send the startup ACK. Steps 3 onward still apply: resume the read-only review and write the structured verdict; leave the task transition to the leader.",
+    "If no task is assigned, wait for an assignment without inventing a task; skip all numbered steps until a task is assigned.",
+    "Subject to the recovery and idle exceptions above, you MUST complete every applicable reviewer step below.",
     "",
     "1. **Claim** your task (run this command first):",
     `   \`${claimTaskCommand}\``,
     "   Save the `claim_token` from the response.",
-    "2. **Do the read-only review** described in your task assignment below.",
-    "3. **Send ACK** to the leader:",
+    "   For ordinary new tasks only: Only after a successful claim may you continue. If the claim fails, do not send the startup ACK or begin work; report the failure to leader-fixed and wait for instructions.",
+    "2. **Send exactly one startup ACK** to the leader before review; do not repeat it for later tasks:",
     `   \`${sendAckCommand}\``,
+    "3. **Do the read-only review** described in your task assignment below.",
     "4. **Write the structured verdict** required by the trusted reviewer contract.",
     "5. **Keep the Cursor session alive** after writing the verdict; the leader consumes it and transitions the task."
   ].join("\n") : [
-    persistentCursor ? "You MUST complete ALL of these steps. Transitioning the task does not end the session." : "You MUST complete ALL of these steps. Do NOT skip any step. Do NOT exit without step 4.",
+    "For an owner-adopted recovery task, follow Recovery Continuation in place of steps 1 and 2 only: do not claim the task again or send the startup ACK. Steps 3 onward still apply: resume the work, then transition the task with the adopted `claim_token` from Recovery Continuation as `<claim_token>`.",
+    "If no task is assigned, wait for an assignment without inventing a task; skip all numbered steps until a task is assigned.",
+    persistentCursor ? "Subject to the recovery and idle exceptions above, you MUST complete every applicable step. Transitioning the task does not end the session." : "Subject to the recovery and idle exceptions above, you MUST complete every applicable step. For an assigned task, do NOT exit without step 4.",
     "",
     "1. **Claim** your task (run this command first):",
     `   \`${claimTaskCommand}\``,
     "   Save the `claim_token` from the response \u2014 you need it for step 4.",
-    "2. **Do the work** described in your task assignment below.",
-    "3. **Send ACK** to the leader:",
+    "   For ordinary new tasks only: Only after a successful claim may you continue. If the claim fails, do not send the startup ACK or begin work; report the failure to leader-fixed and wait for instructions.",
+    "2. **Send exactly one startup ACK** to the leader before work; do not repeat it for later tasks:",
     `   \`${sendAckCommand}\``,
+    "3. **Do the work** described in your task assignment below.",
     persistentCursor ? "4. **Transition** the task status when that task is done:" : "4. **Transition** the task status (REQUIRED before exit):",
     `   - On success: \`${completeTaskCommand}\``,
     `   - On failure: \`${failTaskCommand}\``,
@@ -15345,17 +15781,15 @@ Send messages via CLI API:
 - Check mailbox: \`${mailboxListCommand}\`
 - Mark delivered: \`${mailboxDeliveredCommand}\`
 
-## Startup Handshake (Required)
-Before doing any task work, send exactly one startup ACK to the leader:
-\`${sendAckCommand}\`
-
 ## Shutdown Protocol
 When you see a shutdown request in your inbox:
+For forced shutdown, follow the inbox instructions instead of the normal decision flow below: a rejection does not veto termination; do not resume task work.
+For normal shutdown requests only:
 1. Write your decision to: ${shutdownAckPath}
 2. Format:
    - Accept: {"status":"accept","reason":"ok","updated_at":"<iso>"}
    - Reject: {"status":"reject","reason":"still working","updated_at":"<iso>"}
-3. Exit your session
+3. If you accept, exit your session. If you reject, remain active for task work and mailbox instructions; do not exit because of this request.
 
 ## Rules
 - You are NOT the leader. Never run leader orchestration workflows.
@@ -18003,6 +18437,7 @@ var init_worker_activation_gate = __esm({
 var runtime_v2_exports = {};
 __export(runtime_v2_exports, {
   CircuitBreakerV2: () => CircuitBreakerV2,
+  buildStartupInboxTrigger: () => buildStartupInboxTrigger,
   claimErrorLineFromPane: () => claimErrorLineFromPane,
   cleanupAbandonedTeamState: () => cleanupAbandonedTeamState,
   cleanupStaleReservations: () => cleanupStaleReservations,
@@ -18038,8 +18473,14 @@ import { link as link4, lstat as lstat6, mkdir as mkdir16, open as open5, readdi
 import { performance } from "perf_hooks";
 import { execFileSync as execFileSync8 } from "node:child_process";
 import { createHash as createHash12, randomUUID as randomUUID15 } from "node:crypto";
-function workerInstructionStateRoot(cwd, teamName) {
-  return process.platform === "win32" ? teamStateRoot(cwd, teamName) : "$OMC_TEAM_STATE_ROOT";
+function workerInstructionStateRoot(cwd, teamName, platform = process.platform) {
+  return platform === "win32" ? teamStateRoot(cwd, teamName) : "$OMC_TEAM_STATE_ROOT";
+}
+function buildStartupInboxTrigger(cwd, teamName, workerName, attemptId, platform = process.platform) {
+  const suffix = ` [launch:${attemptId.slice(0, 12)}]`;
+  const message = generateTriggerMessage(teamName, workerName, workerInstructionStateRoot(cwd, teamName, platform)) + suffix;
+  if (platform !== "win32" || message.length <= 200) return message;
+  return `Read workers/${workerName}/inbox.md under the OMC_TEAM_STATE_ROOT environment variable; execute now, report concrete progress.${suffix}`;
 }
 function setRuntimeOwnerRecoveryClient(client) {
   runtimeOwnerRecoveryClient = client;
@@ -18516,15 +18957,15 @@ function buildV2TaskInstruction(teamName, workerName, task, taskId, agentType, c
   const persistentCursor = agentType === "cursor";
   const cursorReviewer = persistentCursor && Boolean(cliOutputContract);
   const lifecycleInstructions = cursorReviewer ? [
-    `3. Write the structured verdict from the trusted reviewer contract below when the review is complete.`,
-    `4. ${renderWorkerExitContract(agentType, true)}`
+    `4. Write the structured verdict from the trusted reviewer contract below when the review is complete.`,
+    `5. ${renderWorkerExitContract(agentType, true)}`
   ] : [
-    `3. On completion (use claim_token from step 1):`,
+    `4. On completion (use claim_token from step 1):`,
     `   ${completeTaskCommand}`,
     `   The result field is required for completion evidence. For broad delegated tasks, include either "Subagent skip reason: <why no nested worker was needed/allowed>" or, only when explicitly allowed by the leader, "Subagent spawn evidence: <child task names/thread ids and integrated findings>".`,
-    `4. On failure (use claim_token from step 1):`,
+    `5. On failure (use claim_token from step 1):`,
     `   ${failTaskCommand}`,
-    persistentCursor ? `5. ${renderWorkerExitContract(agentType, false)}` : `5. ACK/progress replies are not a stop signal. Keep executing your assigned or next feasible work until the task is actually complete or failed, then transition and exit.`
+    persistentCursor ? `6. ${renderWorkerExitContract(agentType, false)}` : `6. ACK/progress replies are not a stop signal. Keep executing your assigned or next feasible work until the task is actually complete or failed, then transition and exit.`
   ];
   return [
     `## REQUIRED: Task Lifecycle Commands`,
@@ -18533,7 +18974,9 @@ function buildV2TaskInstruction(teamName, workerName, task, taskId, agentType, c
     `1. Claim your task:`,
     `   ${claimTaskCommand}`,
     `   Save the claim_token from the response.`,
-    `2. Do the work described below.`,
+    `   Only after a successful claim may you continue. If the claim fails, do not send the startup ACK or begin work; report the failure to leader-fixed and wait for instructions.`,
+    `2. Send the startup ACK from the worker overlay exactly once before work; do not resend it if already sent.`,
+    `3. Do the work described below.`,
     ...lifecycleInstructions,
     ``,
     `## Task Assignment`,
@@ -18814,7 +19257,6 @@ async function spawnV2Worker(opts) {
     opts.agentType,
     cliOutputContract
   );
-  const instructionStateRoot = workerInstructionStateRoot(opts.cwd, opts.teamName);
   const startupBaseline = await captureWorkerStartupBaseline(
     opts.teamName,
     opts.workerName,
@@ -18884,7 +19326,7 @@ async function spawnV2Worker(opts) {
     }
     throw error;
   }
-  const inboxTriggerMessage = `${generateTriggerMessage(opts.teamName, opts.workerName, instructionStateRoot)} [launch:${startupContext.attempt.attempt_id.slice(0, 12)}]`;
+  const inboxTriggerMessage = buildStartupInboxTrigger(opts.cwd, opts.teamName, opts.workerName, startupContext.attempt.attempt_id);
   const cleanupStartedLaunch = async (reason) => {
     const cleaned = await retireAndCleanupCurrentWorkerLaunchAttempt(startupContext.attempt, reason, async () => {
       try {
@@ -20513,11 +20955,12 @@ ${recoveryContract}` : ""}`;
             if (!settlement.settled) return { ok: false, error: startupEvidenceMissingReason(settlement.paneBusy, pending.agentType) };
           } else if (pending.promptMode) {
           } else {
-            const recoveryTriggerMessage = `${generateTriggerMessage(
+            const recoveryTriggerMessage = buildStartupInboxTrigger(
+              input.cwd,
               input.teamName,
               sagaInput2.workerName,
-              workerInstructionStateRoot(input.cwd, input.teamName)
-            )} [launch:${startupContext.attempt.attempt_id.slice(0, 12)}]`;
+              startupContext.attempt.attempt_id
+            );
             const outcome = await queueInboxInstruction({
               teamName: input.teamName,
               workerName: sagaInput2.workerName,
@@ -22597,14 +23040,25 @@ async function shutdownTeamV2(teamName, cwd, options = {}) {
       shutdownRequestTimes.set(w.name, requestedAt);
       const shutdownRoot = workerInstructionStateRoot(cwd, sanitized);
       const shutdownAckPath = `${shutdownRoot}/workers/${w.name}/shutdown-ack.json`;
-      const shutdownInbox = `# Shutdown Request
+      const shutdownInbox = force ? `# Shutdown Request
 
-All tasks are complete. Please wrap up and respond with a shutdown acknowledgement.
+The leader requests forced shutdown. Please wrap up if possible and acknowledge promptly.
 
 Write your ack to: ${shutdownAckPath}
-Format: {"status":"accept","reason":"ok","updated_at":"<iso>"}
+Format:
+- Accept: {"status":"accept","reason":"ok","updated_at":"<iso>"}
 
-Then exit your session.
+This is a forced shutdown: a rejection does not veto termination. After acknowledging, exit your session; do not resume task work.
+` : `# Shutdown Request
+
+The leader requests shutdown. Please wrap up if possible and respond with your shutdown decision.
+
+Write your ack to: ${shutdownAckPath}
+Format:
+- Accept: {"status":"accept","reason":"ok","updated_at":"<iso>"}
+- Reject: {"status":"reject","reason":"still working","updated_at":"<iso>"}
+
+If you accept, exit your session. If you reject, remain active for task work and mailbox instructions; do not exit because of this request.
 `;
       await writeWorkerInbox(sanitized, w.name, shutdownInbox, cwd);
     } catch (err) {
@@ -24921,8 +25375,9 @@ function output(value, asJson) {
   console.log(value);
 }
 function toInt(value, flag) {
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed)) {
+  const trimmed = value.trim();
+  const parsed = Number(trimmed);
+  if (!/^[+-]?\d+$/.test(trimmed) || !Number.isSafeInteger(parsed)) {
     throw new Error(`Invalid ${flag} value: ${value}`);
   }
   return parsed;

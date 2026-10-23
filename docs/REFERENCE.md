@@ -91,6 +91,21 @@ Configure omc for all Claude Code sessions:
 - **Default**: explicitly overwrites existing `~/.claude/CLAUDE.md`
 - **Optional preserve mode**: keeps the base file, writes OMC to `~/.claude/CLAUDE-omc.md`, and lets `omc` force-load that companion config at launch while plain `claude` stays unchanged
 
+#### Opt out of global CLAUDE.md management
+
+If you maintain your own `~/.claude/CLAUDE.md` and do not want installs or updates to merge the OMC block into it, set `claudeMdEnabled` to `false` in `~/.claude/.omc-config.json`:
+
+```json
+{ "claudeMdEnabled": false }
+```
+
+- Default is `true`; only an explicit `false` opts out
+- `omc install`, `omc update` and the global `/oh-my-claudecode:omc-setup` step then leave `~/.claude/CLAUDE.md` and `~/.claude/CLAUDE-omc.md` untouched and log a skip line
+- `omc doctor` reports missing OMC markers as informational (legacy-guide and marker-structure warnings remain); SessionStart omits CLAUDE.md from its drift check, while other component drift notices still apply
+- A `CLAUDE-omc.md` left by an earlier preserve-mode install is still loaded by `omc` launch; delete it if you no longer want it
+- Project-scoped setup (`--local`) is unaffected
+- Removing the key (or setting it to `true`) restores the default merge behavior on the next install, update or setup
+
 ### What Configuration Enables
 
 | Feature           | Without     | With omc Config         |
@@ -129,9 +144,9 @@ If both configurations exist, **project-scoped takes precedence** over global:
 | `OMC_GIT_GUARDRAILS`       | _(unset)_            | `1` force-enables the destructive-git PreToolUse guard in any session; `0` always disables it (immediate exit, wins over everything). With the variable unset, the guard is on by default while an active unattended mode (ralph/autopilot/team/ultragoal) is detected.      |
 | `OMC_RUN_BUDGET_TOKENS`    | _(unset)_            | Opt-in session token budget for unattended modes. Ralph and autopilot compare spend at iteration/phase boundaries (via the `trace_summary` tool): warn at 90%, stop with a resumable budget report at 100%. Advisory today — the model reads the tool output.               |
 | `OMC_STALE_RUN_HOURS`      | `2`                  | Stale-run watchdog threshold in hours. A SessionStart hook reports unattended-mode state files left `active: true` with no mtime progress for this long (the signature of a crashed run). Advisory only — the watchdog never mutates state or resumes runs.                |
-| `OMC_HOST_LOAD_THRESHOLD` | _(dynamic)_ | CPU load threshold (1-minute average). Gate blocks operations when load exceeds this. Default: 80% of available cores. Set to negative value to disable. |
-| `OMC_FREE_MEMORY_THRESHOLD` | `256` | Free memory threshold in MB. Gate blocks operations when free memory falls below this. Set to negative value to disable. |
-| `OMC_MAX_SIBLING_SESSIONS` | `8` | Maximum concurrent OMC sessions before gating expensive operations. Set to negative value to disable. |
+| `OMC_HOST_LOAD_THRESHOLD` | _(dynamic)_ | CPU load threshold (1-minute average). Gate blocks operations when load exceeds this. Default: 80% of available cores. Zero is valid; empty, malformed, negative, or non-finite values use the default. |
+| `OMC_FREE_MEMORY_THRESHOLD` | `256` | Free memory threshold in MB. Gate blocks operations when free memory falls below this. Zero is valid; empty, malformed, negative, fractional, or unsafe integer values use the default. |
+| `OMC_MAX_SIBLING_SESSIONS` | `8` | Maximum concurrent OMC sessions before gating expensive operations. Zero is valid; empty, malformed, negative, fractional, or unsafe integer values use the default. |
 | `OMC_HOST_LOAD_GATE_DISABLED` | _(unset)_ | Set to any value to disable the host load gate entirely. |
 
 #### Headless factory and AFK settings
@@ -145,6 +160,7 @@ OMC monitors host resources (CPU load, free memory, concurrent sessions) to prev
 **Behavior**:
 - **Fail-open**: if metrics are unavailable, the gate allows operations immediately (never deadlocks)
 - **Configurable thresholds**: set environment variables or override via code
+- **Invalid environment values**: empty, malformed, negative, non-finite, or out-of-range thresholds use the documented defaults. Negative thresholds supplied through a code config override still disable that individual check.
 - **Disable-able**: set `OMC_HOST_LOAD_GATE_DISABLED=1` to bypass gating entirely
 
 **Example**: limit concurrent sessions to 4 and free memory to 512 MB:

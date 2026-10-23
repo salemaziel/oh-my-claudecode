@@ -37,7 +37,7 @@ import {
   writeBaseline,
   type CommandBaseline,
 } from '../../hooks/ralph/feedback-baseline.js';
-import { readPrd } from '../../hooks/ralph/prd.js';
+import { findPrdPath, readPrd, readPrdFromPath } from '../../hooks/ralph/prd.js';
 import { executePlanActions, loadMapRecords, parseMapRef, planFromMap, renderActionOutcomes, renderMapPlan } from '../../factory/map-ingest.js';
 import { composeMapPrd, finalizeMapRun, launchGate, mapRunTaskPrompt, readMapRunSidecar } from '../../factory/map-run.js';
 import { defaultSpawnFn, factoryLinkArgv } from '../../hooks/session-end/spawn-next.js';
@@ -298,7 +298,7 @@ Examples:
         process.exitCode = 1;
         return;
       }
-      const feedbackCommands = resolveFeedbackCommands(process.cwd());
+      const { commands: feedbackCommands } = resolveFeedbackCommands(process.cwd());
       const composed = composeMapPrd(process.cwd(), sessionId, plan, records, { feedbackCommands });
       if (!composed.written) {
         report(`launch refused — PRD not composed: ${composed.error ?? 'unknown'}`);
@@ -328,34 +328,40 @@ Examples:
 /**
  * Feedback commands for judgment. Inside an `omc ralph afk` session only the
  * launcher-declared list counts; otherwise the PRD's declared list, else
- * package-script detection.
+ * package-script detection. A found but unreadable PRD returns its error
+ * instead of falling through to package-script detection.
  */
-export function resolveFeedbackCommands(directory: string, sessionId?: string): string[] {
+export function resolveFeedbackCommands(directory: string, sessionId?: string): { commands: string[]; prdError?: string } {
   const afk = process.env[RALPH_AFK_FEEDBACK_ENV];
   if (afk !== undefined) {
     try {
       const parsed: unknown = JSON.parse(afk);
-      return Array.isArray(parsed) ? afkFeedbackCommands(parsed.filter((c): c is string => typeof c === 'string')) : [];
+      return { commands: Array.isArray(parsed) ? afkFeedbackCommands(parsed.filter((c): c is string => typeof c === 'string')) : [] };
     } catch {
-      return [];
+      return { commands: [] };
     }
   }
-  const declared = readPrd(directory, sessionId)?.feedbackCommands;
-  if (declared && declared.length > 0) return [...declared];
+  const prdPath = findPrdPath(directory, sessionId);
+  if (prdPath) {
+    const { prd, error } = readPrdFromPath(prdPath);
+    if (error) return { commands: [], prdError: error };
+    if (prd?.feedbackCommands?.length) return { commands: [...prd.feedbackCommands] };
+  }
   try {
     const pkg = JSON.parse(readFileSync(join(directory, 'package.json'), 'utf8')) as { scripts?: Record<string, string> };
     const scripts = pkg.scripts ?? {};
     // Script NAMES are not commands — `test` is not an executable; the
     // detected entries must be runnable invocations.
-    return ['build', 'typecheck', 'lint', 'test', 'test:run']
+    const commands = ['build', 'typecheck', 'lint', 'test', 'test:run']
       .filter((name) => typeof scripts[name] === 'string')
       .map((name) => `npm run ${name}`);
+    return { commands };
   } catch {
-    return [];
+    return { commands: [] };
   }
 }
 
-const UNRUNNABLE_PATTERN = /not recognized as an internal or external command|command not found|no such file or directory/i;
+const SHELL_MISSING_COMMAND_PATTERN = /^(?:[^:\r\n]*\/)?(?:sh|bash):\s*(?:(?:line\s+)?\d+:\s*)?[^:\r\n]+:\s*(?:command not found|not found)\s*$|^(?:zsh:\s*)?(?:(?:line\s+)?\d+:\s*)?command not found:\s*\S+\s*$|^['"][^'"\r\n]+['"] is not recognized as an internal or external command\b/im;
 
 /** Run one feedback command on the current tree and fingerprint its failures. */
 export function runFeedbackCommand(command: string, directory: string): CommandBaseline {
@@ -369,10 +375,35 @@ export function runFeedbackCommand(command: string, directory: string): CommandB
       maxBuffer: 32 * 1024 * 1024,
     });
     const output = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
-    const unrunnable = Boolean(result.error) || (result.status !== 0 && UNRUNNABLE_PATTERN.test(output));
-    return { signatures: unrunnable ? [] : signatureLines(output), ...(unrunnable ? { unrunnable: true } : {}) };
-  } catch {
-    return { signatures: [], unrunnable: true };
+    const errorCode = result.error && 'code' in result.error && typeof result.error.code === 'string'
+      ? result.error.code
+      : undefined;
+    // spawnSync also reports errors after a child ran (for example, ETIMEDOUT); pid 0 means no child started.
+    const failedToSpawn = Boolean(result.error) && result.pid === 0;
+    const outputWithExecutionError = errorCode && errorCode !== 'ENOENT'
+      ? `${output}\nCommand execution failed: ${errorCode}`
+      : output;
+    const signatures = signatureLines(outputWithExecutionError);
+    const hasShellMissingCommand = SHELL_MISSING_COMMAND_PATTERN.test(output);
+    const otherSignatures = hasShellMissingCommand
+      ? signatureLines(output.split(/\r?\n/).filter((line) => (
+        !SHELL_MISSING_COMMAND_PATTERN.test(line)
+        && !/^>\s/.test(line)
+        && !/^operable program or batch file\.?$/i.test(line)
+      )).join('\n'))
+      : signatures;
+    const unrunnable = failedToSpawn
+      || result.status === 126
+      || result.status === 127
+      || (!result.error && hasShellMissingCommand && otherSignatures.length === 0);
+    return { signatures: unrunnable ? [] : signatures, ...(unrunnable ? { unrunnable: true } : {}) };
+  } catch (error) {
+    const errorCode = typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'string'
+      ? error.code
+      : undefined;
+    return errorCode === 'ENOENT'
+      ? { signatures: [], unrunnable: true }
+      : { signatures: [`Command execution failed: ${errorCode ?? 'unknown'}`] };
   }
 }
 
@@ -406,28 +437,37 @@ export function ralphVerify(options: { json?: boolean; session?: string; writeBa
     }
   }
   const path = sessionId ? baselinePath(stateRoot, sessionId) : '';
-  const commands = resolveFeedbackCommands(directory, sessionId || undefined);
+  const baseline = path ? readBaseline(path) : null;
+  const resolution = resolveFeedbackCommands(directory, sessionId || undefined);
+  if (resolution.prdError) {
+    console.error(`omc ralph verify: ${resolution.prdError}`);
+    if (options.json) {
+      console.log(JSON.stringify({ sessionId: sessionId || null, baselinePresent: Boolean(baseline), commands: [], newFailures: [], resolvedFailures: [], unrunnableCommands: [], error: resolution.prdError }));
+    }
+    return 1;
+  }
+  const commands = resolution.commands;
   if (commands.length === 0) {
     const message = 'no feedback commands: declare feedbackCommands in the PRD or add package.json build/lint/test scripts';
-    if (options.json) console.log(JSON.stringify({ sessionId: sessionId || null, baselinePresent: false, commands: [], newFailures: [], resolvedFailures: [], note: message }));
+    if (options.json) console.log(JSON.stringify({ sessionId: sessionId || null, baselinePresent: Boolean(baseline), commands: [], newFailures: [], resolvedFailures: [], unrunnableCommands: [], note: message }));
     else console.log(`ralph verify: ${message}`);
     return 0;
   }
   const current: Record<string, CommandBaseline> = {};
   for (const command of commands) current[command] = runFeedbackCommand(command, directory);
+  const unrunnableCommands = Object.entries(current).filter(([, entry]) => entry.unrunnable).map(([command]) => command);
 
   if (options.writeBaseline) {
     const written = path ? writeBaseline(path, current, now) : false;
     const note = written ? `baseline recorded at ${path}` : 'could not write a baseline (no session id; pass --session)';
-    if (options.json) console.log(JSON.stringify({ sessionId: sessionId || null, baselineWritten: written, commands, signatures: Object.fromEntries(Object.entries(current).map(([c, e]) => [c, e.signatures.length])) }));
+    if (options.json) console.log(JSON.stringify({ sessionId: sessionId || null, baselineWritten: written, commands, signatures: Object.fromEntries(Object.entries(current).map(([c, e]) => [c, e.signatures.length])), unrunnableCommands }));
     else console.log(`ralph verify: ${note}`);
     return written ? 0 : 1;
   }
 
-  const baseline = path ? readBaseline(path) : null;
   const diff = diffAgainstBaseline(baseline, current);
   if (options.json) {
-    console.log(JSON.stringify({ sessionId: sessionId || null, baselinePresent: Boolean(baseline), commands, newFailures: diff.newSignatures, resolvedFailures: diff.resolvedSignatures }));
+    console.log(JSON.stringify({ sessionId: sessionId || null, baselinePresent: Boolean(baseline), commands, newFailures: diff.newSignatures, resolvedFailures: diff.resolvedSignatures, unrunnableCommands }));
     return diff.newSignatures.length > 0 ? 1 : 0;
   }
   if (!baseline) {
@@ -439,6 +479,12 @@ export function ralphVerify(options: { json?: boolean; session?: string; writeBa
     console.log(`ralph verify: ${diff.newSignatures.length} NEW failure(s) since baseline`);
     for (const signature of diff.newSignatures) console.log(`  new: ${signature}`);
     return 1;
+  }
+  const stillUnrunnable = unrunnableCommands.filter((command) => baseline?.commands[command]?.unrunnable);
+  if (stillUnrunnable.length > 0) {
+    console.log(`ralph verify: ${stillUnrunnable.length} feedback command(s) remain unrunnable; no comparison was possible`);
+    for (const command of stillUnrunnable) console.log(`  unavailable: ${command}`);
+    return 0;
   }
   const note = diff.resolvedSignatures.length > 0 ? ` (${diff.resolvedSignatures.length} baseline failure(s) resolved)` : '';
   console.log(`ralph verify: clean vs baseline${note}`);

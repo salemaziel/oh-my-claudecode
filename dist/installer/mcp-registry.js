@@ -276,6 +276,17 @@ function escapeTomlString(value) {
     // Escape order: backslash first to avoid re-escaping.
     let result = value.replace(/\\/g, '\\\\');
     // Escape other special characters and control codes
+    // An unpaired surrogate is not a Unicode scalar value, so TOML cannot carry it
+    // either way: it has no UTF-8 encoding, and a \uXXXX escape naming a surrogate
+    // is rejected outright by a conforming parser (Python's tomllib refuses the
+    // whole document with "Escaped character is not a Unicode scalar value"), which
+    // would make one bad value unreadable for the entire Codex config rather than
+    // just for itself.
+    //
+    // Substitute U+FFFD, which is what the UTF-8 write produced anyway -- now
+    // explicitly and with a document that still parses. A matched pair is a real
+    // astral character and is left alone.
+    result = result.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, '\uFFFD');
     result = result.replace(/["\n\r\t\b\f\0-\x07\x0b\x0e-\x1f\x7f]/g, (char) => {
         switch (char) {
             case '"':
@@ -564,6 +575,110 @@ function parseTomlKey(value) {
     const parsed = parseTomlQuotedString(trimmed);
     return parsed && parsed.trim().length > 0 ? parsed : undefined;
 }
+function parseTomlDottedKey(value) {
+    const keys = [];
+    let index = 0;
+    const skipWhitespace = () => {
+        while (value[index] === ' ' || value[index] === '\t') {
+            index++;
+        }
+    };
+    skipWhitespace();
+    while (index < value.length) {
+        const start = index;
+        const quote = value[index];
+        if (quote === '"') {
+            index++;
+            let closed = false;
+            while (index < value.length) {
+                if (value[index] === '\\') {
+                    index += 2;
+                }
+                else if (value[index++] === '"') {
+                    closed = true;
+                    break;
+                }
+            }
+            if (!closed) {
+                return undefined;
+            }
+        }
+        else if (quote === "'") {
+            index++;
+            while (index < value.length && value[index] !== "'") {
+                index++;
+            }
+            if (index >= value.length) {
+                return undefined;
+            }
+            index++;
+        }
+        else {
+            while (index < value.length && value[index] !== '.' && value[index] !== ' ' && value[index] !== '\t') {
+                index++;
+            }
+        }
+        const key = parseTomlKey(value.slice(start, index));
+        if (!key) {
+            return undefined;
+        }
+        keys.push(key);
+        skipWhitespace();
+        if (index === value.length) {
+            return keys;
+        }
+        if (value[index] !== '.') {
+            return undefined;
+        }
+        index++;
+        skipWhitespace();
+        if (index === value.length) {
+            return undefined;
+        }
+    }
+    return undefined;
+}
+function parseTomlTableHeader(line) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('[') || trimmed.startsWith('[[')) {
+        return undefined;
+    }
+    let quote;
+    let escaped = false;
+    let closingBracket = -1;
+    for (let index = 1; index < trimmed.length; index++) {
+        const character = trimmed[index];
+        if (quote === '"') {
+            if (escaped) {
+                escaped = false;
+            }
+            else if (character === '\\') {
+                escaped = true;
+            }
+            else if (character === '"') {
+                quote = undefined;
+            }
+            continue;
+        }
+        if (quote === "'") {
+            if (character === "'") {
+                quote = undefined;
+            }
+            continue;
+        }
+        if (character === '"' || character === "'") {
+            quote = character;
+        }
+        else if (character === ']') {
+            closingBracket = index;
+            break;
+        }
+    }
+    if (closingBracket < 0 || (trimmed.slice(closingBracket + 1).trim() && !trimmed.slice(closingBracket + 1).trimStart().startsWith('#'))) {
+        return undefined;
+    }
+    return parseTomlDottedKey(trimmed.slice(1, closingBracket));
+}
 function renderTomlStringMapInline(values) {
     const entries = Object.entries(values)
         .sort(([left], [right]) => left.localeCompare(right))
@@ -629,10 +744,10 @@ function parseCodexMcpServerNames(content) {
         if (!line || line.startsWith('#')) {
             continue;
         }
-        const sectionMatch = line.match(/^\[mcp_servers\.([^\]]+)\]$/);
-        if (sectionMatch) {
-            const name = sectionMatch[1].trim();
-            if (name && CODEX_MCP_SERVER_NAME_PATTERN.test(name)) {
+        const tableKeys = parseTomlTableHeader(line);
+        if (tableKeys?.[0] === 'mcp_servers' && tableKeys.length >= 2) {
+            const name = tableKeys[1];
+            if (CODEX_MCP_SERVER_NAME_PATTERN.test(name)) {
                 names.add(name);
             }
         }
@@ -703,23 +818,30 @@ function parseCodexMcpRegistryEntries(content) {
         if (!line || line.startsWith('#')) {
             continue;
         }
-        const headersSectionMatch = line.match(/^\[mcp_servers\.([^\]]+)\.headers\]$/);
-        if (headersSectionMatch) {
-            const name = headersSectionMatch[1].trim();
-            if (!currentName || currentName !== name) {
+        const tableKeys = parseTomlTableHeader(line);
+        if (tableKeys) {
+            const name = tableKeys[0] === 'mcp_servers' ? tableKeys[1] : undefined;
+            if (name && CODEX_MCP_SERVER_NAME_PATTERN.test(name) && tableKeys.length === 3 && tableKeys[2] === 'headers') {
+                if (!currentName || currentName !== name) {
+                    flushCurrent();
+                    currentName = name;
+                    currentEntry = {};
+                }
+                currentSection = 'headers';
+            }
+            else if (name && CODEX_MCP_SERVER_NAME_PATTERN.test(name) && tableKeys.length === 2) {
                 flushCurrent();
                 currentName = name;
                 currentEntry = {};
+                currentSection = 'server';
             }
-            currentSection = 'headers';
+            else {
+                flushCurrent();
+            }
             continue;
         }
-        const sectionMatch = line.match(/^\[mcp_servers\.([^\]]+)\]$/);
-        if (sectionMatch) {
+        if (line.startsWith('[[')) {
             flushCurrent();
-            currentName = sectionMatch[1].trim();
-            currentEntry = {};
-            currentSection = 'server';
             continue;
         }
         if (!currentName || !currentSection) {

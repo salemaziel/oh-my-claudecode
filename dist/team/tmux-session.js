@@ -24,6 +24,8 @@ const execFileAsync = promisify(execFile);
 const TMUX_SESSION_PREFIX = 'omc-team';
 const TMUX_LIVENESS_SERVER_RECHECK_ATTEMPTS = 3;
 const TMUX_LIVENESS_SERVER_RECHECK_DELAY_MS = 20;
+const CMUX_MEMBERSHIP_RETRY_ATTEMPTS = 20;
+const CMUX_MEMBERSHIP_RETRY_INTERVAL_MS = 50;
 const defaultTmuxServerIdentityDependencies = {
     tmuxQuery: (args, options) => tmuxCmdAsync(args, options),
     processIdentity: currentStrictProcessStartIdentity,
@@ -652,17 +654,19 @@ async function cmuxSplitSurface(targetSurfaceId, direction, _cwd) {
     return { ...result, paneId };
 }
 async function cmuxSendSurface(surfaceId, text) {
-    // cmux 0.64.x targets a specific surface with the dedicated
-    // `send-surface` subcommand. `cmux send --surface ...` is parsed as the
-    // focused-surface form plus an unknown option in current cmux builds, which
-    // makes worker startup fail after the split/worktree has already been
-    // created. The top-level `omc team` catch then prints generic usage and the
-    // startup rollback tears the empty worktree down. (#3325)
+    // cmux releases expose either the dedicated command or the --surface form.
+    // Probe the CLI's actual behavior and fall back only on a dialect error;
+    // do not pin command syntax to a version string.
     await cmuxExecPrimaryWithLegacyFallback(['send-surface', '--surface', surfaceId, text], ['send', '--surface', surfaceId, text]);
 }
 function normalizeCmuxKey(key) {
     const normalized = key.trim();
     const lower = normalized.toLowerCase();
+    const controlKey = normalized.match(/^[Cc]-([A-Za-z])$/);
+    if (controlKey?.[1]) {
+        const character = controlKey[1].toLowerCase();
+        return character === 'm' ? 'enter' : `ctrl+${character}`;
+    }
     switch (lower) {
         case 'enter':
         case 'return':
@@ -681,11 +685,10 @@ function normalizeCmuxKey(key) {
     }
 }
 async function cmuxSendSurfaceKey(surfaceId, key) {
-    // See cmuxSendSurface(): targeting a surface uses `send-key-surface`, not a
-    // `--surface` option on `send-key`. Key names are lower-case in the cmux CLI
-    // reference; normalize common names while leaving advanced chord strings alone.
+    // See cmuxSendSurface(): older and newer cmux releases use different
+    // surface-targeting commands. Normalize tmux-style control keys for both.
     const normalizedKey = normalizeCmuxKey(key);
-    await cmuxExecPrimaryWithLegacyFallback(['send-key-surface', '--surface', surfaceId, normalizedKey], ['send-key', '--surface', surfaceId, key]);
+    await cmuxExecPrimaryWithLegacyFallback(['send-key-surface', '--surface', surfaceId, normalizedKey], ['send-key', '--surface', surfaceId, normalizedKey]);
 }
 async function cmuxCaptureSurface(surfaceId) {
     const result = await cmuxExecPrimaryWithLegacyFallback(['read-screen', '--surface', surfaceId], ['capture-pane', '--surface', surfaceId, '--scrollback']);
@@ -903,6 +906,21 @@ export async function verifyTeamTargetOwnership(target, dependencies = defaultMa
         return { kind: 'unavailable' };
     }
 }
+async function verifyCmuxTargetOwnershipWithRetry(target, dependencies) {
+    let membership = await verifyTeamTargetOwnership(target, dependencies);
+    if (membership.kind === 'owned' || membership.kind === 'provider_mismatch')
+        return membership;
+    // cmux allocates a new surface before it becomes visible in list-panes.
+    // Retry the authoritative membership query rather than delaying once and
+    // assuming the new surface is ready. Each retry observes provider state.
+    for (let attempt = 1; attempt < CMUX_MEMBERSHIP_RETRY_ATTEMPTS; attempt++) {
+        await sleep(CMUX_MEMBERSHIP_RETRY_INTERVAL_MS);
+        membership = await verifyTeamTargetOwnership(target, dependencies);
+        if (membership.kind === 'owned' || membership.kind === 'provider_mismatch')
+            return membership;
+    }
+    return membership;
+}
 const defaultDirectMailboxEffectDependencies = {
     sendWorker: sendToWorker,
     sendLeader: injectToLeaderPane,
@@ -935,6 +953,9 @@ export async function invokeDirectMailboxEffect(target, message, dependencies = 
         if (membership.kind !== 'owned') {
             return { kind: 'not_attempted', reason: 'mailbox_membership_unresolvable' };
         }
+        const inputBlockReason = await paneInputBlockReason(target.paneId, tmuxServerIdentity, dependencies.serverIdentityDependencies);
+        if (inputBlockReason)
+            return { kind: 'not_attempted', reason: inputBlockReason };
         const text = target.recipientRole === 'leader'
             ? `[OMC_TMUX_INJECT] ${message}`.slice(0, 200)
             : message;
@@ -949,6 +970,15 @@ export async function invokeDirectMailboxEffect(target, message, dependencies = 
                         reason: 'notification_delivery_uncertain',
                         cause: 'returned_false',
                     };
+            }
+            const postInputBlockReason = await paneInputBlockReason(target.paneId, tmuxServerIdentity, dependencies.serverIdentityDependencies);
+            if (postInputBlockReason) {
+                return {
+                    kind: 'attempted_unconfirmed',
+                    transport: 'tmux_send_keys',
+                    reason: 'notification_delivery_uncertain',
+                    cause: 'returned_false',
+                };
             }
             const enter = await runGuardedNativeTmuxCommand(tmuxServerIdentity, tmuxCommandString(['send-keys', '-t', target.paneId, 'Enter']));
             if (enter.outcome !== 'executed') {
@@ -1302,7 +1332,7 @@ export function workerPaneShellCommand() {
     // file that the pane shell sources and removes before exec'ing the login shell.
     const inline = buildProviderEnvironment({ SHELL: shell }, process.env, process.platform, []);
     const passthrough = Object.fromEntries(Object.entries(baseline).filter(([key, value]) => inline[key] !== value));
-    const inheritedPaneEnvironment = ['TERM', 'TMUX', 'TMUX_PANE', 'TMUX_TMPDIR', 'LANG', 'LC_ALL', 'LC_CTYPE']
+    const inheritedPaneEnvironment = ['TERM', 'COLORTERM', 'TMUX', 'TMUX_PANE', 'TMUX_TMPDIR', 'LANG', 'LC_ALL', 'LC_CTYPE']
         .map(key => `${key}="$${key}"`);
     const inlineAssignments = Object.entries(inline).map(([key, value]) => `${key}=${shellQuote(value)}`);
     if (Object.keys(passthrough).length === 0) {
@@ -1613,7 +1643,7 @@ export async function adoptWorkerPaneOwnership(input) {
             serverIdentityDependencies: input.serverIdentityDependencies,
         }
         : membershipDependencies;
-    const membership = await verifyTeamTargetOwnership({
+    const target = {
         provider: input.provider,
         providerTarget: input.providerTarget,
         recipient: 'worker',
@@ -1622,7 +1652,10 @@ export async function adoptWorkerPaneOwnership(input) {
         ...(input.provider === 'tmux'
             ? { tmuxServerIdentity: input.tmuxServerIdentity }
             : {}),
-    }, dependenciesWithIdentityProbe);
+    };
+    const membership = input.provider === 'cmux'
+        ? await verifyCmuxTargetOwnershipWithRetry(target, dependenciesWithIdentityProbe)
+        : await verifyTeamTargetOwnership(target, dependenciesWithIdentityProbe);
     if (membership.kind === 'foreign')
         return { ok: false, reason: 'pane_foreign' };
     if (membership.kind !== 'owned')
@@ -1633,7 +1666,7 @@ export async function adoptWorkerPaneOwnership(input) {
     };
 }
 export async function workerPaneBelongsToProviderTarget(input, dependencies = input.dependencies ?? defaultMailboxTargetOwnershipDependencies) {
-    const membership = await verifyTeamTargetOwnership({
+    const target = {
         provider: input.provider,
         providerTarget: input.providerTarget,
         recipient: 'worker',
@@ -1642,7 +1675,10 @@ export async function workerPaneBelongsToProviderTarget(input, dependencies = in
         ...(input.provider === 'tmux'
             ? { tmuxServerIdentity: input.tmuxServerIdentity }
             : {}),
-    }, dependencies);
+    };
+    const membership = input.provider === 'cmux'
+        ? await verifyCmuxTargetOwnershipWithRetry(target, dependencies)
+        : await verifyTeamTargetOwnership(target, dependencies);
     return membership.kind === 'owned';
 }
 /** Owned variant of pane membership; tmux queries never reconnect by name. */
@@ -2523,7 +2559,7 @@ async function capturePaneObservation(paneId, opts = {}) {
         }
         if (opts.tmuxServerIdentity) {
             if (!isValidTmuxServerIdentity(opts.tmuxServerIdentity)
-                || await observeTmuxServerIdentity(opts.tmuxServerIdentity) !== 'matching') {
+                || await observeTmuxServerIdentity(opts.tmuxServerIdentity, opts.serverIdentityDependencies) !== 'matching') {
                 return { ok: false, error: 'tmux_server_identity_unverified' };
             }
         }
@@ -2534,7 +2570,7 @@ async function capturePaneObservation(paneId, opts = {}) {
             ? await tmuxExecAsync(tmuxArgsForIdentity(opts.tmuxServerIdentity, args), { timeout: 2_000, stripTmux: true })
             : await tmuxExecAsync(args);
         if (opts.tmuxServerIdentity
-            && await observeTmuxServerIdentity(opts.tmuxServerIdentity) !== 'matching') {
+            && await observeTmuxServerIdentity(opts.tmuxServerIdentity, opts.serverIdentityDependencies) !== 'matching') {
             return { ok: false, error: 'tmux_server_identity_changed' };
         }
         return { ok: true, captured: result.stdout };
@@ -2581,14 +2617,34 @@ export async function sendTeamPaneKey(paneId, key, tmuxServerIdentity) {
         throw new Error('tmux_server_guard_failed');
 }
 async function guardedSendLiteralAndEnter(paneId, text, tmuxServerIdentity) {
-    if (!isValidTmuxServerIdentity(tmuxServerIdentity)
-        || await observeTmuxServerIdentity(tmuxServerIdentity) !== 'matching')
+    if (await paneInputBlockReason(paneId, tmuxServerIdentity))
         return false;
     const literal = await runGuardedNativeTmuxCommand(tmuxServerIdentity, tmuxCommandString(['send-keys', '-t', paneId, '-l', '--', text]));
     if (literal.outcome !== 'executed')
         return false;
+    if (await paneInputBlockReason(paneId, tmuxServerIdentity))
+        return false;
     const enter = await runGuardedNativeTmuxCommand(tmuxServerIdentity, tmuxCommandString(['send-keys', '-t', paneId, 'Enter']));
     return enter.outcome === 'executed';
+}
+async function paneInputBlockReason(paneId, tmuxServerIdentity, serverIdentityDependencies) {
+    const observation = await capturePaneObservation(paneId, {
+        operation: 'guarded-notification',
+        tmuxServerIdentity,
+        ...(serverIdentityDependencies ? { serverIdentityDependencies } : {}),
+    });
+    if (!observation.ok || !observation.captured.trim())
+        return 'mailbox_membership_unresolvable';
+    // Guarded input never answers a trust dialog: typed text and Enter would
+    // land on whatever choice is focused (Claude focuses "No, exit").
+    const trustPrompt = detectPaneTrustPromptKind(observation.captured);
+    if (trustPrompt === 'codex_directory')
+        return 'codex_workspace_untrusted';
+    if (trustPrompt === 'cursor_workspace_trust')
+        return 'cursor_workspace_untrusted';
+    if (trustPrompt)
+        return 'trust_prompt_pending';
+    return undefined;
 }
 export async function killTeamPane(paneId) {
     if (isCmuxSurfaceTarget(paneId)) {
@@ -2636,9 +2692,31 @@ export async function killOwnedWorkerPane(ownership) {
         throw new Error('owned_pane_tmux_server_guard_failed');
     }
 }
-function detectPaneTrustPromptKind(captured, provider) {
+/**
+ * @internal Exported for testing only.
+ */
+export function detectPaneTrustPromptKind(captured, provider) {
     const lines = captured.split('\n').map(l => l.replace(/\r/g, '').trim()).filter(l => l.length > 0);
     const tail = lines.slice(-12);
+    const lastCodexPromptIndex = lines.findLastIndex(line => paneLineLooksLikeIdlePrompt(line, 'codex'));
+    const activeCodexPrompt = lastCodexPromptIndex >= 0
+        ? lines[lastCodexPromptIndex].replace(/^\s*(?:[│┃║▌▐▏▕╎┆┊]\s*)?[›>❯]\s*/, '')
+        : '';
+    const lastCodexTrustQuestionIndex = lines.findLastIndex((line, index) => /Trust this folder\?/i.test(lines.slice(index, index + 2).join(' ')));
+    const previousTrustChoiceWasRendered = lastCodexTrustQuestionIndex >= 0
+        && lines.slice(lastCodexTrustQuestionIndex + 1, lastCodexPromptIndex).some(line => {
+            const prompt = line.replace(/^\s*(?:[│┃║▌▐▏▕╎┆┊]\s*)?[›>❯]\s*/, '');
+            return /^(?:1(?:\.|$)|2(?:\.|$))/i.test(prompt);
+        });
+    const lastCodexPromptIsTrustChoice = lastCodexPromptIndex >= 0
+        && (/^(?:1(?:\.|$)|2(?:\.|$))/i.test(activeCodexPrompt)
+            || (activeCodexPrompt === '' && !previousTrustChoiceWasRendered));
+    const codexTrustQuestionIsActive = lastCodexTrustQuestionIndex >= 0
+        && (lastCodexPromptIndex < lastCodexTrustQuestionIndex || lastCodexPromptIsTrustChoice);
+    if ((provider === undefined || provider === 'codex')
+        && codexTrustQuestionIsActive) {
+        return 'codex_directory';
+    }
     const hasCursorTrustBanner = tail.some(l => /Workspace Trust Required/i.test(l));
     const hasCursorTrustHint = tail.some(l => /Pass\s+--trust,\s*--yolo,\s*or\s+-f/i.test(l));
     if ((provider === undefined || provider === 'cursor')
@@ -2648,7 +2726,7 @@ function detectPaneTrustPromptKind(captured, provider) {
     const hasClaudeDirectoryQuestion = tail.some(l => /(?:Do you trust the files in this folder|Quick safety check:\s*Is this a project you created or one you trust)\?/i.test(l));
     const hasClaudeDirectoryNoChoice = tail.some(l => /\bNo,\s*exit\b/i.test(l));
     const hasClaudeDirectoryYesChoice = tail.some(l => /\bYes,\s*(?:proceed|I trust this folder)\b/i.test(l));
-    if (provider === 'claude' && hasClaudeDirectoryQuestion
+    if ((provider === undefined || provider === 'claude') && hasClaudeDirectoryQuestion
         && hasClaudeDirectoryNoChoice && hasClaudeDirectoryYesChoice) {
         return 'claude_directory';
     }
@@ -2730,10 +2808,10 @@ export function paneLooksReady(captured, provider) {
         .filter(line => line.trim() !== '');
     if (lines.length === 0)
         return false;
-    // A dismissible trust prompt still means the CLI is up and answering. The
-    // cursor workspace-trust banner is the opposite: the process already exited,
-    // so the pane is not ready and never will be without `--trust`.
-    if (detectPaneTrustPromptKind(content, provider) === 'cursor_workspace_trust')
+    // Dismissible trust prompts are still interactive. Cursor has exited, while
+    // Codex's folder-trust choice must be made by the user, so neither is ready.
+    const trustPrompt = detectPaneTrustPromptKind(content, provider);
+    if (trustPrompt === 'cursor_workspace_trust' || trustPrompt === 'codex_directory')
         return false;
     if (paneHasTrustPrompt(content, provider))
         return true;
@@ -2847,6 +2925,10 @@ export async function waitForStartupPaneReady(context, opts = {}) {
         const captured = observation.captured;
         const selector = detectPaneTrustPromptKind(captured, context.provider);
         if (selector) {
+            // This Codex dialog persists workspace trust and can enable folder
+            // settings. Never type a task or grant that trust on the user's behalf.
+            if (selector === 'codex_directory')
+                return { ok: false, reason: 'codex_workspace_untrusted' };
             // cursor-agent's workspace-trust banner has no selectable answer and the
             // process is already gone, so there is nothing to drive. Report it under
             // its own reason instead of blocking until readiness_timeout.
@@ -2882,6 +2964,31 @@ export async function waitForStartupPaneReady(context, opts = {}) {
     }
     return { ok: false, reason: 'readiness_timeout' };
 }
+async function startupPaneSubmitBlockReason(context, attemptAlreadyFenced) {
+    if (!await startupContextIsActive(context, attemptAlreadyFenced))
+        return 'attempt_inactive';
+    const copyMode = await paneCopyModeObservation(context.ownership.paneId, context.ownership.tmuxServerIdentity);
+    if (copyMode === null)
+        return 'copy_mode_unknown';
+    if (copyMode)
+        return 'copy_mode';
+    const observation = await capturePaneObservation(context.ownership.paneId, {
+        operation: 'startup-submit',
+        ...(context.ownership.provider === 'tmux'
+            ? { tmuxServerIdentity: context.ownership.tmuxServerIdentity }
+            : {}),
+    });
+    if (!observation.ok || !observation.captured.trim())
+        return 'capture_failed';
+    const selector = detectPaneTrustPromptKind(observation.captured, context.provider);
+    if (selector === 'codex_directory')
+        return 'codex_workspace_untrusted';
+    if (selector === 'cursor_workspace_trust')
+        return 'cursor_workspace_untrusted';
+    if (selector)
+        return 'selector_persistent';
+    return undefined;
+}
 export async function deliverStartupInbox(context, message, options = {}) {
     if (message.length > 200)
         return { ok: false, reason: 'message_too_long' };
@@ -2889,11 +2996,19 @@ export async function deliverStartupInbox(context, message, options = {}) {
     if (!ready.ok)
         return { ok: false, reason: ready.reason };
     try {
+        const preInputBlockReason = await startupPaneSubmitBlockReason(context, options.attemptAlreadyFenced ?? false);
+        if (preInputBlockReason)
+            return { ok: false, reason: preInputBlockReason };
         await sendLiteralPaneText(context.ownership.paneId, message, context.ownership.tmuxServerIdentity);
         await sleep(100);
-        await sendTeamPaneKey(context.ownership.paneId, 'C-m', context.ownership.tmuxServerIdentity);
-        await sleep(120);
-        await sendTeamPaneKey(context.ownership.paneId, 'C-m', context.ownership.tmuxServerIdentity);
+        for (let submitIndex = 0; submitIndex < 2; submitIndex++) {
+            const submitBlockReason = await startupPaneSubmitBlockReason(context, options.attemptAlreadyFenced ?? false);
+            if (submitBlockReason)
+                return { ok: false, reason: submitBlockReason };
+            await sendTeamPaneKey(context.ownership.paneId, 'Enter', context.ownership.tmuxServerIdentity);
+            if (submitIndex === 0)
+                await sleep(120);
+        }
         return { ok: true, kind: 'attempted_unconfirmed' };
     }
     catch (error) {
@@ -3006,17 +3121,15 @@ export async function sendToWorker(_sessionName, paneId, message, tmuxServerIden
             return false;
         }
         // Check for trust prompt and auto-dismiss before sending our text
-        const initialCapture = await capturePaneAsync(paneId);
+        const initialObservation = await capturePaneObservation(paneId, { operation: 'worker-direct-send' });
+        if (!initialObservation.ok || !initialObservation.captured.trim())
+            return false;
+        const initialCapture = initialObservation.captured;
         if (paneHasClaudeStartupBanner(initialCapture)) {
             return false;
         }
         const paneBusy = paneHasActiveTask(initialCapture);
         const trustPromptKind = detectPaneTrustPromptKind(initialCapture);
-        if (trustPromptKind === 'cursor_workspace_trust') {
-            // Nothing to dismiss: cursor-agent printed the banner and exited. Sending
-            // keys here would type into a dead pane.
-            return false;
-        }
         if (trustPromptKind === 'directory') {
             await sendKey('C-m');
             await sleep(120);
@@ -3032,6 +3145,11 @@ export async function sendToWorker(_sessionName, paneId, message, tmuxServerIden
             await sendKey('C-m');
             await sleep(200);
         }
+        else if (trustPromptKind) {
+            // Every other kind is refused: Codex and Claude directory trust are the
+            // user's decision, and cursor-agent has already exited behind its banner.
+            return false;
+        }
         // Send text in literal mode with -- separator
         if (isCmuxSurfaceTarget(paneId)) {
             await cmuxSendSurface(paneId, message);
@@ -3041,25 +3159,45 @@ export async function sendToWorker(_sessionName, paneId, message, tmuxServerIden
         }
         // Allow input buffer to settle
         await sleep(150);
+        const preSubmitObservation = await capturePaneObservation(paneId, { operation: 'worker-direct-submit' });
+        if (!preSubmitObservation.ok
+            || !preSubmitObservation.captured.trim()
+            || paneHasTrustPrompt(preSubmitObservation.captured))
+            return false;
+        const sendSubmitKey = async (key) => {
+            const observation = await capturePaneObservation(paneId, { operation: 'worker-direct-submit-key' });
+            if (!observation.ok || !observation.captured.trim() || paneHasTrustPrompt(observation.captured))
+                return false;
+            await sendKey(key);
+            return true;
+        };
         // Submit: up to 6 rounds of C-m double-press.
         // For busy panes, first round uses Tab+C-m (queue semantics).
         const submitRounds = 6;
         for (let round = 0; round < submitRounds; round++) {
             await sleep(100);
             if (round === 0 && paneBusy) {
-                await sendKey('Tab');
+                if (!await sendSubmitKey('Tab'))
+                    return false;
                 await sleep(80);
-                await sendKey('C-m');
+                if (!await sendSubmitKey('C-m'))
+                    return false;
             }
             else {
-                await sendKey('C-m');
+                if (!await sendSubmitKey('C-m'))
+                    return false;
                 await sleep(200);
-                await sendKey('C-m');
+                if (!await sendSubmitKey('C-m'))
+                    return false;
             }
             await sleep(140);
             // Check if text is still visible in the pane — if not, it was submitted
-            const checkCapture = await capturePaneAsync(paneId);
-            if (!paneTailContainsLiteralLine(checkCapture, message))
+            const checkObservation = await capturePaneObservation(paneId, { operation: 'worker-direct-submit-check' });
+            if (!checkObservation.ok
+                || !checkObservation.captured.trim()
+                || paneHasTrustPrompt(checkObservation.captured))
+                return false;
+            if (!paneTailContainsLiteralLine(checkObservation.captured, message))
                 return true;
             await sleep(140);
         }
@@ -3068,7 +3206,12 @@ export async function sendToWorker(_sessionName, paneId, message, tmuxServerIden
             return false;
         }
         // Adaptive fallback: for busy panes, retry once without interrupting active turns.
-        const finalCapture = await capturePaneAsync(paneId);
+        const finalObservation = await capturePaneObservation(paneId, { operation: 'worker-direct-final-submit' });
+        if (!finalObservation.ok
+            || !finalObservation.captured.trim()
+            || paneHasTrustPrompt(finalObservation.captured))
+            return false;
+        const finalCapture = finalObservation.captured;
         const paneModeBeforeAdaptiveRetry = await paneInCopyMode(paneId);
         if (shouldAttemptAdaptiveRetry({
             paneBusy,
@@ -3080,12 +3223,18 @@ export async function sendToWorker(_sessionName, paneId, message, tmuxServerIden
             if (await paneInCopyMode(paneId)) {
                 return false;
             }
-            await sendKey('C-u');
+            if (!await sendSubmitKey('C-u'))
+                return false;
             await sleep(80);
             if (await paneInCopyMode(paneId)) {
                 return false;
             }
             if (isCmuxSurfaceTarget(paneId)) {
+                const retryInputObservation = await capturePaneObservation(paneId, { operation: 'worker-direct-retry-input' });
+                if (!retryInputObservation.ok
+                    || !retryInputObservation.captured.trim()
+                    || paneHasTrustPrompt(retryInputObservation.captured))
+                    return false;
                 await cmuxSendSurface(paneId, message);
             }
             else {
@@ -3093,12 +3242,18 @@ export async function sendToWorker(_sessionName, paneId, message, tmuxServerIden
             }
             await sleep(120);
             for (let round = 0; round < 4; round++) {
-                await sendKey('C-m');
+                if (!await sendSubmitKey('C-m'))
+                    return false;
                 await sleep(180);
-                await sendKey('C-m');
+                if (!await sendSubmitKey('C-m'))
+                    return false;
                 await sleep(140);
-                const retryCapture = await capturePaneAsync(paneId);
-                if (!paneTailContainsLiteralLine(retryCapture, message))
+                const retryObservation = await capturePaneObservation(paneId, { operation: 'worker-direct-retry-check' });
+                if (!retryObservation.ok
+                    || !retryObservation.captured.trim()
+                    || paneHasTrustPrompt(retryObservation.captured))
+                    return false;
+                if (!paneTailContainsLiteralLine(retryObservation.captured, message))
                     return true;
             }
         }
@@ -3108,17 +3263,21 @@ export async function sendToWorker(_sessionName, paneId, message, tmuxServerIden
         }
         // Fail-closed: one final submit attempt, then report failure so
         // callers can surface startup dispatch problems explicitly.
-        await sendKey('C-m');
+        if (!await sendSubmitKey('C-m'))
+            return false;
         await sleep(120);
-        await sendKey('C-m');
+        if (!await sendSubmitKey('C-m'))
+            return false;
         await sleep(140);
-        const finalCheckCapture = await capturePaneAsync(paneId);
+        const finalCheckObservation = await capturePaneObservation(paneId, { operation: 'worker-direct-final-check' });
         // Empty capture means tmux capture failed or returned indeterminate output.
         // Treat this as delivery failure to keep dispatch behavior fail-closed.
-        if (!finalCheckCapture || finalCheckCapture.trim() === '') {
+        if (!finalCheckObservation.ok
+            || !finalCheckObservation.captured.trim()
+            || paneHasTrustPrompt(finalCheckObservation.captured)) {
             return false;
         }
-        return !paneTailContainsLiteralLine(finalCheckCapture, message);
+        return !paneTailContainsLiteralLine(finalCheckObservation.captured, message);
     }
     catch {
         return false;

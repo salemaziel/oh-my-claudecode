@@ -182,8 +182,23 @@ import {
 } from './team-ops.js';
 import { createTaskRecord, validateTaskDependencies } from './state/tasks.js';
 
-function workerInstructionStateRoot(cwd: string, teamName: string): string {
-  return process.platform === 'win32' ? teamStateRoot(cwd, teamName) : '$OMC_TEAM_STATE_ROOT';
+function workerInstructionStateRoot(cwd: string, teamName: string, platform: NodeJS.Platform = process.platform): string {
+  return platform === 'win32' ? teamStateRoot(cwd, teamName) : '$OMC_TEAM_STATE_ROOT';
+}
+
+export function buildStartupInboxTrigger(
+  cwd: string,
+  teamName: string,
+  workerName: string,
+  attemptId: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const suffix = ` [launch:${attemptId.slice(0, 12)}]`;
+  const message = generateTriggerMessage(teamName, workerName, workerInstructionStateRoot(cwd, teamName, platform)) + suffix;
+  if (platform !== 'win32' || message.length <= 200) return message;
+  // Both initial and recovery launches explicitly supply this environment variable.
+  // Name it in prose so the instruction works with PowerShell, cmd, and Bash.
+  return `Read workers/${workerName}/inbox.md under the OMC_TEAM_STATE_ROOT environment variable; execute now, report concrete progress.${suffix}`;
 }
 import { currentProcessStartIdentity, isProcessIdentityDead, publishOwnerEpoch, readLatestOwnerEpoch, requireOwnerFence, requireOwnerProcessIdentity, type OwnerEpochRecord, type OwnerFence } from './team-owner-epoch.js';
 import type { RecoverDeadWorkerV2Error, RecoverDeadWorkerV2Failure, RecoverDeadWorkerV2Result, TaskRecoveryAdoptionResult } from './types.js';
@@ -995,18 +1010,18 @@ function buildV2TaskInstruction(
   const cursorReviewer = persistentCursor && Boolean(cliOutputContract);
   const lifecycleInstructions = cursorReviewer
     ? [
-      `3. Write the structured verdict from the trusted reviewer contract below when the review is complete.`,
-      `4. ${renderWorkerExitContract(agentType, true)}`,
+      `4. Write the structured verdict from the trusted reviewer contract below when the review is complete.`,
+      `5. ${renderWorkerExitContract(agentType, true)}`,
     ]
     : [
-      `3. On completion (use claim_token from step 1):`,
+      `4. On completion (use claim_token from step 1):`,
       `   ${completeTaskCommand}`,
       `   The result field is required for completion evidence. For broad delegated tasks, include either "Subagent skip reason: <why no nested worker was needed/allowed>" or, only when explicitly allowed by the leader, "Subagent spawn evidence: <child task names/thread ids and integrated findings>".`,
-      `4. On failure (use claim_token from step 1):`,
+      `5. On failure (use claim_token from step 1):`,
       `   ${failTaskCommand}`,
       persistentCursor
-        ? `5. ${renderWorkerExitContract(agentType, false)}`
-        : `5. ACK/progress replies are not a stop signal. Keep executing your assigned or next feasible work until the task is actually complete or failed, then transition and exit.`,
+        ? `6. ${renderWorkerExitContract(agentType, false)}`
+        : `6. ACK/progress replies are not a stop signal. Keep executing your assigned or next feasible work until the task is actually complete or failed, then transition and exit.`,
     ];
   return [
     `## REQUIRED: Task Lifecycle Commands`,
@@ -1015,7 +1030,9 @@ function buildV2TaskInstruction(
     `1. Claim your task:`,
     `   ${claimTaskCommand}`,
     `   Save the claim_token from the response.`,
-    `2. Do the work described below.`,
+    `   Only after a successful claim may you continue. If the claim fails, do not send the startup ACK or begin work; report the failure to leader-fixed and wait for instructions.`,
+    `2. Send the startup ACK from the worker overlay exactly once before work; do not resend it if already sent.`,
+    `3. Do the work described below.`,
     ...lifecycleInstructions,
     ``,
     `## Task Assignment`,
@@ -1542,7 +1559,6 @@ async function spawnV2Worker(opts: SpawnV2WorkerOptions): Promise<SpawnV2WorkerR
   const instruction = buildV2TaskInstruction(
     opts.teamName, opts.workerName, opts.task, opts.taskId, opts.agentType, cliOutputContract,
   );
-  const instructionStateRoot = workerInstructionStateRoot(opts.cwd, opts.teamName);
   const startupBaseline = await captureWorkerStartupBaseline(
     opts.teamName, opts.workerName, opts.taskId, opts.cwd,
   );
@@ -1613,8 +1629,7 @@ async function spawnV2Worker(opts: SpawnV2WorkerOptions): Promise<SpawnV2WorkerR
     }
     throw error;
   }
-  const inboxTriggerMessage = `${generateTriggerMessage(opts.teamName, opts.workerName, instructionStateRoot)} ` +
-    `[launch:${startupContext.attempt.attempt_id.slice(0, 12)}]`;
+  const inboxTriggerMessage = buildStartupInboxTrigger(opts.cwd, opts.teamName, opts.workerName, startupContext.attempt.attempt_id);
   const cleanupStartedLaunch = async (reason: string): Promise<void> => {
     const cleaned = await retireAndCleanupCurrentWorkerLaunchAttempt(startupContext.attempt, reason, async () => {
       try {
@@ -3629,11 +3644,9 @@ export async function executeRecoverDeadWorkerV2Owner(
             // identity has been verified live, so waiting for fabricated progress
             // would turn a successful idle recovery into a deterministic timeout.
           } else {
-          const recoveryTriggerMessage = `${generateTriggerMessage(
-            input.teamName,
-            sagaInput.workerName,
-            workerInstructionStateRoot(input.cwd, input.teamName),
-          )} [launch:${startupContext.attempt.attempt_id.slice(0, 12)}]`;
+          const recoveryTriggerMessage = buildStartupInboxTrigger(
+            input.cwd, input.teamName, sagaInput.workerName, startupContext.attempt.attempt_id,
+          );
           const outcome = await queueInboxInstruction({
             teamName: input.teamName,
             workerName: sagaInput.workerName,
@@ -6357,7 +6370,9 @@ export async function shutdownTeamV2(
       // Write shutdown inbox
       const shutdownRoot = workerInstructionStateRoot(cwd, sanitized);
       const shutdownAckPath = `${shutdownRoot}/workers/${w.name}/shutdown-ack.json`;
-      const shutdownInbox = `# Shutdown Request\n\nAll tasks are complete. Please wrap up and respond with a shutdown acknowledgement.\n\nWrite your ack to: ${shutdownAckPath}\nFormat: {"status":"accept","reason":"ok","updated_at":"<iso>"}\n\nThen exit your session.\n`;
+      const shutdownInbox = force
+        ? `# Shutdown Request\n\nThe leader requests forced shutdown. Please wrap up if possible and acknowledge promptly.\n\nWrite your ack to: ${shutdownAckPath}\nFormat:\n- Accept: {"status":"accept","reason":"ok","updated_at":"<iso>"}\n\nThis is a forced shutdown: a rejection does not veto termination. After acknowledging, exit your session; do not resume task work.\n`
+        : `# Shutdown Request\n\nThe leader requests shutdown. Please wrap up if possible and respond with your shutdown decision.\n\nWrite your ack to: ${shutdownAckPath}\nFormat:\n- Accept: {"status":"accept","reason":"ok","updated_at":"<iso>"}\n- Reject: {"status":"reject","reason":"still working","updated_at":"<iso>"}\n\nIf you accept, exit your session. If you reject, remain active for task work and mailbox instructions; do not exit because of this request.\n`;
       await writeWorkerInbox(sanitized, w.name, shutdownInbox, cwd);
     } catch (err) {
       process.stderr.write(`[team/runtime-v2] shutdown request failed for ${w.name}: ${err}\n`);

@@ -14,6 +14,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, rmSync 
 import { join, dirname } from 'path';
 import { execSync, execFileSync } from 'child_process';
 import { TaskTool } from '../hooks/beads-context/types.js';
+import { compareVersions as compareSemver } from '../utils/semver-compare.js';
 import {
   install as installOmc,
   HOOKS_DIR,
@@ -616,6 +617,9 @@ export interface OMCConfig {
   notificationProfiles?: Record<string, NotificationConfig>;
   /** Whether HUD statusline is enabled (default: true). Set to false to skip HUD installation. */
   hudEnabled?: boolean;
+  /** Whether OMC may write/merge the global ~/.claude/CLAUDE.md on install, update and setup (default: true).
+   *  Set to false to leave the global CLAUDE.md untouched. */
+  claudeMdEnabled?: boolean;
   /** Whether to prompt for upgrade at session start when a new version is available (default: true).
    *  Set to false to show a passive notification instead of an interactive prompt. */
   autoUpgradePrompt?: boolean;
@@ -648,6 +652,7 @@ export function getOMCConfig(): OMCConfig {
       notifications: config.notifications,
       notificationProfiles: config.notificationProfiles,
       hudEnabled: config.hudEnabled,
+      claudeMdEnabled: config.claudeMdEnabled,
       autoUpgradePrompt: config.autoUpgradePrompt,
       nodeBinary: config.nodeBinary,
     };
@@ -918,24 +923,7 @@ export async function fetchLatestRelease(): Promise<ReleaseInfo> {
  * Returns: -1 if a < b, 0 if a == b, 1 if a > b
  */
 export function compareVersions(a: string, b: string): number {
-  // Remove 'v' prefix if present
-  const cleanA = a.replace(/^v/, '');
-  const cleanB = b.replace(/^v/, '');
-
-  const partsA = cleanA.split('.').map(n => parseInt(n, 10) || 0);
-  const partsB = cleanB.split('.').map(n => parseInt(n, 10) || 0);
-
-  const maxLength = Math.max(partsA.length, partsB.length);
-
-  for (let i = 0; i < maxLength; i++) {
-    const numA = partsA[i] || 0;
-    const numB = partsB[i] || 0;
-
-    if (numA < numB) return -1;
-    if (numA > numB) return 1;
-  }
-
-  return 0;
+  return compareSemver(a, b);
 }
 
 /**

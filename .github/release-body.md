@@ -1,40 +1,17 @@
-# oh-my-claudecode v5.7.4: More reliable hooks, team workflows, HUD, and Jev planning
+# oh-my-claudecode v5.7.11: Safer guarded input around trust prompts
 
 ## Release Notes
 
-Release with **1 new feature**, **4 bug fixes**, **1 performance improvement**, and **3 test improvements** across **9 merged PRs**.
-
-### Highlights
-
-- **feat(jev): add OMC_JEV_PLAN_MODE to keep Jev from deciding in plan mode** (#4395)
-- **fix(team): quarantine stale Cursor verdicts and retain them on unreadable tasks** (#4380)
-- **perf(hooks): launch the file-context injectors only for the tools they act on** (#4373)
-
-### New Features
-
-- **feat(jev): add OMC_JEV_PLAN_MODE to keep Jev from deciding in plan mode** (#4395)
-
-### Performance Improvements
-
-- **perf(hooks): launch the file-context injectors only for the tools they act on** (#4373)
-  - File-context injectors now launch only for the tools they act on, reducing hook overhead.
+This release prevents guarded pane input from typing into any trust prompt or selecting a trust decision. Thanks to @iyoda for the contribution to #4528.
 
 ### Bug Fixes
 
-- **fix(plugin-cache): link stale plugin roots only to a real cache directory** (#4375)
-- **fix(installer): log CLAUDE.md as already up to date when install leaves it unchanged** (#4377)
-- **fix(team): quarantine stale Cursor verdicts and retain them on unreadable tasks** (#4380)
-- **fix: scope HUD stdin cache per session using stdin.session_id** (#4398)
+- **fix(team): refuse guarded pane input on every trust prompt kind** (#4528, @iyoda)
 
-### Test Improvements
+### Other Changes
 
-- **test(run-cjs): blank user-level OMC env in the worker skip-guard hook spawns** (#4376)
-- **test(atomic-write): give SQLite contention timing bounds a runner margin** (#4385)
-- **test: make shutdown and state-clear race checks environment-independent** (#4379)
-
-### Stats
-
-- **9 PRs merged** | **1 new feature** | **4 bug fixes** | **1 performance improvement** | **3 test improvements**
+- **chore(sync): merge main v5.7.10 release into dev** (#4532)
+- **ci: authorize generated artifacts for sync PR #4532** (#4533)
 
 ### Install / Update
 
@@ -43,7 +20,7 @@ The npm CLI and the Claude Code marketplace/plugin are separate install tracks, 
 **CLI / runtime:**
 
 ```bash
-npm install -g oh-my-claude-sisyphus@5.7.4
+npm install -g oh-my-claude-sisyphus@5.7.11
 ```
 
 **Claude Code plugin:**
@@ -52,4 +29,10 @@ npm install -g oh-my-claude-sisyphus@5.7.4
 /plugin marketplace update omc
 ```
 
-**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-claudecode/compare/v5.7.3...v5.7.4
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-claudecode/compare/v5.7.10...v5.7.11
+
+## Contributors
+
+Thank you to all contributors who made this release possible!
+
+@iyoda @Yeachan-Heo

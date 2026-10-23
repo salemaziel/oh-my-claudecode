@@ -12,13 +12,14 @@ import { createHash, randomUUID } from 'crypto';
 import { join, dirname, resolve, isAbsolute, basename, relative, sep } from 'path';
 import { fileURLToPath } from 'url';
 import { homedir } from 'os';
+import { compareVersions } from '../utils/semver-compare.js';
 import { execSync } from 'child_process';
 import { isWindows, getHooksSettingsConfig, } from './hooks.js';
 import { getRuntimePackageVersion } from '../lib/version.js';
 import { getClaudeConfigDir } from '../utils/config-dir.js';
 import { MIN_NODE_VERSION } from '../utils/node-version.js';
 import { resolveNodeBinary } from '../utils/resolve-node.js';
-import { parseFrontmatter } from '../utils/frontmatter.js';
+import { parseFrontmatter, stripLeadingUtf8Bom } from '../utils/frontmatter.js';
 import { isSkininthegamebrosUser } from '../utils/skininthegamebros-user.js';
 import { syncUnifiedMcpRegistryTargets } from './mcp-registry.js';
 import { OMC_CONFIG_FILE_REL } from '../lib/paths.js';
@@ -27,7 +28,7 @@ import { getOmcRoot } from '../lib/worktree-paths.js';
 import { syncOmcLearnedUserSkillsForClaudeCode } from '../utils/user-skill-compat.js';
 import { OMC_PLUGIN_ROOT_ENV } from '../lib/env-vars.js';
 import { analyzeLegacyClaudeMd, OMC_END_MARKER, OMC_START_MARKER, parseClaudeMdMarkers, removeClaudeMdRanges } from './claude-md-analysis.js';
-import { executeClaudeMdTransaction } from './claude-md-transaction.js';
+import { executeClaudeMdTransaction, isClaudeMdEnabledInConfig } from './claude-md-transaction.js';
 import { HISTORICAL_AGENT_OWNERSHIP } from './historical-agent-ownership.js';
 import entitlementManifest from '../config/builtin-skill-entitlements.json' with { type: 'json' };
 /** Claude Code configuration directory */
@@ -129,20 +130,6 @@ function currentSkillsDir() {
  */
 function isComparableVersion(version) {
     return !!version && /^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(version);
-}
-function compareVersions(a, b) {
-    const partsA = a.replace(/^v/, '').split('.').map(part => parseInt(part, 10) || 0);
-    const partsB = b.replace(/^v/, '').split('.').map(part => parseInt(part, 10) || 0);
-    const maxLength = Math.max(partsA.length, partsB.length);
-    for (let i = 0; i < maxLength; i++) {
-        const valueA = partsA[i] || 0;
-        const valueB = partsB[i] || 0;
-        if (valueA < valueB)
-            return -1;
-        if (valueA > valueB)
-            return 1;
-    }
-    return 0;
 }
 function extractOmcVersionMarker(content) {
     const match = content.match(OMC_VERSION_MARKER_PATTERN);
@@ -1647,7 +1634,7 @@ function resolveBestPluginSyncSource(targetRoots) {
     return { sourceRoot: bestRoot, errors: bestRoot ? [] : errors };
 }
 function extractFrontmatterBlock(content) {
-    const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+    const match = stripLeadingUtf8Bom(content).match(/^---\r?\n([\s\S]*?)\r?\n---/);
     return match?.[1] ?? null;
 }
 function getFrontmatterStringValue(metadata, key) {
@@ -2362,7 +2349,12 @@ export function install(options = {}) {
         }
         // Keep the public installer on the same raw-byte transaction path as setup.
         // The public string merger remains exported for callers that use it directly.
-        if (!projectScoped) {
+        // claudeMdEnabled=false in .omc-config.json opts out of every global CLAUDE.md write.
+        const claudeMdDisabledByConfig = !projectScoped && !isClaudeMdEnabledInConfig(CLAUDE_CONFIG_DIR);
+        if (claudeMdDisabledByConfig) {
+            log('Skipping CLAUDE.md (claudeMdEnabled is false in .omc-config.json)');
+        }
+        if (!projectScoped && !claudeMdDisabledByConfig) {
             const transaction = executeClaudeMdTransaction({
                 mode: 'global-overwrite',
                 root: CLAUDE_CONFIG_DIR,
