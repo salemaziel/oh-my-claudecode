@@ -1,7 +1,7 @@
 /**
  * Shared types for Oh-My-ClaudeCode
  */
-export type ModelType = "sonnet" | "opus" | "haiku" | "inherit";
+export type ModelType = "sonnet" | "opus" | "haiku" | "fable" | "inherit";
 export interface AgentConfig {
     name: string;
     description: string;
@@ -16,6 +16,13 @@ export interface AgentConfig {
 export type AutopilotExecutionBackend = "team" | "solo";
 export type AutopilotPlanningMode = "ralplan" | "direct" | false;
 export type AutopilotTeamAgentType = "claude" | "codex" | "gemini" | "grok" | "cursor" | "antigravity";
+/** Built-in stages admitted by version 1 named autopilot workflows. */
+export type AutopilotWorkflowStage = "ralplan" | "execution" | "ralph" | "qa";
+/** Closed, versioned named autopilot workflow profile. */
+export interface AutopilotWorkflowProfileV1 {
+    version: 1;
+    stages: AutopilotWorkflowStage[];
+}
 export interface AutopilotConfigBlock {
     /** Maximum total iterations across all phases. */
     maxIterations?: number;
@@ -42,6 +49,8 @@ export interface AutopilotConfigBlock {
     } | false;
     /** Whether to run QA build/lint/test cycling. */
     qa?: boolean;
+    /** Named, fixed-stage workflow profiles. Project profiles replace user profiles of the same name. */
+    workflows?: Record<string, AutopilotWorkflowProfileV1>;
     /** Team execution options used when execution is 'team'. */
     team?: {
         /** Preferred CLI worker types for executor-style implementation tasks. */
@@ -131,6 +140,9 @@ export interface PluginConfig {
         tool?: string;
         onError?: "warn" | "silent" | "fail";
     };
+    keywordDetector?: {
+        disabled?: string[];
+    };
     permissions?: {
         allowBash?: boolean;
         allowEdit?: boolean;
@@ -138,7 +150,6 @@ export interface PluginConfig {
         maxBackgroundTasks?: number;
     };
     magicKeywords?: {
-        ultrawork?: string[];
         search?: string[];
         analyze?: string[];
         ultrathink?: string[];
@@ -182,9 +193,9 @@ export interface PluginConfig {
          *   (useful on non-Anthropic backends without the nuclear forceInherit)
          * - `{ haiku: 'sonnet' }` — promote all haiku agents to sonnet tier
          *
-         * Env: OMC_MODEL_ALIAS_HAIKU, OMC_MODEL_ALIAS_SONNET, OMC_MODEL_ALIAS_OPUS
+         * Env: OMC_MODEL_ALIAS_HAIKU, OMC_MODEL_ALIAS_SONNET, OMC_MODEL_ALIAS_OPUS, OMC_MODEL_ALIAS_FABLE
          */
-        modelAliases?: Partial<Record<"haiku" | "sonnet" | "opus", ModelType>>;
+        modelAliases?: Partial<Record<"haiku" | "sonnet" | "opus" | "fable", ModelType>>;
         /** Keywords that force escalation to higher tier */
         escalationKeywords?: string[];
         /** Keywords that suggest lower tier */
@@ -323,6 +334,7 @@ export interface ExternalModelsDefaults {
     geminiModel?: string;
     grokModel?: string;
     antigravityModel?: string;
+    cursorModel?: string;
 }
 /**
  * External models fallback policy
@@ -409,8 +421,6 @@ export interface ResolveDelegationOptions {
 /** Canonical role names accepted in `team.roleRouting` (source of truth). */
 export declare const CANONICAL_TEAM_ROLES: readonly ["orchestrator", "planner", "analyst", "architect", "executor", "debugger", "critic", "code-reviewer", "security-reviewer", "test-engineer", "designer", "writer", "code-simplifier", "explore", "document-specialist"];
 export type CanonicalTeamRole = typeof CANONICAL_TEAM_ROLES[number];
-/** Cursor team workers are currently supported only for executor-style tasks. */
-export declare const CURSOR_EXECUTOR_TEAM_ROLES: readonly ["executor"];
 /** Provider for /team role routing. */
 export type TeamRoleProvider = 'claude' | 'codex' | 'gemini' | 'grok' | 'cursor' | 'antigravity';
 /** Tier name accepted in role-assignment `model` field. */
@@ -424,6 +434,8 @@ export interface TeamRoleAssignmentSpec {
     /** Tier name ('HIGH' | 'MEDIUM' | 'LOW') or explicit model ID. */
     model?: TeamRoleTier | string;
     agent?: KnownAgentName;
+    /** Reasoning effort level per provider. Codex: low|medium|high|xhigh|max|ultra; Claude: low|medium|high|xhigh|max; Antigravity: low|medium|high|max. Not allowed on orchestrator. */
+    reasoningEffort?: string;
 }
 /** Orchestrator is pinned to claude; only `model` is user-configurable. */
 export type OrchestratorSpec = Pick<TeamRoleAssignmentSpec, 'model'>;
@@ -452,5 +464,6 @@ export interface RoleAssignment {
     /** Resolved model ID (tier names expanded to explicit model strings). */
     model: string;
     agent: KnownAgentName;
+    reasoningEffort?: string;
 }
 //# sourceMappingURL=types.d.ts.map

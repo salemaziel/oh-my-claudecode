@@ -9,6 +9,8 @@ import {
   getPrdStatus,
   getSessionPrdPath,
   markStoryComplete,
+  getStoryGoverningCriteriaRevision,
+  getPrdRevision,
   markStoryIncomplete,
   markStoryArchitectVerified,
   getStory,
@@ -26,10 +28,16 @@ import {
 
 describe('Ralph PRD Module', () => {
   let testDir: string;
+  let previousHome: string | undefined;
+  let previousUserProfile: string | undefined;
 
   beforeEach(() => {
     // Create a unique temp directory for each test
     testDir = join(tmpdir(), `ralph-prd-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    previousHome = process.env.HOME;
+    previousUserProfile = process.env.USERPROFILE;
+    process.env.HOME = testDir;
+    process.env.USERPROFILE = testDir;
     mkdirSync(testDir, { recursive: true });
   });
 
@@ -38,6 +46,10 @@ describe('Ralph PRD Module', () => {
     if (existsSync(testDir)) {
       rmSync(testDir, { recursive: true, force: true });
     }
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
   });
 
   describe('findPrdPath', () => {
@@ -103,10 +115,39 @@ describe('Ralph PRD Module', () => {
       expect(readPrd(testDir)).toBeNull();
     });
 
-    it('should write and read prd correctly', () => {
-      expect(writePrd(testDir, samplePrd)).toBe(true);
+    it('should write and read revision-bound completion claims', () => {
+      const prd = structuredClone(samplePrd);
+      const completed = prd.userStories[1];
+      const revision = getStoryGoverningCriteriaRevision(completed);
+      completed.completionCriteriaRevision = revision;
+      completed.architectVerificationCriteriaRevision = revision;
+      expect(writePrd(testDir, prd)).toBe(true);
       const read = readPrd(testDir);
-      expect(read).toEqual(samplePrd);
+      expect(read).toMatchObject(prd);
+    });
+
+    it('rewrites an existing PRD without expectedRevision', () => {
+      expect(writePrd(testDir, samplePrd)).toBe(true);
+      const updated = { ...samplePrd, project: 'Rewritten Project' };
+      expect(writePrd(testDir, updated)).toBe(true);
+      expect(readPrd(testDir)?.project).toBe('Rewritten Project');
+    });
+
+    it('rewrites an existing PRD when expectedRevision still matches', () => {
+      expect(writePrd(testDir, samplePrd)).toBe(true);
+      const current = readPrd(testDir)!;
+      const revision = getPrdRevision(current);
+      expect(writePrd(testDir, { ...current, project: 'CAS Rewrite' }, undefined, revision)).toBe(true);
+      expect(readPrd(testDir)?.project).toBe('CAS Rewrite');
+    });
+
+    it('rejects an existing-file write when expectedRevision is stale', () => {
+      expect(writePrd(testDir, samplePrd)).toBe(true);
+      const snapshot = readPrd(testDir)!;
+      const staleRevision = getPrdRevision(snapshot);
+      expect(writePrd(testDir, { ...snapshot, project: 'First' })).toBe(true);
+      expect(writePrd(testDir, { ...snapshot, project: 'Stale' }, undefined, staleRevision)).toBe(false);
+      expect(readPrd(testDir)?.project).toBe('First');
     });
 
     it('should create .omc directory when writing', () => {
@@ -251,6 +292,10 @@ describe('Ralph PRD Module', () => {
           { id: 'US-001', title: 'A', description: '', acceptanceCriteria: [], priority: 1, passes: false, architectVerified: false }
         ]
       };
+      const completed = prd.userStories[0];
+      const revision = getStoryGoverningCriteriaRevision(completed);
+      completed.completionCriteriaRevision = revision;
+      completed.architectVerificationCriteriaRevision = revision;
       writePrd(testDir, prd);
     });
 
@@ -301,6 +346,9 @@ describe('Ralph PRD Module', () => {
           { id: 'US-002', title: 'Second', description: '', acceptanceCriteria: [], priority: 2, passes: false, architectVerified: false }
         ]
       };
+      const revision = getStoryGoverningCriteriaRevision(prd.userStories[0]);
+      prd.userStories[0].completionCriteriaRevision = revision;
+      prd.userStories[0].architectVerificationCriteriaRevision = revision;
       writePrd(testDir, prd);
     });
 
@@ -466,5 +514,59 @@ describe('Ralph PRD Module', () => {
       const formatted = formatStory(story);
       expect(formatted).toContain('AWAITING ARCHITECT REVIEW');
     });
+  });
+});
+
+describe('PRD run-field preservation (repoQualityClass / feedbackCommands)', () => {
+  let dir: string;
+  let previousHome: string | undefined;
+  let previousUserProfile: string | undefined;
+  beforeEach(() => {
+    dir = join(tmpdir(), `ralph-prd-fields-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    previousHome = process.env.HOME;
+    previousUserProfile = process.env.USERPROFILE;
+    process.env.HOME = dir;
+    process.env.USERPROFILE = dir;
+    mkdirSync(dir, { recursive: true });
+  });
+  afterEach(() => {
+    if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = previousUserProfile;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const base: PRD = {
+    project: 'Fields',
+    branchName: 'ralph/fields',
+    description: 'Run fields survive code-mediated writes',
+    userStories: [
+      {
+        id: 'US-001',
+        title: 'One story',
+        description: 'd',
+        acceptanceCriteria: ['Criterion one that is long enough to count'],
+        priority: 1,
+        passes: false,
+        architectVerified: false
+      }
+    ]
+  };
+
+  it('preserves valid repoQualityClass and feedbackCommands through markStoryComplete', () => {
+    const prd: PRD = { ...base, repoQualityClass: 'library', feedbackCommands: ['npm run build', 'npm test'] };
+    expect(writePrd(dir, prd)).toBe(true);
+    expect(markStoryComplete(dir, 'US-001')).toBe(true);
+    const after = readPrd(dir);
+    expect(after?.repoQualityClass).toBe('library');
+    expect(after?.feedbackCommands).toEqual(['npm run build', 'npm test']);
+  });
+
+  it('drops invalid values fail-soft without invalidating the PRD', () => {
+    const prd = { ...base, repoQualityClass: 'garbage', feedbackCommands: ['npm test', 42, ''] } as unknown as PRD;
+    expect(writePrd(dir, prd)).toBe(true);
+    const after = readPrd(dir);
+    expect(after).not.toBeNull();
+    expect(after?.repoQualityClass).toBeUndefined();
+    expect(after?.feedbackCommands).toEqual(['npm test']);
   });
 });

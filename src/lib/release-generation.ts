@@ -1,4 +1,4 @@
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 const DEFAULT_REPO_URL = 'https://github.com/salemaziel/oh-my-claudecode';
 
 export interface ReleasePullRequest {
@@ -38,8 +38,10 @@ export function getLatestTag(options: { cwd?: string; excludeTag?: string; ref?:
   const { cwd = process.cwd(), excludeTag, ref = 'HEAD' } = options;
 
   try {
-    const excludeArg = excludeTag ? ` --exclude ${JSON.stringify(excludeTag)}` : '';
-    return execSync(`git describe --tags --abbrev=0${excludeArg} ${JSON.stringify(ref)}`, {
+    const args = ['describe', '--tags', '--abbrev=0'];
+    if (excludeTag) args.push('--exclude', excludeTag);
+    args.push('--', ref);
+    return execFileSync('git', args, {
       cwd,
       encoding: 'utf-8',
     }).trim();
@@ -247,10 +249,15 @@ export function generateReleaseBody(
   let body = changelog;
 
   body += `\n### Install / Update\n\n`;
+  body += 'The npm CLI and the Claude Code marketplace/plugin are separate install tracks, not either/or replacements. Update whichever track you use; if you have both installed, update both. CLI-dependent skill paths such as `ask` and CLI-backed `team` require the `omc` CLI from the npm package.\n\n';
+  body += '**CLI / runtime:**\n\n';
   body += '```bash\n';
   body += `npm install -g oh-my-claude-sisyphus@${version}\n`;
   body += '```\n\n';
-  body += 'Or reinstall the plugin:\n```bash\nclaude /install-plugin oh-my-claudecode\n```\n';
+  body += '**Claude Code plugin:**\n\n';
+  body += '```text\n';
+  body += '/plugin marketplace update omc\n';
+  body += '```\n';
 
   if (prevTag) {
     body += `\n**Full Changelog**: ${repoUrl}/compare/${prevTag}...v${version}\n`;

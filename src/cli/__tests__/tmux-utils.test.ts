@@ -27,6 +27,7 @@ import {
   buildTmuxShellCommandWithEnv,
   createHudWatchPane,
   isClaudeAvailable,
+  isNativeWindowsShell,
   killTmuxPane,
   listHudWatchPaneIdsInCurrentWindow,
   resolveLaunchPolicy,
@@ -192,18 +193,31 @@ describe('resolveLaunchPolicy', () => {
 });
 
 describe('isClaudeAvailable', () => {
-  it('uses shell:true on win32 so npm .cmd wrappers resolve', () => {
+  it('probes claude via COMSPEC with verbatim args on win32 so npm .cmd wrappers resolve (#4154)', () => {
     const originalPlatform = process.platform;
+    const originalComspec = process.env.COMSPEC;
     Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
-    mockedExecFileSync.mockReturnValue(Buffer.from('2.1.116'));
+    process.env.COMSPEC = 'C:\\Windows\\System32\\cmd.exe';
+    try {
+      mockedSpawnSync.mockClear();
+      mockedExecFileSync.mockClear();
+      mockedSpawnSync.mockReturnValueOnce({ status: 0 } as ReturnType<typeof spawnSync>);
 
-    expect(isClaudeAvailable()).toBe(true);
-    expect(mockedExecFileSync).toHaveBeenCalledWith('claude', ['--version'], {
-      stdio: 'ignore',
-      shell: true,
-    });
+      expect(isClaudeAvailable()).toBe(true);
+      expect(mockedExecFileSync).not.toHaveBeenCalled();
+      expect(mockedSpawnSync).toHaveBeenCalledWith(
+        'C:\\Windows\\System32\\cmd.exe',
+        ['/d', '/s', '/c', 'claude --version'],
+        { stdio: 'ignore', windowsVerbatimArguments: true },
+      );
 
-    Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true });
+      mockedSpawnSync.mockReturnValueOnce({ status: 9009 } as ReturnType<typeof spawnSync>);
+      expect(isClaudeAvailable()).toBe(false);
+    } finally {
+      Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true });
+      if (originalComspec === undefined) delete process.env.COMSPEC;
+      else process.env.COMSPEC = originalComspec;
+    }
   });
 });
 
@@ -394,6 +408,29 @@ describe('tmux command execution parity on Windows', () => {
 });
 
 // ---------------------------------------------------------------------------
+// isNativeWindowsShell
+// ---------------------------------------------------------------------------
+describe('isNativeWindowsShell', () => {
+  it('keeps plain MSYS tmux on the POSIX path', () => {
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+    vi.stubEnv('MSYSTEM', 'MSYS');
+    vi.stubEnv('MINGW_PREFIX', '');
+    vi.stubEnv('SYSTEM', '');
+
+    expect(isNativeWindowsShell()).toBe(false);
+  });
+
+  it('does not mistake SYSTEM for an MSYS shell marker', () => {
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+    vi.stubEnv('MSYSTEM', '');
+    vi.stubEnv('MINGW_PREFIX', '');
+    vi.stubEnv('SYSTEM', 'MSYS');
+
+    expect(isNativeWindowsShell()).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // wrapWithLoginShell
 // ---------------------------------------------------------------------------
 describe('wrapWithLoginShell', () => {
@@ -430,6 +467,27 @@ describe('wrapWithLoginShell', () => {
 
     expect(buildTmuxShellCommandWithEnv('claude', ['--print'], { CODEX_HOME: 'C:\\Users\\me\\codex home' }))
       .toBe('set "CODEX_HOME=C:\\Users\\me\\codex home" && claude --print');
+
+    Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true });
+  });
+
+  it('escapes literal percent signs in native env assignments', () => {
+    const originalPlatform = process.platform;
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+
+    expect(buildTmuxShellCommandWithEnv('claude', [], { TOKEN: 'literal%PATH%' }))
+      .toContain('set "TOKEN=literal%%PATH%%"');
+
+    Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true });
+  });
+
+  it.each(['line\nbreak', 'line\rbreak', `nul\0value`])('rejects unsafe native env value %j', (value) => {
+    const originalPlatform = process.platform;
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+
+    expect(() => buildTmuxShellCommandWithEnv('claude', [], { TOKEN: value })).toThrow(
+      'Native Windows tmux command values cannot contain NUL, CR, or LF characters',
+    );
 
     Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true });
   });

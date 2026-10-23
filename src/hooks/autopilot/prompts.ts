@@ -33,6 +33,7 @@ function resolvePromptOpenQuestionsPath(
 export function getExpansionPrompt(
   idea: string,
   openQuestionsPathOrConfig?: string | PluginConfig,
+  includeLegacyCompletion = true,
 ): string {
   const openQuestionsPath = resolvePromptOpenQuestionsPath(
     openQuestionsPathOrConfig,
@@ -101,9 +102,9 @@ The Analyst is read-only and cannot write files, so you must persist its open qu
 Combine Analyst requirements + Architect technical spec into a single document.
 Save to: \`.omc/autopilot/spec.md\`
 
-### Step 4: Signal Completion
+${includeLegacyCompletion ? `### Step 4: Signal Completion
 
-When the spec is saved, signal: EXPANSION_COMPLETE
+When the spec is saved, signal: EXPANSION_COMPLETE` : ''}
 `;
 }
 
@@ -201,11 +202,11 @@ When Critic approves: PLANNING_COMPLETE
 export function getExecutionPrompt(planPath: string): string {
   return `## AUTOPILOT PHASE 2: EXECUTION
 
-Execute the plan at ${planPath} using Ralph+Ultrawork mode.
+Execute the plan at ${planPath} using executor agents with Ralph persistence.
 
 ### Activation
 
-Ralph and Ultrawork are now active. Execute tasks in parallel where possible.
+Ralph persistence is active. Delegate independent tasks to executor agents or a coordinated Team where appropriate.
 
 ### Execution Rules
 
@@ -220,13 +221,13 @@ Ralph and Ultrawork are now active. Execute tasks in parallel where possible.
 
 \`\`\`
 // For simple tasks (single file, straightforward logic)
-Task(subagent_type="oh-my-claudecode:executor-low", model="haiku", prompt="...")
+Task(subagent_type="oh-my-claudecode:executor", model="haiku", prompt="...")
 
 // For standard implementation (feature, multiple methods)
 Task(subagent_type="oh-my-claudecode:executor", model="sonnet", prompt="...")
 
 // For complex work (architecture, debugging, refactoring)
-Task(subagent_type="oh-my-claudecode:executor-high", model="opus", prompt="...")
+Task(subagent_type="oh-my-claudecode:executor", model="opus", prompt="...")
 \`\`\`
 
 ### Progress Tracking
@@ -245,10 +246,10 @@ When all tasks from the plan are complete: EXECUTION_COMPLETE
 /**
  * Generate the QA phase prompt (Phase 3)
  */
-export function getQAPrompt(): string {
+export function getQAPrompt(includeLegacyCompletion = true): string {
   return `## AUTOPILOT PHASE 3: QUALITY ASSURANCE
 
-Run UltraQA cycles until build/lint/tests pass.
+Run build/lint/test cycles until all pass.
 
 ### QA Sequence
 
@@ -277,7 +278,7 @@ For each failure:
 1. **Diagnose** - Understand the error
 \`\`\`
 Task(
-  subagent_type="oh-my-claudecode:architect-low",
+  subagent_type="oh-my-claudecode:architect",
   model="haiku",
   prompt="Diagnose this error and suggest fix: [ERROR]"
 )
@@ -297,11 +298,11 @@ Task(
 
 ### Exit Conditions
 
-- All checks pass → QA_COMPLETE
+- All checks pass${includeLegacyCompletion ? ' → QA_COMPLETE' : ''}
 - Max cycles reached → Report failures
 - Same error 3 times → Escalate to user
 
-When all checks pass: QA_COMPLETE
+${includeLegacyCompletion ? 'When all checks pass: QA_COMPLETE' : ''}
 `;
 }
 

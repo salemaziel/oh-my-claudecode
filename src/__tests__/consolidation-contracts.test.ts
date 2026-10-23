@@ -17,13 +17,13 @@ describe('Consolidation contracts', () => {
       const names = listBuiltinSkillNames();
 
       expect(names).toContain('autopilot');
-      expect(names).toContain('ultrawork');
-      expect(names).toContain('ralph');
+      expect(names).toContain('execute');
+      expect(names).toContain('ultragoal');
       expect(names).toContain('team');
     });
 
     it('resolves Tier-0 skills via getBuiltinSkill()', () => {
-      const tier0 = ['autopilot', 'ultrawork', 'ralph', 'team'] as const;
+      const tier0 = ['autopilot', 'execute', 'ultragoal', 'team'] as const;
 
       for (const name of tier0) {
         const skill = getBuiltinSkill(name);
@@ -55,9 +55,17 @@ describe('Consolidation contracts', () => {
 
       expect(names).not.toContain('analyze');
       expect(names).not.toContain('build-fix');
-      expect(names).not.toContain('tdd');
       expect(names).not.toContain('code-review');
       expect(names).not.toContain('omc-security-review');
+    });
+
+    it('registers tdd as a canonical skill', () => {
+      const names = listBuiltinSkillNames();
+      const tdd = getBuiltinSkill('tdd');
+
+      expect(names).toContain('tdd');
+      expect(tdd).toBeDefined();
+      expect(tdd?.aliasOf).toBeUndefined();
     });
 
     it('hides deprecated compatibility aliases from default listings', () => {

@@ -9,7 +9,7 @@
  * - config: Show or edit configuration
  * - setup: Sync all OMC components (hooks, agents, skills)
  */
-import { Command } from 'commander';
+import { Command, CommanderError } from 'commander';
 import chalk from 'chalk';
 import { join } from 'path';
 import { writeFileSync, existsSync } from 'fs';
@@ -21,20 +21,29 @@ import { checkForUpdates, performUpdate, formatUpdateNotification, getInstalledV
 import { install as installOmc, isInstalled, getInstallInfo } from '../installer/index.js';
 import { waitCommand, waitStatusCommand, waitDaemonCommand, waitDetectCommand } from './commands/wait.js';
 import { doctorConflictsCommand } from './commands/doctor-conflicts.js';
+import { ralphCommand } from './commands/ralph.js';
 import { doctorTeamRoutingCommand } from './commands/doctor-team-routing.js';
+import { capabilitiesCheckCommand, capabilitiesLockCommand } from './commands/capabilities.js';
 import { sessionSearchCommand } from './commands/session-search.js';
+import { sessionFrictionReportCommand } from './commands/session-friction-report.js';
 import { teamCommand } from './commands/team.js';
 import { ralphthonCommand } from './commands/ralphthon.js';
 import { ultragoalCommand, ULTRAGOAL_HELP } from './commands/ultragoal.js';
+import { aliasRetirementCommand, ALIAS_RETIREMENT_HELP } from './commands/alias-retirement.js';
 import { teleportCommand, teleportListCommand, teleportRemoveCommand } from './commands/teleport.js';
 import { getRuntimePackageVersion } from '../lib/version.js';
 import { resolvePluginDirArg } from '../lib/plugin-dir.js';
 import { launchCommand } from './launch.js';
 import { interopCommand } from './interop.js';
 import { askCommand, ASK_USAGE } from './ask.js';
+import { graphCommand } from './graph.js';
+import { checkpointCommand } from './checkpoint.js';
+import { lookoutCommand } from './lookout.js';
+import { intakeCommand } from './commands/intake.js';
+import { factoryCommand } from './commands/factory.js';
 import { warnIfWin32 } from './win32-warning.js';
 import { autoresearchCommand } from './autoresearch.js';
-import { runHudWatchLoop } from './hud-watch.js';
+import { parseHudWatchInterval, runHudWatchLoop } from './hud-watch.js';
 const version = getRuntimePackageVersion();
 /**
  * Apply a --plugin-dir option value: resolve to absolute path, warn if it
@@ -612,7 +621,6 @@ Examples:
         console.log(`  ${chalk.green(name)}`);
     }
     console.log(chalk.blue('\nMagic Keywords:'));
-    console.log(`  Ultrawork: ${chalk.cyan(session.config.magicKeywords?.ultrawork?.join(', ') ?? 'ultrawork, ulw, uw')}`);
     console.log(`  Search:    ${chalk.cyan(session.config.magicKeywords?.search?.join(', ') ?? 'search, find, locate')}`);
     console.log(`  Analyze:   ${chalk.cyan(session.config.magicKeywords?.analyze?.join(', ') ?? 'analyze, investigate, examine')}`);
     console.log(chalk.gray('\n━'.repeat(50)));
@@ -626,7 +634,7 @@ program
     .description('Test how a prompt would be enhanced')
     .addHelpText('after', `
 Examples:
-  $ omc test-prompt "ultrawork fix bugs"    See how magic keywords are detected
+  $ omc test-prompt "analyze this code"     See how magic keywords are detected
   $ omc test-prompt "analyze this code"     Test prompt enhancement`)
     .action(async (prompt) => {
     const session = createOmcSession();
@@ -835,7 +843,7 @@ Examples:
             console.log('  /omc <task>              # Activate OMC orchestration mode');
             console.log('  /omc-default             # Configure for current project');
             console.log('  /omc-default-global      # Configure globally');
-            console.log('  /ultrawork <task>             # Maximum performance mode');
+            console.log('  /team <task>                  # Coordinated parallel execution');
             console.log('  /deepsearch <query>           # Thorough codebase search');
             console.log('  /analyze <target>             # Deep analysis mode');
             console.log('  /plan <description>           # Start planning with Planner');
@@ -855,13 +863,6 @@ Examples:
             console.log('    executor            - Focused execution (Sonnet)');
             console.log('    planner          - Strategic planning (Opus)');
             console.log('    qa-tester           - Interactive CLI testing (Sonnet)');
-            console.log(chalk.gray('  Tiered Variants (for smart routing):'));
-            console.log('    architect-medium       - Simpler analysis (Sonnet)');
-            console.log('    architect-low          - Quick questions (Haiku)');
-            console.log('    executor-high       - Complex tasks (Opus)');
-            console.log('    executor-low        - Trivial tasks (Haiku)');
-            console.log('    designer-high       - Design systems (Opus)');
-            console.log('    designer-low        - Simple styling (Haiku)');
             console.log('');
             console.log(chalk.yellow('After Updates:'));
             console.log('  Run \'/omc-default\' (project) or \'/omc-default-global\' (global)');
@@ -1034,7 +1035,9 @@ const sessionCmd = program
 Examples:
   $ omc session search "team leader stale"
   $ omc session search notify-hook --since 7d
-  $ omc session search provider-routing --project all --json`);
+  $ omc session search provider-routing --project all --json
+  $ omc session friction report --since 24h
+  $ omc session friction report --json`);
 sessionCmd
     .command('search <query>')
     .description('Search prior local session transcripts and OMC session artifacts')
@@ -1056,6 +1059,55 @@ sessionCmd
         context: parseInt(options.context, 10),
         workingDirectory: process.cwd(),
     });
+});
+sessionCmd
+    .command('friction')
+    .description('Report local session context-bloat and operator-friction signals')
+    .command('report')
+    .description('Summarize local session/context bloat and friction without raw prompt content')
+    .option('-l, --limit <number>', 'Maximum number of sessions to return', '10')
+    .option('-s, --session <id>', 'Restrict report to a specific session id')
+    .option('--since <duration|date>', 'Only include artifacts since a duration (e.g. 7d, 24h) or absolute date')
+    .option('--project <scope>', 'Project scope. Defaults to current project. Use "all" to inspect all local projects')
+    .option('--json', 'Output report as JSON')
+    .action(async (options) => {
+    await sessionFrictionReportCommand({
+        limit: parseInt(options.limit, 10),
+        session: options.session,
+        since: options.since,
+        project: options.project,
+        json: options.json,
+        workingDirectory: process.cwd(),
+    });
+});
+/**
+ * Capabilities command - deterministic tool/skill/capability lockfile preflight
+ */
+const capabilitiesCmd = program
+    .command('capabilities')
+    .description('Create or verify deterministic tool/skill/capability lockfiles')
+    .addHelpText('after', `
+Examples:
+  $ omc capabilities lock
+  $ omc capabilities lock --json --lockfile .omc/capabilities.lock.json
+  $ omc capabilities check --json`);
+capabilitiesCmd
+    .command('lock')
+    .description('Write the current deterministic tool/skill/capability lockfile')
+    .option('--json', 'Output as JSON')
+    .option('--lockfile <path>', 'Lockfile path (default: omc-capabilities.lock.json)')
+    .action(async (options) => {
+    const exitCode = await capabilitiesLockCommand(options);
+    process.exit(exitCode);
+});
+capabilitiesCmd
+    .command('check')
+    .description('Check current deterministic tool/skill/capability surface against a lockfile')
+    .option('--json', 'Output as JSON')
+    .option('--lockfile <path>', 'Lockfile path (default: omc-capabilities.lock.json)')
+    .action(async (options) => {
+    const exitCode = await capabilitiesCheckCommand(options);
+    process.exit(exitCode);
 });
 /**
  * Doctor command - Diagnostic tools
@@ -1091,8 +1143,8 @@ doctorCmd
 Examples:
   $ omc doctor team-routing                     Probe configured providers
   $ omc doctor team-routing --json              Output results as JSON`)
-    .action(async (options) => {
-    const exitCode = await doctorTeamRoutingCommand({ json: options.json ?? false });
+    .action(async (_options, command) => {
+    const exitCode = await doctorTeamRoutingCommand({ json: command.optsWithGlobals().json ?? false });
     process.exit(exitCode);
 });
 doctorCmd
@@ -1110,6 +1162,8 @@ Examples:
     const exitCode = await doctorConflictsCommand(options);
     process.exit(exitCode);
 });
+// Headless AFK ralph launcher (factory AFK profile + declared verify commands).
+ralphCommand(program);
 /**
  * Setup command - Official CLI entry point for omc-setup
  *
@@ -1247,12 +1301,11 @@ program
     .command('hud')
     .description('Run the OMC HUD statusline renderer')
     .option('--watch', 'Run in watch mode (continuous polling for tmux pane)')
-    .option('--interval <ms>', 'Poll interval in milliseconds', '1000')
+    .option('--interval <ms>', 'Poll interval in milliseconds', parseHudWatchInterval, 1000)
     .action(async (options) => {
     const { main: hudMain } = await import('../hud/index.js');
     if (options.watch) {
-        const intervalMs = parseInt(options.interval, 10);
-        await runHudWatchLoop({ intervalMs, hudMain });
+        await runHudWatchLoop({ intervalMs: options.interval, hudMain });
     }
     else {
         await hudMain();
@@ -1345,6 +1398,29 @@ program
     await ultragoalCommand(args);
 });
 /**
+ * Alias retirement verifier — Issue #3711
+ * Read-only eligibility check + generated closure inventory. Never deletes files.
+ */
+program
+    .command('alias-retirement')
+    .description('Alias retirement verifier and generated-closure inventory (issue #3711)')
+    .helpOption(false)
+    .allowUnknownOption(true)
+    .allowExcessArguments(true)
+    .argument('[args...]', 'alias-retirement subcommand arguments')
+    .addHelpText('after', `\n${ALIAS_RETIREMENT_HELP}`)
+    .action(async (args) => {
+    await aliasRetirementCommand(args ?? []);
+});
+/**
+ * Graph command - Execute sealed graph descriptors (graph runtime v2)
+ */
+program.addCommand(graphCommand());
+program.addCommand(checkpointCommand());
+program.addCommand(lookoutCommand());
+program.addCommand(intakeCommand());
+program.addCommand(factoryCommand());
+/**
  * Returns the fully-configured commander program.
  *
  * Exported so tests can drive the real CLI pipeline (e.g.
@@ -1362,6 +1438,21 @@ export function buildProgram() {
 // and child processes inherit VITEST from the parent vitest worker, which
 // would cause the CLI to silently exit with no output.
 if (!process.env.OMC_CLI_SKIP_PARSE) {
-    program.parse();
+    try {
+        program.parse();
+    }
+    catch (error) {
+        // Commands with an exitOverride (e.g. lookout remaps usage errors to 2)
+        // surface parse failures as CommanderError. Commander has already
+        // printed the message; honor the remapped exit code without a stack.
+        // Other commands keep commander's default process.exit behavior, and
+        // non-Commander errors stay fatal.
+        if (error instanceof CommanderError) {
+            process.exitCode = error.exitCode;
+        }
+        else {
+            throw error;
+        }
+    }
 }
 //# sourceMappingURL=index.js.map

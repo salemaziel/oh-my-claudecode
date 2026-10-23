@@ -10,8 +10,9 @@
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from 'fs';
 import { join } from 'path';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { getGlobalOmcConfigCandidates } from '../../utils/paths.js';
+import { recordSimplifierTriggerShadow } from './jev-shadow.js';
 
 /** Config shape for the code-simplifier feature */
 export interface CodeSimplifierConfig {
@@ -79,11 +80,12 @@ export function getModifiedFiles(
   maxFiles: number = DEFAULT_MAX_FILES,
 ): string[] {
   try {
-    const output = execSync('git diff HEAD --name-only', {
+    const output = execFileSync('git', ['diff', 'HEAD', '--name-only'], {
       cwd,
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'ignore'],
       timeout: 5000,
+      windowsHide: true,
     });
 
     return output
@@ -180,6 +182,16 @@ export function processCodeSimplifier(
   if (files.length === 0) {
     return { shouldBlock: false, message: '' };
   }
+
+  // Jev advisory point "simplifier-trigger" (ticket 12): record the fire-once
+  // heuristic vs Jev's Noul in shadow mode. Fire-and-forget and twin-decided —
+  // the returned block/message below is unchanged with or without a Jev key.
+  void recordSimplifierTriggerShadow({
+    cwd,
+    stateDir,
+    files,
+    shouldBlock: true,
+  }).catch(() => {});
 
   writeTriggerMarker(stateDir);
 

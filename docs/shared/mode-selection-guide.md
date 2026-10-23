@@ -7,9 +7,7 @@
 | Clarify vague requirements first                                      | `deep-interview`               | "deep interview", "ouroboros", "don't assume"  |
 | Full autonomous build from idea                                       | `autopilot`                    | "autopilot", "build me", "I want a"            |
 | Parallel autonomous (3-5x faster)                                     | `team` (replaces `ultrapilot`) | `/team N:executor "task"`                      |
-| Persistence until verified done                                       | `ralph`                        | "ralph", "don't stop"                          |
-| Parallel execution, manual oversight                                  | `ultrawork`                    | "ulw", "ultrawork"                             |
-| Cost-efficient execution                                              | `` (modifier)                  | "eco", "budget"                                |
+| Persistence until verified done                                       | `ralph`                        | "ralph", "don't stop"                         |
 | Many similar independent tasks                                        | `team` (replaces `swarm`)      | `/team N:executor "task"`                      |
 | Native Claude Code cross-turn loop with a single completion condition | Claude Code `/goal`            | `/goal "condition with proof"`                 |
 | Durable goal ledger without starting another loop                     | artifact-only Ultragoal        | Write goal artifacts/checkpoints/evidence only |
@@ -33,19 +31,15 @@ Want autonomous execution?
 ├── YES: Is task parallelizable into 3+ independent components?
 │   ├── YES: team N:executor (parallel autonomous with file ownership)
 │   └── NO: autopilot (sequential with ralph phases)
-└── NO: Want parallel execution with manual oversight?
-    ├── YES: Do you want cost optimization?
-    │   ├── YES: eco + ultrawork
-    │   └── NO: ultrawork alone
-    └── NO: Want persistence until verified done?
-        ├── YES: ralph (persistence + ultrawork + verification)
-        └── NO: Standard orchestration (delegate to agents directly)
+└── NO: Want persistence until verified done?
+    ├── YES: ralph (persistence + verification)
+    └── NO: Standard orchestration (delegate to agents directly)
 
 Have many similar independent tasks (e.g., "fix 47 errors")?
 └── YES: team N:executor (N agents claiming from task pool)
 
 Already have one measurable completion condition and want Claude Code to keep the session moving?
-└── YES: Claude Code /goal, unless Ralph/Team/UltraQA/autopilot already owns the loop
+└── YES: Claude Code /goal, unless Ralph/Team/autopilot already owns the loop
 
 Need durable tracking but no active execution loop yet?
 └── YES: artifact-only Ultragoal ledger/checkpoints/evidence
@@ -53,14 +47,13 @@ Need durable tracking but no active execution loop yet?
 
 ## Goal-Oriented Workflow Selection
 
-Claude Code `/goal`, Ralph, Team, UltraQA, and artifact-only Ultragoal all help with "keep going until done" work, but they own different parts of the workflow. Pick one primary loop authority for a session; do not run competing persistence loops at the same time.
+Claude Code `/goal`, Ralph, Team, and artifact-only Ultragoal all help with "keep going until done" work, but they own different parts of the workflow. Pick one primary loop authority for a session; do not run competing persistence loops at the same time.
 
 | Workflow                | Primary authority                      | Best fit                                                                                | Evidence and completion rule                                                                 | Avoid when                                                                                 |
 | ----------------------- | -------------------------------------- | --------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| Claude Code `/goal`     | Claude Code native goal loop           | One active session needs a measurable completion condition and cross-turn persistence   | Surface proof in the conversation, then let the `/goal` evaluator judge the stated condition | Ralph, Team, UltraQA, autopilot, or another Stop-hook loop is already driving continuation |
+| Claude Code `/goal`     | Claude Code native goal loop           | One active session needs a measurable completion condition and cross-turn persistence   | Surface proof in the conversation, then let the `/goal` evaluator judge the stated condition | Ralph, Team, autopilot, or another Stop-hook loop is already driving continuation |
 | Ralph                   | OMC persistence loop                   | Single-owner implementation that must finish all PRD stories with reviewer verification | Fresh tests/build/lint plus reviewer approval against PRD criteria                           | Work should be split across several owners first                                           |
 | Team                    | OMC coordinated team pipeline          | Parallel work with explicit task ownership and staged verification                      | Task results, worker commits, team verification/fix loop evidence                            | One person can finish faster than coordination overhead                                    |
-| UltraQA                 | OMC QA cycling loop                    | Repeated test/build/lint/typecheck failures until a quality gate passes                 | Command output for the chosen QA goal on every cycle                                         | Requirements or implementation scope are still undefined                                   |
 | Artifact-only Ultragoal | Durable goal artifacts, no active loop | Planning, handoff, or audit trail when a runtime loop is unavailable or unsafe          | Goal ledger, checkpoints, handoff prompts, and attached evidence                             | The user expects automatic execution without selecting Ralph/Team/`/goal`                  |
 
 ### Claude Code `/goal` source boundary
@@ -75,9 +68,9 @@ Use the deterministic policy names `refuse`, `adopt_existing`, and `artifact_onl
 
 When a goal-like request enters an OMC session:
 
-1. If Ralph, Team, UltraQA, autopilot, or a Stop-hook loop is active, keep that OMC loop as the authority and use `/goal` only as a documented handoff option.
+1. If Ralph, Team, autopilot, or a Stop-hook loop is active, keep that OMC loop as the authority and use `/goal` only as a documented handoff option.
 2. If Claude Code `/goal` is already active, either adopt that existing goal explicitly, refuse to start a competing OMC loop, or degrade to artifact-only Ultragoal documentation.
-3. If hooks, workspace trust, or managed settings make `/goal` unavailable, use Ralph/Team/UltraQA or artifact-only Ultragoal instead of pretending `/goal` is active.
+3. If hooks, workspace trust, or managed settings make `/goal` unavailable, use Ralph/Team or artifact-only Ultragoal instead of pretending `/goal` is active.
 4. Always attach command/test/review evidence before declaring durable OMC completion. `/goal` evaluator success alone is not the OMC final-review gate.
 
 ## Examples
@@ -88,8 +81,6 @@ When a goal-like request enters an OMC session:
 | "Build frontend, backend, and database" | team 3:executor | Clear component boundaries      |
 | "Fix all 47 TypeScript errors"          | team 5:executor | Many independent similar tasks  |
 | "Refactor auth module thoroughly"       | ralph           | Need persistence + verification |
-| "Quick parallel execution"              | ultrawork       | Manual oversight preferred      |
-| "Save tokens while fixing errors"       | + ultrawork     | Cost-conscious parallel         |
 | "Don't stop until done"                 | ralph           | Persistence keyword detected    |
 
 ## Mode Types
@@ -107,31 +98,20 @@ These run independently:
 
 These wrap other modes:
 
-- **ralph**: Adds persistence + verification around ultrawork
+- **ralph**: Adds persistence + verification around direct executor delegation
 
-### Component Modes
+## Cost Control
 
-These are used by other modes:
+To limit token spending during execution, set the `OMC_RUN_BUDGET_TOKENS` environment variable:
 
-- **ultrawork**: Parallel execution engine (used by ralph, autopilot)
+```bash
+OMC_RUN_BUDGET_TOKENS=50000 ralph fix all errors
+```
 
-### Modifier Modes
-
-These modify how other modes work:
-
-- \*\*\*\*: Changes model routing to prefer cheaper tiers
-
-## Valid Combinations
-
-| Combination     | Effect                                 |
-| --------------- | -------------------------------------- |
-| `eco ralph`     | Ralph persistence with cheaper agents  |
-| `eco ultrawork` | Parallel execution with cheaper agents |
-| `eco autopilot` | Autonomous execution with cost savings |
+At 90% of budget, Ralph will finish the current story. At 100%, it stops with a resumable budget report.
 
 ## Invalid Combinations
 
 | Combination      | Why Invalid                       |
 | ---------------- | --------------------------------- |
 | `autopilot team` | Both are standalone - use one     |
-| `` alone         | Needs an execution mode to modify |

@@ -1,6 +1,6 @@
 // src/team/index.ts
 export { readTask, updateTask, findNextTask, areBlockersResolved, writeTaskFailure, readTaskFailure, listTaskIds, } from './task-file-ops.js';
-export { validateTmux, sanitizeName, sessionName, createSession, killSession, isSessionAlive, listActiveSessions, spawnBridgeInSession, } from './tmux-session.js';
+export { validateTmux, sanitizeName, sessionName, isSessionAlive, listActiveSessions, } from './tmux-session.js';
 export { appendOutbox, rotateOutboxIfNeeded, rotateInboxIfNeeded, readNewInboxMessages, readAllInboxMessages, clearInbox, writeShutdownSignal, checkShutdownSignal, deleteShutdownSignal, writeDrainSignal, checkDrainSignal, deleteDrainSignal, cleanupWorkerFiles, } from './inbox-outbox.js';
 export { registerMcpWorker, unregisterMcpWorker, isMcpWorker, listMcpWorkers, getRegistrationStrategy, readProbeResult, writeProbeResult, } from './team-registration.js';
 export { writeHeartbeat, readHeartbeat, listHeartbeats, isWorkerAlive, deleteHeartbeat, cleanupTeamHeartbeats, } from './heartbeat.js';
@@ -30,12 +30,15 @@ export { getContract, isCliAvailable as isCliAvailableForAgent, validateCliAvail
 shouldLoadShellRc, validateCliBinaryPath, resolveCliBinaryPath, clearResolvedPathCache, } from './model-contract.js';
 export { detectCli, detectAllClis } from './cli-detection.js';
 export { generateWorkerOverlay, composeInitialInbox, appendToInbox, getWorkerEnv, ensureWorkerStateDir, writeWorkerOverlay, } from './worker-bootstrap.js';
+export { prepareWorkerLaunchAttempt, loadWorkerLaunchAttempt, loadCurrentWorkerLaunchAttempt, buildWorkerLaunchBootstrapSpec, revokeWorkerLaunchAttempt, awaitWorkerLaunchAcknowledgement, isWorkerLaunchAttemptAccepted, runWorkerLaunchBootstrap, isWorkerLaunchProviderStarted, isWorkerLaunchAttemptCurrent, withWorkerLaunchAttemptFence, buildProviderSpawnInvocation, } from './worker-launch-ack.js';
 // tmux-comm
 export { sendTmuxTrigger, queueInboxInstruction, queueDirectMessage, queueBroadcastMessage, readMailbox, } from './tmux-comm.js';
 // Deprecated backward-compat exports for older layout APIs.
 export { LayoutStabilizer } from './layout-stabilizer.js';
 export { inferPhase, getPhaseTransitionLog, isTerminalPhase } from './phase-controller.js';
-export { startTeam, monitorTeam, assignTask, shutdownTeam, resumeTeam, watchdogCliWorkers } from './runtime.js';
+export { startTeam, monitorTeam, shutdownTeam, resumeTeam } from './runtime.js';
+export { setRuntimeOwnerRecoveryClient, recoverDeadWorkerV2, readRecoverDeadWorkerV2Outcome, readRecoverDeadWorkerV2Result, } from './runtime-v2.js';
+export { teamPublishTaskRecoveryCheckpoint } from './team-ops.js';
 export { injectToLeaderPane } from './tmux-session.js';
 // api-interop (CLI API for workers)
 export { TEAM_API_OPERATIONS, LEGACY_TEAM_MCP_TOOLS, resolveTeamApiOperation, executeTeamApiOperation, buildLegacyTeamDeprecationHint, } from './api-interop.js';

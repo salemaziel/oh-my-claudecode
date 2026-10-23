@@ -1,6 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { join } from 'path';
-
 vi.mock('fs', async () => {
   const actual = await vi.importActual<typeof import('fs')>('fs');
   return {
@@ -9,8 +8,11 @@ vi.mock('fs', async () => {
     readFileSync: vi.fn(),
     readdirSync: vi.fn(),
     statSync: vi.fn(),
+    lstatSync: vi.fn(),
+    realpathSync: vi.fn(),
     rmSync: vi.fn(),
     unlinkSync: vi.fn(),
+    renameSync: vi.fn(),
     symlinkSync: vi.fn(),
   };
 });
@@ -19,7 +21,18 @@ vi.mock('../utils/config-dir.js', () => ({
   getClaudeConfigDir: vi.fn(() => '/mock/.claude'),
 }));
 
-import { existsSync, readFileSync, readdirSync, statSync, rmSync, symlinkSync } from 'fs';
+import {
+  existsSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  lstatSync,
+  realpathSync,
+  rmSync,
+  renameSync,
+  symlinkSync,
+  unlinkSync,
+} from 'fs';
 import { purgeStalePluginCacheVersions } from '../utils/paths.js';
 
 const mockedExistsSync = vi.mocked(existsSync);
@@ -27,16 +40,73 @@ const mockedReadFileSync = vi.mocked(readFileSync);
 const mockedReaddirSync = vi.mocked(readdirSync);
 const mockedStatSync = vi.mocked(statSync);
 const mockedRmSync = vi.mocked(rmSync);
+const mockedRenameSync = vi.mocked(renameSync);
+const mockedLstatSync = vi.mocked(lstatSync);
+const mockedRealpathSync = vi.mocked(realpathSync);
+const mockedUnlinkSync = vi.mocked(unlinkSync);
 const mockedSymlinkSync = vi.mocked(symlinkSync);
 
-function dirent(name: string): { name: string; isDirectory: () => boolean } {
-  return { name, isDirectory: () => true };
+/** lstat result for a real directory. */
+function dirStats() {
+  return {
+    isSymbolicLink: () => false,
+    isDirectory: () => true,
+  } as unknown as ReturnType<typeof lstatSync>;
+}
+
+/** lstat result for a redirect symlink. */
+function symlinkStats() {
+  return {
+    isSymbolicLink: () => true,
+    isDirectory: () => false,
+  } as unknown as ReturnType<typeof lstatSync>;
+}
+
+/** Node error with a specific errno code, for simulating fs races. */
+function fsError(code: string): NodeJS.ErrnoException {
+  const err = new Error(code) as NodeJS.ErrnoException;
+  err.code = code;
+  return err;
+}
+
+/** Pid the fixtures use for an owner that has exited. */
+const DEAD_OWNER_PID = 999997;
+
+/**
+ * Make process liveness deterministic: this process is alive, every other pid is
+ * gone. Without it the fixtures depend on whether the host happens to be running
+ * something at the pid baked into the directory name — and a pid owned by another
+ * user reports EPERM, which isAsideOwnerAlive counts as alive, so a low pid on a
+ * CI runner would silently flip the dead-owner cases into in-flight ones.
+ */
+function stubOwnerLiveness() {
+  return vi.spyOn(process, 'kill').mockImplementation(((pid: number) => {
+    if (pid === process.pid) return true;
+    throw fsError('ESRCH');
+  }) as unknown as typeof process.kill);
+}
+
+function dirent(name: string): {
+  name: string;
+  isDirectory: () => boolean;
+  isSymbolicLink: () => boolean;
+} {
+  return { name, isDirectory: () => true, isSymbolicLink: () => false };
+}
+
+function fileDirent(name: string): {
+  name: string;
+  isDirectory: () => boolean;
+  isSymbolicLink: () => boolean;
+  isFile: () => boolean;
+} {
+  return { name, isDirectory: () => false, isSymbolicLink: () => false, isFile: () => true };
 }
 
 /** Return a stat result with mtime N ms ago.
  * Default must exceed STALE_THRESHOLD_MS (24 h) in src/utils/paths.ts. */
 function staleStats(ageMs: number = 25 * 60 * 60 * 1000) {
-  return { mtimeMs: Date.now() - ageMs } as ReturnType<typeof statSync>;
+  return { mtimeMs: Date.now() - ageMs, size: 1, isDirectory: () => true } as ReturnType<typeof statSync>;
 }
 
 /** Return a stat result modified very recently */
@@ -49,6 +119,20 @@ describe('purgeStalePluginCacheVersions', () => {
     vi.clearAllMocks();
     // Default: statSync returns stale timestamps
     mockedStatSync.mockReturnValue(staleStats());
+    // clearAllMocks() keeps implementations, so a test that makes an fs call
+    // throw would leak into whichever test runs next.  Restore benign defaults
+    // here so the file passes under --sequence.shuffle too.
+    mockedRenameSync.mockImplementation(() => undefined);
+    mockedSymlinkSync.mockImplementation(() => undefined);
+    mockedRmSync.mockImplementation(() => undefined);
+    mockedUnlinkSync.mockImplementation(() => undefined);
+    mockedLstatSync.mockImplementation(() => dirStats());
+    mockedRealpathSync.mockImplementation((path) => String(path));
+    stubOwnerLiveness();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   it('returns early when installed_plugins.json does not exist', () => {
@@ -73,21 +157,26 @@ describe('purgeStalePluginCacheVersions', () => {
       return false;
     });
 
-    mockedReadFileSync.mockReturnValue(JSON.stringify({
-      version: 2,
-      plugins: {
-        'my-plugin@my-marketplace': [{
-          installPath: activeVersion,
-          version: '2.0.0',
-        }],
-      },
-    }));
+    mockedReadFileSync.mockReturnValue(
+      JSON.stringify({
+        version: 2,
+        plugins: {
+          'my-plugin@my-marketplace': [
+            {
+              installPath: activeVersion,
+              version: '2.0.0',
+            },
+          ],
+        },
+      }),
+    );
 
     mockedReaddirSync.mockImplementation((p, _opts?) => {
       const ps = String(p);
       if (ps === cacheDir) return [dirent('my-marketplace')] as any;
       if (ps.endsWith('my-marketplace')) return [dirent('my-plugin')] as any;
       if (ps.endsWith('my-plugin')) return [dirent('1.0.0'), dirent('2.0.0')] as any;
+      if (ps === activeVersion) return [fileDirent('README.md')] as any;
       return [] as any;
     });
 
@@ -97,83 +186,16 @@ describe('purgeStalePluginCacheVersions', () => {
     expect(result.symlinked).toBe(1);
     expect(result.removed).toBe(0);
     expect(result.symlinkPaths).toEqual([staleVersion]);
-    // safeRmSync still removes the real dir before creating the symlink
-    expect(mockedRmSync).toHaveBeenCalledWith(staleVersion, { recursive: true, force: true });
+    // The real dir is moved aside — never deleted outright — before the
+    // symlink is created, so the path is never missing.
+    expect(mockedRenameSync).toHaveBeenCalledWith(staleVersion, expect.stringContaining(`${staleVersion}.omc-stale-`));
+    expect(mockedRmSync).not.toHaveBeenCalledWith(staleVersion, {
+      recursive: true,
+      force: true,
+    });
     expect(mockedSymlinkSync).toHaveBeenCalledWith(activeVersion, staleVersion, 'dir');
     // Active version should NOT be removed
     expect(mockedRmSync).not.toHaveBeenCalledWith(activeVersion, expect.anything());
-  });
-
-  it('handles multiple marketplaces and plugins', () => {
-    const cacheDir = '/mock/.claude/plugins/cache';
-    const active1 = join(cacheDir, 'official/hookify/aa11');
-    const active2 = join(cacheDir, 'omc/oh-my-claudecode/4.3.0');
-    const stale1 = join(cacheDir, 'official/hookify/bb22');
-    const stale2 = join(cacheDir, 'official/hookify/cc33');
-
-    mockedExistsSync.mockImplementation((p) => {
-      const ps = String(p);
-      if (ps.includes('installed_plugins.json')) return true;
-      if (ps === cacheDir) return true;
-      if (ps === stale1 || ps === stale2) return true;
-      return false;
-    });
-
-    mockedReadFileSync.mockReturnValue(JSON.stringify({
-      version: 2,
-      plugins: {
-        'hookify@official': [{ installPath: active1 }],
-        'oh-my-claudecode@omc': [{ installPath: active2 }],
-      },
-    }));
-
-    mockedReaddirSync.mockImplementation((p, _opts?) => {
-      const ps = String(p);
-      if (ps === cacheDir) return [dirent('official'), dirent('omc')] as any;
-      if (ps.endsWith('official')) return [dirent('hookify')] as any;
-      if (ps.endsWith('hookify')) return [dirent('aa11'), dirent('bb22'), dirent('cc33')] as any;
-      if (ps.endsWith('omc')) return [dirent('oh-my-claudecode')] as any;
-      if (ps.endsWith('oh-my-claudecode')) return [dirent('4.3.0')] as any;
-      return [] as any;
-    });
-
-    const result = purgeStalePluginCacheVersions();
-    // Both stale hookify versions share a namespace with active1 → symlinked.
-    expect(result.symlinked).toBe(2);
-    expect(result.removed).toBe(0);
-    expect(result.symlinkPaths).toContain(stale1);
-    expect(result.symlinkPaths).toContain(stale2);
-  });
-
-  it('does nothing when all cache versions are active', () => {
-    const cacheDir = '/mock/.claude/plugins/cache';
-    const active = join(cacheDir, 'omc/oh-my-claudecode/4.3.0');
-
-    mockedExistsSync.mockImplementation((p) => {
-      const ps = String(p);
-      if (ps.includes('installed_plugins.json')) return true;
-      if (ps === cacheDir) return true;
-      return false;
-    });
-
-    mockedReadFileSync.mockReturnValue(JSON.stringify({
-      version: 2,
-      plugins: {
-        'oh-my-claudecode@omc': [{ installPath: active }],
-      },
-    }));
-
-    mockedReaddirSync.mockImplementation((p, _opts?) => {
-      const ps = String(p);
-      if (ps === cacheDir) return [dirent('omc')] as any;
-      if (ps.endsWith('omc')) return [dirent('oh-my-claudecode')] as any;
-      if (ps.endsWith('oh-my-claudecode')) return [dirent('4.3.0')] as any;
-      return [] as any;
-    });
-
-    const result = purgeStalePluginCacheVersions();
-    expect(result.removed).toBe(0);
-    expect(mockedRmSync).not.toHaveBeenCalled();
   });
 
   it('reports error for malformed installed_plugins.json', () => {
@@ -192,15 +214,19 @@ describe('purgeStalePluginCacheVersions', () => {
     const versionDir = join(cacheDir, 'omc/plugin/1.0.0');
 
     mockedExistsSync.mockReturnValue(true);
-    mockedReadFileSync.mockReturnValue(JSON.stringify({
-      version: 2,
-      plugins: {
-        'plugin@omc': [{
-          // installPath has trailing slash
-          installPath: versionDir + '/',
-        }],
-      },
-    }));
+    mockedReadFileSync.mockReturnValue(
+      JSON.stringify({
+        version: 2,
+        plugins: {
+          'plugin@omc': [
+            {
+              // installPath has trailing slash
+              installPath: versionDir + '/',
+            },
+          ],
+        },
+      }),
+    );
 
     mockedReaddirSync.mockImplementation((p, _opts?) => {
       const ps = String(p);
@@ -222,15 +248,19 @@ describe('purgeStalePluginCacheVersions', () => {
     const versionDir = join(cacheDir, 'omc/plugin/2.0.0');
 
     mockedExistsSync.mockReturnValue(true);
-    mockedReadFileSync.mockReturnValue(JSON.stringify({
-      version: 2,
-      plugins: {
-        'plugin@omc': [{
-          // installPath points into a subdirectory
-          installPath: versionDir + '/dist',
-        }],
-      },
-    }));
+    mockedReadFileSync.mockReturnValue(
+      JSON.stringify({
+        version: 2,
+        plugins: {
+          'plugin@omc': [
+            {
+              // installPath points into a subdirectory
+              installPath: versionDir + '/dist',
+            },
+          ],
+        },
+      }),
+    );
 
     mockedReaddirSync.mockImplementation((p, _opts?) => {
       const ps = String(p);
@@ -250,10 +280,12 @@ describe('purgeStalePluginCacheVersions', () => {
   function setupFreshNonActiveCache() {
     const cacheDir = '/mock/.claude/plugins/cache';
     mockedExistsSync.mockReturnValue(true);
-    mockedReadFileSync.mockReturnValue(JSON.stringify({
-      version: 2,
-      plugins: { 'plugin@omc': [{ installPath: '/other/path' }] },
-    }));
+    mockedReadFileSync.mockReturnValue(
+      JSON.stringify({
+        version: 2,
+        plugins: { 'plugin@omc': [{ installPath: '/other/path' }] },
+      }),
+    );
     mockedReaddirSync.mockImplementation((p, _opts?) => {
       const ps = String(p);
       if (ps === cacheDir) return [dirent('omc')] as any;
@@ -289,10 +321,12 @@ describe('purgeStalePluginCacheVersions', () => {
   // --- S5 fix: unexpected top-level structure ---
   it('reports error for unexpected plugins structure (array)', () => {
     mockedExistsSync.mockReturnValue(true);
-    mockedReadFileSync.mockReturnValue(JSON.stringify({
-      version: 2,
-      plugins: [1, 2, 3],
-    }));
+    mockedReadFileSync.mockReturnValue(
+      JSON.stringify({
+        version: 2,
+        plugins: [1, 2, 3],
+      }),
+    );
 
     const result = purgeStalePluginCacheVersions();
     expect(result.removed).toBe(0);
@@ -300,49 +334,144 @@ describe('purgeStalePluginCacheVersions', () => {
     expect(result.errors[0]).toContain('unexpected top-level structure');
   });
 
-  // --- #2543 regression: symlink-instead-of-delete ---
-
-  it('replaces stale version dir with symlink to active version in same namespace', () => {
-    // Scenario: CLAUDE_PLUGIN_ROOT=4.14.4 in a running session; 4.14.5 installed;
-    // purge runs after grace period.  4.14.4 must become a symlink, not disappear.
+  /**
+   * Cache where a previous relink died after moving 4.15.6 aside.
+   * `occupant` describes what now sits at the original version path:
+   *   'missing'  — nothing (the plain interrupted case)
+   *   'squatter' — an empty dir holding only .DS_Store (a lost race)
+   *   'redirect' — the symlink, i.e. the relink actually completed
+   *   'payload'  — a real reinstalled version directory
+   */
+  function setupInterruptedRelink(occupant: 'missing' | 'squatter' | 'redirect' | 'payload') {
     const cacheDir = '/mock/.claude/plugins/cache';
-    const activeVersion = join(cacheDir, 'omc/oh-my-claudecode/4.14.5');
-    const staleVersion = join(cacheDir, 'omc/oh-my-claudecode/4.14.4');
+    const activeVersion = join(cacheDir, 'omc/oh-my-claudecode/4.15.10');
+    const originalDir = join(cacheDir, 'omc/oh-my-claudecode/4.15.6');
+    const asideDir = `${originalDir}.omc-stale-${DEAD_OWNER_PID}`;
+    const originalExists = occupant !== 'missing';
+
+    mockedLstatSync.mockImplementation((p) => {
+      if (String(p) === originalDir) {
+        if (occupant === 'missing') throw fsError('ENOENT');
+        return occupant === 'redirect' ? symlinkStats() : dirStats();
+      }
+      return dirStats();
+    });
 
     mockedExistsSync.mockImplementation((p) => {
       const ps = String(p);
       if (ps.includes('installed_plugins.json')) return true;
       if (ps === cacheDir) return true;
-      if (ps === staleVersion || ps === activeVersion) return true;
+      if (ps === activeVersion || ps === asideDir) return true;
+      if (ps === originalDir) return originalExists;
+      // Plugin-root markers: only a real payload directory carries them.  The
+      // squatter cases deliberately do not, which is the whole point of the
+      // marker check replacing the old "any non-dotfile" heuristic.
+      if (ps.startsWith(`${activeVersion}/`) || ps.startsWith(`${asideDir}/`)) return true;
+      // Marker probes under the version path.  existsSync follows symlinks, so a
+      // completed redirect resolves to the active version and shows its markers;
+      // a squatter or a dangling link shows nothing.
+      if (ps.startsWith(`${originalDir}/`)) return occupant === 'payload' || occupant === 'redirect';
       return false;
     });
-
-    mockedReadFileSync.mockReturnValue(JSON.stringify({
-      version: 2,
-      plugins: {
-        'oh-my-claudecode@omc': [{ installPath: activeVersion, version: '4.14.5' }],
-      },
-    }));
-
-    mockedReaddirSync.mockImplementation((p, _opts?) => {
+    mockedReadFileSync.mockReturnValue(
+      JSON.stringify({
+        version: 2,
+        plugins: {
+          'oh-my-claudecode@omc': [{ installPath: activeVersion, version: '4.15.10' }],
+        },
+      }),
+    );
+    mockedReaddirSync.mockImplementation((p, opts?: any) => {
       const ps = String(p);
       if (ps === cacheDir) return [dirent('omc')] as any;
       if (ps.endsWith('omc')) return [dirent('oh-my-claudecode')] as any;
-      if (ps.endsWith('oh-my-claudecode')) return [dirent('4.14.4'), dirent('4.14.5')] as any;
+      if (ps.endsWith('oh-my-claudecode')) {
+        const entries = [dirent(`4.15.6.omc-stale-${DEAD_OWNER_PID}`), dirent('4.15.10')];
+        if (originalExists) entries.unshift(dirent('4.15.6'));
+        return entries as any;
+      }
+      // isUsableVersionPath reads the occupant's entries (no withFileTypes)
+      if (ps === originalDir && !opts?.withFileTypes) {
+        return (occupant === 'payload' ? ['scripts', 'package.json'] : ['.DS_Store']) as any;
+      }
       return [] as any;
     });
+    return { activeVersion, originalDir, asideDir };
+  }
+
+  it('clears a dangling redirect symlink and restores the backup over it', () => {
+    // lstat reports a symlink but the target is gone, so the path is unusable.
+    // On a real filesystem renaming a directory over a symlink raises ENOTDIR
+    // (verified on APFS), and existsSync-based removal cannot clear a dangling
+    // link — both are modelled here; the integration test proves the real thing.
+    const { originalDir, asideDir } = setupInterruptedRelink('redirect');
+    mockedExistsSync.mockImplementation((p) => {
+      const ps = String(p);
+      // Dangling: existsSync follows the link, so neither the path itself nor any
+      // marker probe through it resolves.
+      if (ps === originalDir || ps.startsWith(`${originalDir}/`)) return false;
+      if (ps.includes('installed_plugins.json')) return true;
+      return ps.includes('cache');
+    });
+    let danglingPresent = true;
+    mockedUnlinkSync.mockImplementation(((p: any) => {
+      if (String(p) === originalDir) danglingPresent = false;
+      return undefined;
+    }) as any);
+    mockedRenameSync.mockImplementation(((_from: any, to: any) => {
+      if (String(to) === originalDir && danglingPresent) throw fsError('ENOTDIR');
+      return undefined;
+    }) as any);
 
     const result = purgeStalePluginCacheVersions();
 
-    expect(result.symlinked).toBe(1);
-    expect(result.removed).toBe(0);
-    expect(result.symlinkPaths).toEqual([staleVersion]);
-    // Real dir removed first, then symlink created
-    expect(mockedRmSync).toHaveBeenCalledWith(staleVersion, { recursive: true, force: true });
-    expect(mockedSymlinkSync).toHaveBeenCalledWith(activeVersion, staleVersion, 'dir');
-    // Active version untouched
-    expect(mockedRmSync).not.toHaveBeenCalledWith(activeVersion, expect.anything());
-    expect(mockedSymlinkSync).not.toHaveBeenCalledWith(expect.anything(), activeVersion, expect.anything());
+    // The link is unlinked (not rmSync'd — existsSync cannot see it) and the
+    // rename then succeeds on the retry.
+    expect(mockedUnlinkSync).toHaveBeenCalledWith(originalDir);
+    expect(result.restored).toBe(1);
+    expect(mockedRenameSync).toHaveBeenCalledWith(asideDir, originalDir);
+  });
+
+  it('discards the aside copy when the redirect symlink is already in place', () => {
+    const { originalDir, asideDir } = setupInterruptedRelink('redirect');
+
+    const result = purgeStalePluginCacheVersions();
+
+    expect(result.restored).toBe(0);
+    expect(mockedRmSync).toHaveBeenCalledWith(asideDir, {
+      recursive: true,
+      force: true,
+    });
+    expect(mockedRenameSync).not.toHaveBeenCalledWith(asideDir, originalDir);
+  });
+
+  it('discards the aside copy when the version was reinstalled with payload', () => {
+    const { originalDir, asideDir } = setupInterruptedRelink('payload');
+
+    const result = purgeStalePluginCacheVersions();
+
+    expect(result.restored).toBe(0);
+    expect(mockedRmSync).toHaveBeenCalledWith(asideDir, {
+      recursive: true,
+      force: true,
+    });
+    expect(mockedRenameSync).not.toHaveBeenCalledWith(asideDir, originalDir);
+  });
+
+  it('never treats an aside dir as a plugin version when picking a symlink target', () => {
+    // compareSemverDesc must not see the aside suffix as a version candidate.
+    const { activeVersion } = setupInterruptedRelink('redirect');
+
+    purgeStalePluginCacheVersions();
+
+    for (const call of mockedSymlinkSync.mock.calls) {
+      expect(String(call[0])).toBe(activeVersion);
+      expect(String(call[1])).not.toContain('.omc-stale-');
+    }
+    expect(mockedRenameSync).not.toHaveBeenCalledWith(
+      expect.stringContaining(`.omc-stale-${DEAD_OWNER_PID}`),
+      activeVersion,
+    );
   });
 
   it('deletes stale version dir when no active version exists in namespace', () => {
@@ -352,13 +481,15 @@ describe('purgeStalePluginCacheVersions', () => {
     const staleVersion = join(cacheDir, 'omc/plugin/1.0.0');
 
     mockedExistsSync.mockReturnValue(true);
-    mockedReadFileSync.mockReturnValue(JSON.stringify({
-      version: 2,
-      plugins: {
-        // installPath is outside the omc/plugin namespace
-        'plugin@other': [{ installPath: '/completely/different/path/2.0.0' }],
-      },
-    }));
+    mockedReadFileSync.mockReturnValue(
+      JSON.stringify({
+        version: 2,
+        plugins: {
+          // installPath is outside the omc/plugin namespace
+          'plugin@other': [{ installPath: '/completely/different/path/2.0.0' }],
+        },
+      }),
+    );
 
     mockedReaddirSync.mockImplementation((p, _opts?) => {
       const ps = String(p);
@@ -373,7 +504,10 @@ describe('purgeStalePluginCacheVersions', () => {
     expect(result.removed).toBe(1);
     expect(result.symlinked).toBe(0);
     expect(result.removedPaths).toEqual([staleVersion]);
-    expect(mockedRmSync).toHaveBeenCalledWith(staleVersion, { recursive: true, force: true });
+    expect(mockedRmSync).toHaveBeenCalledWith(staleVersion, {
+      recursive: true,
+      force: true,
+    });
     expect(mockedSymlinkSync).not.toHaveBeenCalled();
   });
 
@@ -384,12 +518,14 @@ describe('purgeStalePluginCacheVersions', () => {
     const activeVersion = join(cacheDir, 'omc/oh-my-claudecode/4.14.5');
 
     mockedExistsSync.mockReturnValue(true);
-    mockedReadFileSync.mockReturnValue(JSON.stringify({
-      version: 2,
-      plugins: {
-        'oh-my-claudecode@omc': [{ installPath: activeVersion }],
-      },
-    }));
+    mockedReadFileSync.mockReturnValue(
+      JSON.stringify({
+        version: 2,
+        plugins: {
+          'oh-my-claudecode@omc': [{ installPath: activeVersion }],
+        },
+      }),
+    );
 
     mockedReaddirSync.mockImplementation((p, _opts?) => {
       const ps = String(p);
@@ -397,10 +533,7 @@ describe('purgeStalePluginCacheVersions', () => {
       if (ps.endsWith('omc')) return [dirent('oh-my-claudecode')] as any;
       if (ps.endsWith('oh-my-claudecode')) {
         // 4.14.4 is a symlink (isDirectory returns false), 4.14.5 is a real dir
-        return [
-          { name: '4.14.4', isDirectory: () => false },
-          dirent('4.14.5'),
-        ] as any;
+        return [{ name: '4.14.4', isDirectory: () => false }, dirent('4.14.5')] as any;
       }
       return [] as any;
     });

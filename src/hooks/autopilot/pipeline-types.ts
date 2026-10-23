@@ -2,7 +2,7 @@
  * Pipeline Types
  *
  * Type definitions for the configurable pipeline orchestrator.
- * The pipeline unifies autopilot/ultrawork/ultrapilot into a single
+ * The pipeline unifies autopilot and ultrapilot into a single
  * configurable sequence: RALPLAN -> EXECUTION -> RALPH -> QA.
  *
  * @see https://github.com/Yeachan-Heo/oh-my-claudecode/issues/1130
@@ -39,6 +39,67 @@ export const STAGE_ORDER: readonly PipelineStageId[] = [
   "ralph",
   "qa",
 ] as const;
+
+/** Closed version 1 profile sequence admitted by the workflow contract. */
+export type WorkflowProfileStages = readonly [
+  "ralplan",
+  "execution",
+] | readonly [
+  "ralplan",
+  "execution",
+  "ralph",
+] | readonly [
+  "ralplan",
+  "execution",
+  "qa",
+] | readonly [
+  "ralplan",
+  "execution",
+  "ralph",
+  "qa",
+];
+
+/** Immutable, normalized descriptor persisted for a named workflow run. */
+export interface WorkflowDescriptor {
+  readonly descriptorVersion: 1;
+  readonly workflowName: string;
+  readonly profileVersion: 1;
+  readonly stages: WorkflowProfileStages;
+  readonly profileHash: string;
+}
+
+/** Stable identity of transcript bytes accepted by a named workflow run. */
+export interface PipelineTranscriptFileIdentity {
+  device: number;
+  inode: number;
+  size: number;
+  mtimeNs: string;
+  ctimeNs: string;
+  contentSha256: string;
+}
+
+/** Transcript boundary captured at workflow activation. */
+export interface PipelineActivationBoundary {
+  transcriptPath: string;
+  transcriptRoot: string;
+  transcriptBasename: string;
+  sessionId: string;
+  byteOffset: number;
+  fileIdentity: PipelineTranscriptFileIdentity;
+}
+
+/** Evidence captured when a selected workflow stage completes. */
+export interface PipelineCompletionObservation {
+  stageId: PipelineStageId;
+  sessionId: string;
+  signalId: string;
+  lineNumber: number;
+  byteOffset: number;
+  recordContentSha256: string;
+  stableFile: PipelineTranscriptFileIdentity;
+  activationBoundary: PipelineActivationBoundary;
+  observedAt: string;
+}
 
 // ============================================================================
 // PIPELINE CONFIGURATION
@@ -136,7 +197,7 @@ export interface PipelineContext {
 
 /**
  * Interface that each stage adapter must implement.
- * Adapters wrap existing modules (ralplan, team, ralph, ultraqa)
+ * Adapters wrap existing modules (ralplan, team, ralph, qa)
  * into a uniform interface for the pipeline orchestrator.
  */
 export interface PipelineStageAdapter {
@@ -181,12 +242,18 @@ export interface PipelineStageState {
  * Stored alongside existing autopilot state fields.
  */
 export interface PipelineTracking {
-  /** Pipeline configuration used for this run */
-  pipelineConfig: PipelineConfig;
-  /** Ordered list of stages and their current status */
+  /** Pipeline configuration used by legacy pipeline runs. */
+  pipelineConfig?: PipelineConfig;
+  /** Ordered list of selected stages and their current status. */
   stages: PipelineStageState[];
-  /** Index of the currently active stage in the stages array */
+  /** Index of the currently active stage in the stages array. */
   currentStageIndex: number;
+  /** Monotonic mutable progress revision. */
+  trackingRevision: number;
+  /** Transcript boundary captured when the workflow was activated. */
+  activationBoundary: PipelineActivationBoundary | null;
+  /** Evidence collected for each completed workflow stage. */
+  completionObservations: PipelineCompletionObservation[];
 }
 
 // ============================================================================
@@ -195,17 +262,12 @@ export interface PipelineTracking {
 
 /**
  * Maps deprecated mode names to their pipeline configuration equivalents.
- * Used to translate ultrawork/ultrapilot invocations into autopilot + config.
+ * Used to translate ultrapilot invocations into autopilot + config.
  */
 export const DEPRECATED_MODE_ALIASES: Record<
   string,
   { config: Partial<PipelineConfig>; message: string }
 > = {
-  ultrawork: {
-    config: { execution: "team" },
-    message:
-      'ultrawork is deprecated. Use /autopilot with execution: "team" instead.',
-  },
   ultrapilot: {
     config: { execution: "team" },
     message:

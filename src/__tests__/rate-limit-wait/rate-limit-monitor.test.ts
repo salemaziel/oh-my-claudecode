@@ -11,20 +11,39 @@ import {
   shouldMonitorBlockedPanes,
 } from '../../features/rate-limit-wait/rate-limit-monitor.js';
 import type { RateLimitStatus } from '../../features/rate-limit-wait/types.js';
+import type { StatuslineStdin } from '../../hud/types.js';
 
 // Mock the usage-api module
 vi.mock('../../hud/usage-api.js', () => ({
   getUsage: vi.fn(),
 }));
 
+vi.mock('../../hud/stdin.js', () => ({
+  readStdinCache: vi.fn(),
+}));
+
 import { getUsage } from '../../hud/usage-api.js';
+import { readStdinCache } from '../../hud/stdin.js';
 
 describe('rate-limit-monitor', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(readStdinCache).mockReturnValue(null);
   });
 
   describe('checkRateLimitStatus', () => {
+    it('passes the cached Claude Code version to the usage API', async () => {
+      vi.mocked(readStdinCache).mockReturnValue({ version: '2.1.232' } as StatuslineStdin);
+      vi.mocked(getUsage).mockResolvedValue({ rateLimits: null, error: 'no_credentials' });
+
+      await checkRateLimitStatus();
+
+      expect(getUsage).toHaveBeenCalledWith({
+        clientVersion: '2.1.232',
+        skipWarmCache: true,
+      });
+    });
+
     it('should return null when getUsage returns null rateLimits', async () => {
       vi.mocked(getUsage).mockResolvedValue({ rateLimits: null, error: 'no_credentials' });
 
@@ -133,6 +152,7 @@ describe('rate-limit-monitor', () => {
           monthlyResetsAt: null,
         },
         error: 'rate_limited',
+        stale: true,
       });
 
       const result = await checkRateLimitStatus();
@@ -143,6 +163,29 @@ describe('rate-limit-monitor', () => {
       expect(result!.usingStaleData).toBe(true);
       expect(formatRateLimitStatus(result!)).toContain('stale cached usage');
       expect(formatRateLimitStatus(result!)).not.toBe('Not rate limited');
+    });
+
+    it('surfaces stale cached usage after a network failure', async () => {
+      vi.mocked(getUsage).mockResolvedValue({
+        rateLimits: {
+          fiveHourPercent: 83,
+          weeklyPercent: 57,
+          fiveHourResetsAt: null,
+          weeklyResetsAt: null,
+          monthlyPercent: 0,
+          monthlyResetsAt: null,
+        },
+        error: 'network',
+        stale: true,
+      });
+
+      const result = await checkRateLimitStatus();
+
+      expect(result).not.toBeNull();
+      expect(result!.apiErrorReason).toBe('network');
+      expect(result!.usingStaleData).toBe(true);
+      expect(isRateLimitStatusDegraded(result)).toBe(true);
+      expect(formatRateLimitStatus(result!)).toContain('Usage API network error; showing stale cached usage');
     });
 
     it('should handle API errors gracefully', async () => {
@@ -291,6 +334,26 @@ describe('rate-limit-monitor', () => {
         fiveHourPercent: 83,
         weeklyPercent: 57,
         apiErrorReason: 'rate_limited',
+        usingStaleData: true,
+        lastCheckedAt: new Date(),
+      };
+
+      expect(isRateLimitStatusDegraded(status)).toBe(true);
+      expect(shouldMonitorBlockedPanes(status)).toBe(false);
+    });
+
+    it('treats stale cached network results as degraded', () => {
+      const status: RateLimitStatus = {
+        fiveHourLimited: false,
+        weeklyLimited: false,
+        monthlyLimited: false,
+        isLimited: false,
+        fiveHourResetsAt: null,
+        weeklyResetsAt: null,
+        monthlyResetsAt: null,
+        nextResetAt: null,
+        timeUntilResetMs: null,
+        apiErrorReason: 'network',
         usingStaleData: true,
         lastCheckedAt: new Date(),
       };

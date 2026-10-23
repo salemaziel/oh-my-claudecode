@@ -5,6 +5,7 @@ import * as path from 'path';
 
 vi.mock('../callbacks.js', () => ({
   triggerStopCallbacks: vi.fn(async () => undefined),
+  runSessionEndDeferredAction: vi.fn(async () => ({ status: 'completed' })),
 }));
 
 vi.mock('../../../notifications/index.js', () => ({
@@ -21,6 +22,7 @@ vi.mock('../../../tools/python-repl/bridge-manager.js', () => ({
 }));
 
 import { processSessionEndCleanupWorker } from '../index.js';
+import { prepareCoreManifest, sealCoreManifest, sealWikiManifest } from '../cleanup-manifest.js';
 import { cleanupBridgeSessions } from '../../../tools/python-repl/bridge-manager.js';
 
 describe('processSessionEndCleanupWorker python bridge cleanup', () => {
@@ -29,12 +31,14 @@ describe('processSessionEndCleanupWorker python bridge cleanup', () => {
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'omc-session-end-bridge-'));
+    vi.stubEnv('OMC_STATE_DIR', path.join(tmpDir, 'state-root'));
     transcriptPath = path.join(tmpDir, 'transcript.jsonl');
   });
 
   afterEach(() => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
     vi.clearAllMocks();
+    vi.unstubAllEnvs();
   });
 
   it('passes extracted python_repl sessions to cleanupBridgeSessions', async () => {
@@ -50,6 +54,10 @@ describe('processSessionEndCleanupWorker python bridge cleanup', () => {
       }),
     ];
     fs.writeFileSync(transcriptPath, transcriptLines.join('\n'), 'utf-8');
+
+    prepareCoreManifest(tmpDir, 'session-123', { transcriptPath });
+    sealCoreManifest(tmpDir, 'session-123');
+    sealWikiManifest(tmpDir, 'session-123');
 
     await processSessionEndCleanupWorker({
       directory: tmpDir,

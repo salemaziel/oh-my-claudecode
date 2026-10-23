@@ -10,10 +10,18 @@ const watchMode = process.argv.includes('--watch');
 const buildConfig = {
   entryPoints: ['src/team/runtime-cli.ts'],
   bundle: true,
+  preserveSymlinks: true,
   platform: 'node',
   target: 'node18',
   format: 'cjs',
   outfile,
+  // Inject import.meta.url polyfill for CJS format
+  banner: {
+    js: 'const importMetaUrl = require("url").pathToFileURL(__filename);',
+  },
+  define: {
+    'import.meta.url': 'importMetaUrl',
+  },
   // Note: platform:'node' auto-externalizes all Node built-in subpaths (fs/promises, etc.)
   external: [
     'fs', 'fs/promises', 'path', 'os', 'util', 'stream', 'events',
@@ -29,8 +37,8 @@ const buildConfig = {
 if (watchMode) {
   const ctx = await esbuild.context(buildConfig);
   await ctx.watch();
-  console.log(`Watching ${outfile}...`);
+  console.error(`Watching ${outfile}...`);
 } else {
   await esbuild.build(buildConfig);
-  console.log(`Built ${outfile}`);
+  console.error(`Built ${outfile}`);
 }

@@ -36,8 +36,8 @@ This guide assumes you're comfortable with terminal commands and git branching.
    git remote -v
    # origin    https://github.com/<your-username>/oh-my-claudecode.git (fetch)
    # origin    https://github.com/<your-username>/oh-my-claudecode.git (push)
-   # upstream  https://github.com/salemaziel/oh-my-claudecode.git (fetch)
-   # upstream  https://github.com/salemaziel/oh-my-claudecode.git (read-only)
+   # upstream  https://github.com/Yeachan-Heo/oh-my-claudecode.git (fetch)
+   # upstream  https://github.com/Yeachan-Heo/oh-my-claudecode.git (push)
    ```
 
 5. **Check available branches**:
@@ -83,6 +83,11 @@ Note: The repo has two main branches:
    ```
 
 All TypeScript and bundling steps are handled. The output goes to `dist/` and `bridge/`.
+
+On macOS, the graph filesystem backend also requires clang and Node development
+headers and produces ignored binaries in `native/`. See
+[Graph contained filesystem](docs/graph-contained-filesystem.md) for header
+configuration, packaging, and the real-host acceptance checks.
 
 ---
 
@@ -131,6 +136,11 @@ This tells Claude Code to ignore the repo's `.mcp.json` entry and use the plugin
 /autopilot "your task here"
 ```
 
+**Quick verification**: if Claude Code starts without OMC agents or the bridge MCP, run
+`omc doctor conflicts` first. A missing `disabledMcpjsonServers` entry usually shows up as a duplicate
+`"t"` MCP server, while a stale checkout setup is fixed by re-running `omc setup --plugin-dir-mode`
+from the repository root.
+
 **Rebuilding**: After code changes:
 ```bash
 npm run build
@@ -159,6 +169,14 @@ claude plugin marketplace update oh-my-claudecode
 claude plugin update oh-my-claudecode@oh-my-claudecode
 /setup
 ```
+
+**Known limitation**: the plugin cache copy runs at the version you last
+updated through the marketplace — hooks (including the SessionEnd chain
+enqueuer) execute the cached code, not your checkout. If session-end behavior
+looks stale after rebuilding, re-run `claude plugin update` first. OMC already
+mitigates dangling references to older cache versions at setup time via
+`scripts/repair-plugin-cache.mjs` (registry rewrite + symlink to the latest
+valid cache root), but it does not re-copy content into the cache.
 
 ### Flow C: `omc setup --no-plugin` (fallback, bundled skills)
 
@@ -245,6 +263,20 @@ npm run build
 ```
 
 Runs the complete pipeline: `tsc` → esbuild bundles → docs composition → all bridge artifacts.
+
+### Generated `dist/` and `bridge/` changes are held
+
+`npm run build` regenerates `dist/` and `bridge/`. **Do not commit these build artifacts in ordinary PRs.** They are gitignored, but tracked `bridge/*.cjs` bundles can appear modified after a rebuild. Committing them inflates the diff, causes merge conflicts, and obscures the source change.
+
+Before committing, restore them:
+
+```bash
+git restore dist/ bridge/
+```
+
+The ordinary PR **No Committed Build Artifacts** job is a credential-free, candidate-side classifier. It is replaceable by the PR branch, is non-authoritative for every contributor and maintainer, and holds any candidate `dist/` or `bridge/` delta with `OWNER_CONFIRMATION_REQUIRED`; it cannot approve a generated change or authorize a merge.
+
+A generated delta remains held until owners provide protected split-root authorization: workflow root **W** is the reviewed workflow commit on default `main`; verifier/manifest root **B** is the detached protected `dev` event-base commit. The protected evidence must bind the final PR head **H**, its unique merge base, and complete generated delta records, then be evaluated in a fresh eligible event after B exists. Before merge, target-branch governance must remove this ordinary candidate check from required checks or supersede it with the required protected split-root check.
 
 ---
 
@@ -437,6 +469,6 @@ Or check the troubleshooting sections in:
 - **Local Plugin Install**: [docs/LOCAL_PLUGIN_INSTALL.md](./docs/LOCAL_PLUGIN_INSTALL.md)
 - **Getting Started**: [docs/GETTING-STARTED.md](./docs/GETTING-STARTED.md)
 - **GitHub Issues**: https://github.com/salemaziel/oh-my-claudecode/issues
-- **Discord Community**: https://discord.gg/PUwSMR9XNk
+- **Discord Community**: https://discord.gg/wSyUQYfhAw
 
 Happy contributing!

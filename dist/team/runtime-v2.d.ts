@@ -3,7 +3,7 @@
  *
  * Runtime selection:
  * - Default: v2 enabled
- * - Opt-out: set OMC_RUNTIME_V2=0|false|no|off to force legacy v1
+ * - Native CLI jobs reject the legacy opt-out before startup effects.
  * NO done.json polling. Completion is detected via:
  * - CLI API lifecycle transitions (claim-task, transition-task-status)
  * - Event-driven monitor snapshots
@@ -15,20 +15,59 @@
  * Architecture mirrors runtime.ts: startTeam, monitorTeam, shutdownTeam,
  * assignTask, resumeTeam as discrete operations driven by the caller.
  */
-import type { TeamConfig, TeamTask, TeamTaskDelegationPlan, WorkerStatus, WorkerHeartbeat } from './types.js';
+import type { TeamConfig, TeamManifestV2, TeamInstanceId, TeamTask, TeamTaskDelegationPlan, WorkerInfo, WorkerStatus, WorkerHeartbeat } from './types.js';
 import type { TeamPhase } from './phase-controller.js';
 import type { CliAgentType } from './model-contract.js';
-import { type WorkerPaneLiveness } from './tmux-session.js';
+import { type StartupPaneActivity, type StartupInboxResubmitOutcome, type WorkerPaneLiveness } from './tmux-session.js';
 import type { CanonicalTeamRole, PluginConfig, RoleAssignment, TeamRoleAssignmentSpec } from '../shared/types.js';
 import { type CliWorkerOutputPayload } from './cli-worker-contract.js';
+import { type RecoveryDurableOutcome } from './recovery-request-store.js';
+import { type RecoverDeadWorkerOwnerInput } from './runtime-owner-client.js';
+import type { RecoverDeadWorkerV2Result } from './types.js';
+export interface RecoverDeadWorkerV2Options {
+    workerName: string;
+    requestId?: string;
+    /** Persistent callers provide the original team incarnation. */
+    instanceId?: TeamInstanceId;
+    timeoutMs?: number;
+}
+export interface RuntimeOwnerRecoveryClient {
+    requestRuntimeOwnerRecovery(input: {
+        requestId: string;
+        cwd: string;
+        teamName: string;
+        workerName: string;
+        instanceId: TeamInstanceId;
+        timeoutMs?: number;
+    }): Promise<RecoverDeadWorkerV2Result>;
+}
+/** Runtime integration point; production may bind its owner client after startup. */
+export declare function setRuntimeOwnerRecoveryClient(client: RuntimeOwnerRecoveryClient | undefined): void;
+/** Queue recovery with the runtime owner; this process never runs the owner saga. */
+export declare function recoverDeadWorkerV2(teamName: string, cwd: string, { workerName, requestId, instanceId: expectedInstanceId, timeoutMs }: RecoverDeadWorkerV2Options): Promise<RecoverDeadWorkerV2Result>;
+/** Reads only the canonical durable terminal result for a request. */
+export declare function readRecoverDeadWorkerV2Result(requestId: string, cwd?: string): Promise<RecoverDeadWorkerV2Result | null>;
+/** Compatibility/internal reader that may return an in-progress durable outcome. */
+export declare function readRecoverDeadWorkerV2Outcome(cwd: string, requestId: string): RecoveryDurableOutcome | null;
+export declare function reconcileCommittedTeamServices(config: TeamConfig, cwd: string): Promise<'synced' | 'repair_required'>;
 export { isRuntimeV2Enabled } from './runtime-flags.js';
+export interface TeamStartupFailure {
+    worker: string;
+    reason: string;
+    /** One claim-task error line from the owned pane. Set only for a pane-busy evidence miss. */
+    claimError?: string;
+}
 export interface TeamRuntimeV2 {
     teamName: string;
     sanitizedName: string;
+    /** Immutable identity for this named team incarnation. */
+    instanceId: TeamInstanceId;
     sessionName: string;
     config: TeamConfig;
     cwd: string;
     ownsWindow: boolean;
+    /** Workers that launched without startup evidence. Set by startTeamV2. */
+    startupFailures?: TeamStartupFailure[];
 }
 export interface TeamSnapshotV2 {
     teamName: string;
@@ -37,6 +76,8 @@ export interface TeamSnapshotV2 {
         name: string;
         alive: boolean;
         liveness: WorkerPaneLiveness;
+        /** Provider execution health is observed independently of pane transport. */
+        providerLiveness: 'alive' | 'dead' | 'unknown';
         status: WorkerStatus;
         heartbeat: WorkerHeartbeat | null;
         assignedTasks: string[];
@@ -73,7 +114,20 @@ export interface ShutdownOptionsV2 {
     force?: boolean;
     ralph?: boolean;
     timeoutMs?: number;
+    /** Refuse to operate on a replacement sharing the same team name. */
+    instanceId?: TeamInstanceId;
 }
+export type ShutdownTeamV2Result = {
+    outcome: 'cleaned';
+} | {
+    outcome: 'preserved';
+    reason: 'config_missing_cleanup_evidence' | 'provider_cleanup_unverified' | 'worker_panes_alive' | 'worker_pane_liveness_unknown' | 'worker_process_reaped_pane_unconfirmed' | 'worktrees_preserved';
+    workers: string[];
+} | {
+    outcome: 'failed';
+    reason: 'tmux_cleanup_failed' | 'worktree_cleanup_failed' | 'state_cleanup_failed';
+    detail: string;
+};
 /**
  * Resolve a per-task routing assignment from the team's routing snapshot.
  *
@@ -83,8 +137,9 @@ export interface ShutdownOptionsV2 {
  *   3. Fallback to the `fallbackAgent` round-robin pick if snapshot lookup
  *      fails (role outside canonical vocabulary or snapshot missing).
  *
- * Returns the primary assignment by default; callers swap to the Claude
- * fallback if the primary provider's CLI binary is missing at spawn time.
+ * Returns the authoritative primary assignment for the selected route.
+ * A missing provider binary is a startup error; routing never changes
+ * providers implicitly.
  */
 export declare function resolveTaskAssignment(task: {
     subject: string;
@@ -93,13 +148,16 @@ export declare function resolveTaskAssignment(task: {
 }, resolvedRouting: Record<CanonicalTeamRole, {
     primary: RoleAssignment;
     fallback: RoleAssignment;
-}>, roleRoutingConfig: Partial<Record<CanonicalTeamRole, TeamRoleAssignmentSpec>> | undefined, resolvedBinaryPaths: Partial<Record<CliAgentType, string>>, fallbackAgent: CliAgentType): {
+}>, roleRoutingConfig: Partial<Record<CanonicalTeamRole, TeamRoleAssignmentSpec>> | undefined, fallbackAgent: CliAgentType): {
     agentType: CliAgentType;
     model: string;
+    reasoningEffort?: string;
     role: CanonicalTeamRole | null;
 };
 export interface StartTeamV2Config {
     teamName: string;
+    /** Caller-supplied identity (CLI/MCP); direct callers may omit it. */
+    instanceId?: TeamInstanceId;
     workerCount: number;
     agentTypes: string[];
     tasks: Array<{
@@ -107,6 +165,7 @@ export interface StartTeamV2Config {
         description: string;
         owner?: string;
         blocked_by?: string[];
+        depends_on?: string[];
         role?: string;
         delegation?: TeamTaskDelegationPlan;
     }>;
@@ -115,6 +174,8 @@ export interface StartTeamV2Config {
     workerRoles?: string[];
     roleName?: string;
     rolePrompt?: string;
+    /** Per-role overlay prompts. Mixed-role launches look up by worker role. */
+    rolePromptByRole?: Record<string, string>;
     /**
      * Optional pre-loaded plugin config. When omitted, `loadConfig()` is called
      * at startup. Exposed so callers (tests, bridges) can inject a config.
@@ -131,6 +192,70 @@ export interface StartTeamV2Config {
      */
     autoMerge?: boolean;
 }
+export interface WorkerStartupEvidencePolicy {
+    initialBudgetMs: number;
+    finalRecheckBudgetMs: number;
+    resubmitAttempts: number;
+    resubmitBudgetMs: number;
+    /** Read-only evidence recheck granted only when the owned pane was observed
+     * actively working (the worker demonstrably consumed the startup trigger). */
+    engagedPaneRecheckBudgetMs: number;
+}
+export declare function getWorkerStartupEvidencePolicy(agentType: CliAgentType): WorkerStartupEvidencePolicy;
+export declare function waitForStartupEvidenceBudget(hasEvidence: () => Promise<boolean>, budgetMs: number, delayMs?: number): Promise<boolean>;
+/**
+ * Settle worker startup evidence under a provider-aware policy.
+ *
+ * The resubmit loop exists to recover a lost interactive submit. When the probe
+ * reports `pane_busy`, the owned worker demonstrably consumed the trigger and is
+ * actively working, so resubmitting would duplicate the inbox and stopping the
+ * wait would tear down a healthy provider (issue #3849). In that case the loop
+ * stops resubmitting and one bounded read-only engaged-pane recheck runs before
+ * the caller's fail-closed teardown. Interactive providers may also supply a
+ * read-only activity probe when resubmission is disabled. `paneBusy` records
+ * that observation and is not startup success. Panes that are idle, wrong, or
+ * dead never earn that recheck and keep the existing fast failure path.
+ */
+export declare function settleStartupEvidence(policy: WorkerStartupEvidencePolicy, waitForCurrentEvidence: (budgetMs: number) => Promise<boolean>, resubmit?: () => Promise<StartupInboxResubmitOutcome>, probeActivity?: () => Promise<StartupPaneActivity>): Promise<{
+    settled: boolean;
+    paneBusy: boolean;
+}>;
+/** Last owned-pane line that reports a claim-task failure. Pane text is not startup evidence. */
+export declare function claimErrorLineFromPane(captured: string): string | undefined;
+export declare function promptModeRecoveryRequiresProgressEvidence(promptMode: boolean, continuationCount: number): boolean;
+interface RecoveryOwnerFinalizationDeps {
+    readRevisionedConfig: (teamName: string, cwd: string) => Promise<{
+        config: TeamConfig;
+        stateRevision: number;
+    } | null>;
+    saveConfigAtRevision: (config: TeamConfig, expectedRevision: number, cwd: string, afterCommit?: () => Promise<void> | void, options?: import('./monitor.js').SaveTeamConfigAtRevisionOptions) => Promise<boolean>;
+    withConfigLock?: <T>(teamName: string, cwd: string, fn: () => Promise<T> | T) => Promise<T>;
+    publishFinal: (input: RecoverDeadWorkerOwnerInput, recoveryId: string, result: RecoverDeadWorkerV2Result) => RecoverDeadWorkerV2Result;
+    readDurableContinuation?: (cwd: string, requestId: string, recoveryId: string) => 'none' | 'selected' | 'reserved' | 'adopted';
+}
+export declare function finalizeRecoveryOwnerResult(input: RecoverDeadWorkerOwnerInput, recoveryId: string, result: RecoverDeadWorkerV2Result, deps?: RecoveryOwnerFinalizationDeps): Promise<RecoverDeadWorkerV2Result>;
+export declare function selectRecoveryReplayTasks(tasks: TeamTask[], workerName: string, recoveryId: string, committedPaneLiveness: WorkerPaneLiveness | null): TeamTask[];
+export declare function resolveCommittedRecoveryManifestSync(readManifest: () => Promise<TeamManifestV2 | null>, expected: {
+    workerName: string;
+    paneId: string;
+    paneAttemptId: string;
+    recoveryId: string;
+    replacementGeneration: number;
+}): Promise<'synced' | 'repair_required'>;
+export declare function resolveCommittedRecoveryPaneAttempt(activeRecovery: TeamConfig['active_recovery'], recoveryId: string, replacementGeneration: number, worker: WorkerInfo): {
+    paneId: string;
+    paneAttemptId: string;
+} | null;
+interface BootstrapRecoveryEvidenceWaitOptions {
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    now?: () => number;
+    sleep?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
+}
+/** Establish the exact successor/config binding before a detached owner may execute or maintain. */
+export declare function prepareRecoveryOwnerBootstrap(input: RecoverDeadWorkerOwnerInput, waitOptions?: BootstrapRecoveryEvidenceWaitOptions): Promise<void>;
+/** Private runtime-owner executor. It never calls the public recovery facade. */
+export declare function executeRecoverDeadWorkerV2Owner(input: RecoverDeadWorkerOwnerInput): Promise<RecoverDeadWorkerV2Result>;
 /**
  * Start a team with the v2 event-driven runtime.
  * Creates state directories, writes config + task files, spawns workers via
@@ -157,8 +282,8 @@ export declare class CircuitBreakerV2 {
     isTripped(): boolean;
 }
 /**
- * Requeue tasks from dead workers by writing failure sidecars and resetting
- * task status back to pending so they can be claimed by other workers.
+ * Compatibility wrapper that routes legacy dead-worker requeue requests through
+ * the strict runtime-owner recovery transaction.
  */
 export declare function requeueDeadWorkerTasks(teamName: string, deadWorkerNames: string[], cwd: string): Promise<string[]>;
 export type CliWorkerVerdictStatus = 'completed' | 'failed' | 'file_missing' | 'parse_failed' | 'no_in_progress_task' | 'already_terminal' | 'skipped';
@@ -170,26 +295,46 @@ export interface CliWorkerVerdictResult {
     reason?: string;
 }
 /**
- * Post-exit handler for CLI workers that emitted a structured verdict
- * (AC-7). Scans workers whose panes have exited and whose WorkerInfo
+ * Completion handler for CLI workers that emitted a structured verdict
+ * (AC-7). Scans workers whose panes have exited, plus live Cursor panes whose
+ * persistent reviewer session has published a verdict, and whose WorkerInfo
  * carries `output_file`. For each:
  *   - Reads + validates the JSON payload via `parseCliWorkerVerdict`.
- *   - Locates the worker's in_progress task and writes a terminal status
- *     (completed for `approve`, failed for `revise`/`reject`) plus verdict
- *     metadata directly to the task file — the worker process is gone and
- *     cannot re-enter `transitionTaskStatus` with its claim token.
- *   - Renames `verdict.json` to `verdict.processed.json` so a subsequent
- *     monitor cycle does not reprocess it.
- *   - Emits a team event describing the outcome.
+ *   - Cursor reviewers use the claim-token transition path so lease,
+ *     delegation, event, and monitor-snapshot invariants remain authoritative.
+ *   - Other providers retain the post-exit no-token contract: under the
+ *     consumer-owned artifact lock, a durable binding records the exact
+ *     verdict bytes and filesystem publication fingerprint plus original task
+ *     id/version before publication. Retries reuse that binding; under the
+ *     canonical task claim lock they re-read and version-check the task,
+ *     validate an incremented terminal candidate, and publish it atomically.
+ *     Their best-effort events run only after that publication succeeds.
+ *     Proven identity conflicts quarantine the artifact (or persist a stale
+ *     marker if the rename fails) instead of rebinding it.
+ *   - Renames the assignment-scoped verdict artifact to `.processed` so a
+ *     subsequent monitor cycle does not reprocess it.
+ *   - Quarantines stale `.processing` artifacts when replacement output exists.
  * On parse failure, emits a warning event and leaves the task untouched
  * for human review (per plan AC-7).
  */
-export declare function processCliWorkerVerdicts(teamName: string, cwd: string): Promise<CliWorkerVerdictResult[]>;
+export declare function processCliWorkerVerdicts(teamName: string, cwd: string, expectedInstanceId?: TeamInstanceId): Promise<CliWorkerVerdictResult[]>;
 /**
  * Take a single monitor snapshot of team state.
  * Caller drives the loop (e.g., runtime-cli poll interval or event trigger).
  */
-export declare function monitorTeamV2(teamName: string, cwd: string): Promise<TeamSnapshotV2 | null>;
+export declare function monitorTeamV2(teamName: string, cwd: string, expectedInstanceId?: TeamInstanceId): Promise<TeamSnapshotV2 | null>;
+/**
+ * Best-effort cleanup of stale (pending) team reservations owned by dead
+ * processes. Acquires the lifecycle lock to ensure race-safe removal.
+ * This allows new teams to be created even if a previous team's reservation
+ * file was left behind due to process death during startup.
+ */
+export declare function cleanupStaleReservations(teamName: string, cwd: string): Promise<void>;
+/**
+ * Clean up abandoned team state when config exists but has no valid instance_id.
+ * This handles partial startup failures and ensures no state is left behind.
+ */
+export declare function cleanupAbandonedTeamState(teamName: string, cwd: string): Promise<void>;
 /**
  * Graceful team shutdown:
  * 1. Shutdown gate check (unless force)
@@ -198,7 +343,7 @@ export declare function monitorTeamV2(teamName: string, cwd: string): Promise<Te
  * 4. Force kill remaining tmux panes
  * 5. Clean up state
  */
-export declare function shutdownTeamV2(teamName: string, cwd: string, options?: ShutdownOptionsV2): Promise<void>;
+export declare function shutdownTeamV2(teamName: string, cwd: string, options?: ShutdownOptionsV2): Promise<ShutdownTeamV2Result>;
 export declare function resumeTeamV2(teamName: string, cwd: string): Promise<TeamRuntimeV2 | null>;
 export declare function findActiveTeamsV2(cwd: string): Promise<string[]>;
 //# sourceMappingURL=runtime-v2.d.ts.map

@@ -8,6 +8,11 @@ import type { RateLimits, StatuslineStdin } from './types.js';
 /**
  * Persist the last successful stdin read to disk.
  * Used by --watch mode to recover data when stdin is a TTY.
+ *
+ * Uses stdin.session_id as a fallback session identifier when env vars are
+ * absent, so concurrent sessions without env context do not overwrite each
+ * other's cache. Unchanged payloads refresh mtime because env-less readers use
+ * recency to identify the most recently active session.
  */
 export declare function writeStdinCache(stdin: StatuslineStdin): void;
 /**
@@ -17,9 +22,9 @@ export declare function writeStdinCache(stdin: StatuslineStdin): void;
  * path is authoritative. Otherwise — e.g. `omc hud --watch` running as a
  * detached CLI/tmux process that never inherited the parent's session
  * env — we still need a way to surface the active session's cache; we
- * fall back first to the legacy flat path, and then to the most recently
- * updated `state/sessions/{id}/hud-stdin-cache.json` so the watch pane
- * does not stay stuck on an empty/starting view.
+ * prefer the most recently updated valid `state/sessions/{id}/hud-stdin-cache.json`
+ * and then fall back to the legacy flat path so the watch pane does not stay
+ * stuck on an empty/starting view.
  *
  * Returns null if no cache exists or it is unreadable.
  */
@@ -53,5 +58,6 @@ export declare function getRateLimitsFromStdin(stdin: StatuslineStdin): RateLimi
  * omits the model instead of guessing or showing a fake placeholder.
  */
 export declare function getModelId(stdin: StatuslineStdin): string | null;
+export declare function getEffortLevel(stdin: StatuslineStdin): string | null;
 export declare function getModelName(stdin: StatuslineStdin): string | null;
 //# sourceMappingURL=stdin.d.ts.map

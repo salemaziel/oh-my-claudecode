@@ -14,6 +14,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { tmpdir } from 'os';
 import { DEFAULT_THRESHOLD, CRITICAL_THRESHOLD, COMPACTION_COOLDOWN_MS, MAX_WARNINGS, CLAUDE_DEFAULT_CONTEXT_LIMIT, CHARS_PER_TOKEN, CONTEXT_WARNING_MESSAGE, CONTEXT_CRITICAL_MESSAGE, } from './constants.js';
+import { recordContextPruningShadow, } from './jev-shadow.js';
 const DEBUG = process.env.PREEMPTIVE_COMPACTION_DEBUG === '1';
 const DEBUG_FILE = path.join(tmpdir(), 'preemptive-compaction-debug.log');
 /**
@@ -169,8 +170,9 @@ export function createPreemptiveCompactionHook(config) {
     return {
         /**
          * PostToolUse - Check context usage after large tool outputs
+         * Returns Promise<string | null> to support active mode Jev resolution
          */
-        postToolUse: (input) => {
+        postToolUse: async (input) => {
             if (!input.tool_response) {
                 return null;
             }
@@ -213,6 +215,21 @@ export function createPreemptiveCompactionHook(config) {
             if (!usage.isWarning) {
                 return null;
             }
+            // Jev shadow judgment (point 5, context-pruning): await for active mode,
+            // fire-and-forget for shadow/off. In active mode, use Jev's action;
+            // otherwise use the heuristic.
+            let finalAction = usage.action;
+            const jevResult = await recordContextPruningShadow({
+                action: usage.action,
+                totalTokens: state.estimatedTokens,
+                candidates: [buildPruningCandidate(input.tool_name, input.tool_response)],
+                fetchFn: config?.jevFetchFn,
+            }).catch(() => undefined);
+            // In active mode with valid answer, use Jev's action instead of heuristic
+            if (jevResult && jevResult.mode === 'active' && jevResult.source === 'jev') {
+                finalAction = jevResult.answer;
+                usage.action = finalAction;
+            }
             if (!shouldShowWarning(input.session_id, config)) {
                 return null;
             }
@@ -246,6 +263,20 @@ export function createPreemptiveCompactionHook(config) {
             lastAnalysisTime.delete(input.session_id);
             return null;
         },
+    };
+}
+/**
+ * Build the metadata-only candidate summary for the Jev shadow judgment:
+ * tool name, token estimate, and a bounded first-line excerpt. The resolver
+ * bounds every string again before send/log.
+ */
+const JEV_EXCERPT_MAX_CHARS = 200;
+function buildPruningCandidate(toolName, toolResponse) {
+    const firstLine = toolResponse.split('\n', 1)[0] ?? '';
+    return {
+        tool: toolName.toLowerCase(),
+        tokens: estimateTokens(toolResponse),
+        excerpt: firstLine.slice(0, JEV_EXCERPT_MAX_CHARS),
     };
 }
 /**

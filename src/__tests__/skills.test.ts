@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { createBuiltinSkills, getBuiltinSkill, listBuiltinSkillNames, clearSkillsCache, renderBundledSkillBody } from '../features/builtin-skills/skills.js';
@@ -69,10 +69,10 @@ describe('Builtin Skills', () => {
   });
 
   describe('createBuiltinSkills()', () => {
-    it('should return correct number of skills (36 canonical + 3 aliases)', () => {
+    it('should return correct number of skills (48 canonical + 2 aliases)', () => {
       const skills = createBuiltinSkills();
-      // 39 entries: 36 canonical skills + 3 deprecated aliases (cancel-ralph, learner, psm)
-      expect(skills).toHaveLength(39);
+      // 50 entries: 48 canonical skills + 2 aliases (cancel-ralph, psm)
+      expect(skills).toHaveLength(50);
     });
 
     it('should return an array of BuiltinSkill objects', () => {
@@ -121,46 +121,59 @@ describe('Builtin Skills', () => {
   describe('Skill names', () => {
     it('should have valid skill names', () => {
       const skills = createBuiltinSkills();
+      // Surface after the 5.0.0 retirement, including debug/remember/verify
+      // which were ungated in 5.0.0.
       const expectedSkills = [
-        'ask',
         'ai-slop-cleaner',
-        'autoresearch',
+        'agent-doc-discipline',
+        'architecture-survey',
+        'ask',
+        'ask-navigator',
         'autopilot',
+        'autoresearch',
         'cancel',
         'cancel-ralph',
-        'ccg',
         'configure-notifications',
-        'deep-dive',
+        'debug',
         'deep-interview',
         'deepinit',
-        'omc-doctor',
+        'diagram',
+        'execute',
         'external-context',
+        'graph',
+        'harbor',
         'hud',
-        'skillify',
-        'learner',
-        'local-build-reminder',
-        'mcp-setup',
-        'omc-setup',
-        'omc-teams',
+        'intent',
+        'minimal-code-discipline',
+        'minimal-prose-discipline',
+        'launch',
+        'loft',
+        'map',
+        'drydock',
+        'omc-doctor',
         'omc-plan',
-        'omc-reference',
+        'omc-review',
+        'omc-setup',
+        'pr',
         'project-session-manager',
         'psm',
         'ralph',
         'ralplan',
         'release',
-        'sciomc',
+        'refit',
+        'remember',
+        'research',
         'self-improve',
-        'setup',
+        'session-flow',
         'skill',
+        'skillify',
         'team',
+        'tdd',
         'trace',
-        'ultraqa',
-        'ultrawork',
         'ultragoal',
+        'verify',
         'visual-verdict',
         'wiki',
-        'writer-memory',
       ];
 
       const actualSkillNames = skills.map((s) => s.name);
@@ -192,21 +205,6 @@ describe('Builtin Skills', () => {
       expect(listBuiltinSkillNames({ includeAliases: true })).toContain('cancel-ralph');
     });
 
-    it('exposes learner as a deprecated alias for canonical skillify', () => {
-      const skillify = getBuiltinSkill('skillify');
-      const learner = getBuiltinSkill('learner');
-
-      expect(skillify).toBeDefined();
-      expect(skillify!.aliasOf).toBeUndefined();
-      expect(skillify!.aliases).toContain('learner');
-      expect(learner).toBeDefined();
-      expect(learner!.aliasOf).toBe('skillify');
-      expect(learner!.deprecatedAlias).toBe(true);
-      expect(learner!.deprecationMessage).toContain('Use "skillify" instead');
-      expect(listBuiltinSkillNames()).toContain('skillify');
-      expect(listBuiltinSkillNames()).not.toContain('learner');
-      expect(listBuiltinSkillNames({ includeAliases: true })).toContain('learner');
-    });
   });
 
   describe('getBuiltinSkill()', () => {
@@ -215,6 +213,7 @@ describe('Builtin Skills', () => {
       expect(skill).toBeDefined();
       expect(skill?.name).toBe('autopilot');
     });
+
 
     it('should retrieve the ai-slop-cleaner skill by name', () => {
       const skill = getBuiltinSkill('ai-slop-cleaner');
@@ -231,43 +230,7 @@ describe('Builtin Skills', () => {
       expect(skill?.template).toContain('`psm.sh`');
     });
 
-    it('stages mcp-setup AskUserQuestion menus so each prompt stays within the current option limit', () => {
-      const skill = getBuiltinSkill('mcp-setup');
-      expect(skill).toBeDefined();
 
-      const template = skill!.template;
-      expect(template).toContain('no more than 3 options per question');
-
-      const blocks = template
-        .split(/AskUserQuestion(?: with [^:\n]+)?[:]?/g)
-        .slice(1)
-        .map((block) => block.split(/## Step|### Step|### For |## Custom MCP Server/)[0]);
-
-      expect(blocks.length).toBeGreaterThanOrEqual(3);
-
-      for (const block of blocks) {
-        const optionLines = block
-          .split('\n')
-          .map((line) => line.trim())
-          .filter((line) => /^\d+\. \*\*/.test(line));
-        expect(optionLines.length).toBeLessThanOrEqual(3);
-      }
-
-      expect(template).toContain('Recommended starter setup');
-      expect(template).toContain('Individual popular server');
-      expect(template).toContain('More server choices');
-      expect(template).not.toContain('5. **All of the above**');
-      expect(template).not.toContain('6. **Custom**');
-    });
-
-    it('should emphasize process-first install routing in the setup skill', () => {
-      const skill = getBuiltinSkill('setup');
-      expect(skill).toBeDefined();
-      expect(skill?.description).toContain('install/update routing');
-      expect(skill?.template).toContain('Process the request by the **first argument only**');
-      expect(skill?.template).toContain('/oh-my-claudecode:setup doctor --json');
-      expect(skill?.template).not.toContain('{{ARGUMENTS_AFTER_DOCTOR}}');
-    });
 
     it('should emphasize worktree-first guidance in project session manager skill text', () => {
       const skill = getBuiltinSkill('project-session-manager');
@@ -298,50 +261,12 @@ describe('Builtin Skills', () => {
       expect(skill?.template).toContain('single dimensional key across distinct entities, tenants, streams, or groups');
       expect(skill?.template).toContain('verification-methodology defect');
     });
-    it('should retrieve the deep-dive skill with pipeline metadata and 3-point injection', () => {
-      const skill = getBuiltinSkill('deep-dive');
+
+    it('should retrieve tdd as a canonical skill', () => {
+      const skill = getBuiltinSkill('tdd');
       expect(skill).toBeDefined();
-      expect(skill?.name).toBe('deep-dive');
-      expect(skill?.pipeline).toEqual({
-        steps: ['deep-dive', 'plan', 'autopilot'],
-        nextSkill: 'plan',
-        nextSkillArgs: '--consensus --direct',
-        handoff: '.omc/specs/deep-dive-{slug}.md',
-      });
-      // Verify 3-point injection mechanism
-      expect(skill?.template).toContain('3-Point Injection');
-      expect(skill?.template).toContain('initial_idea enrichment');
-      expect(skill?.template).toContain('codebase_context replacement');
-      expect(skill?.template).toContain('initial question queue injection');
-      // Verify per-lane critical unknowns (B3 fix)
-      expect(skill?.template).toContain('Per-Lane Critical Unknowns');
-      // Verify Lane 3 multi-entity premise audit guard (#2949)
-      expect(skill?.template).toContain('multi-entity premise/key-assumption mismatches');
-      expect(skill?.template).toContain('single dimensional key across distinct entities, tenants, streams, or groups');
-      expect(skill?.template).toContain('verification-methodology defect');
-      // Verify Lane 3 ownership-boundary classification for MOVE recommendations
-      expect(skill?.template).toContain('Lane 3 Misplacement / SoT Ownership Scope');
-      expect(skill?.template).toContain('ownership_scope');
-      expect(skill?.template).toContain('personal-config/shared-config/external/project-scoped');
-      expect(skill?.template).toContain('Cross-boundary MOVE candidates MUST have `Default? = no`');
-      // Verify pipeline handoff is fully wired (B1 fix)
-      expect(skill?.template).toContain('Skill("oh-my-claudecode:autopilot")');
-      expect(skill?.template).toContain('consensus plan as Phase 0+1 output');
-      // Verify Phase 5 workflow pre-flight guards issue/worktree-driven project guidance (#2926)
-      expect(skill?.template).toContain('Workflow Pre-Flight');
-      expect(skill?.template).toContain('issue-driven, worktree-driven, branch-first');
-      expect(skill?.template).toContain('git worktree list --porcelain');
-      expect(skill?.template).toContain('Set up issue/branch/worktree first (Recommended)');
-      expect(skill?.template).toContain('before showing execution options');
-      // Verify untrusted data guard (NB1 fix)
-      expect(skill?.template).toContain('trace-context');
-      expect(skill?.template).toContain('untrusted data');
-      // Verify state schema compatibility (B2 fix)
-      expect(skill?.template).toContain('interview_id');
-      expect(skill?.template).toContain('challenge_modes_used');
-      expect(skill?.template).toContain('ontology_snapshots');
-      expect(skill?.template).toContain('explicit weakest-dimension rationale reporting');
-      expect(skill?.template).toContain('repo-evidence citation requirement');
+      expect(skill?.name).toBe('tdd');
+      expect(skill?.aliasOf).toBeUndefined();
     });
 
 
@@ -510,6 +435,154 @@ describe('Builtin Skills', () => {
       expect(t).not.toContain('"ambiguityThreshold": 0.2,');
     });
 
+    it('preserves non-OMC hooks when fixing legacy settings hooks (issue #4277)', () => {
+      const raw = readFileSync(join(originalCwd, 'skills', 'omc-doctor', 'SKILL.md'), 'utf-8');
+      const fingerprintIndex: {
+        schemaVersion: number;
+        provenance: { algorithm: string; tagCount: number };
+        payloads: Array<{
+          path: string;
+          fingerprints: Array<{ sha256: string; tags: string[] }>;
+          workingTree?: { sha256: string; state: string };
+        }>;
+        additionalCommits: Array<{ path: string; commit: string; sha256: string }>;
+      } = JSON.parse(
+        readFileSync(join(originalCwd, 'skills', 'omc-doctor', 'node-hook-fingerprints.json'), 'utf-8'),
+      );
+      const collectNodeHookPaths = (directory: string, relativeDirectory = 'templates/hooks'): string[] =>
+        readdirSync(directory, { withFileTypes: true, encoding: 'utf8' }).flatMap((entry) => {
+          const relativePath = `${relativeDirectory}/${entry.name}`;
+          if (entry.isDirectory()) return collectNodeHookPaths(join(directory, entry.name), relativePath);
+          return entry.isFile() && entry.name.endsWith('.mjs') ? [relativePath] : [];
+        });
+      const expectedNodeHookPaths = collectNodeHookPaths(join(originalCwd, 'templates', 'hooks')).sort();
+      const indexedHashes = fingerprintIndex.payloads.flatMap(({ fingerprints, workingTree }) => [
+        ...fingerprints.map(({ sha256 }) => sha256),
+        ...(workingTree ? [workingTree.sha256] : []),
+      ]).concat(fingerprintIndex.additionalCommits.map(({ sha256 }) => sha256));
+      expect(raw).toContain('ask for explicit confirmation of that scoped change');
+      expect(raw).toContain('verify the target is a regular non-symlink file');
+      expect(raw).toContain('Create a timestamped backup beside the original with exclusive, no-follow semantics');
+      expect(raw).toContain('Give the backup permissions no broader than the source');
+      expect(raw).toContain('Write the replacement through a same-directory exclusive/no-follow temporary file and atomic replacement');
+      expect(raw).toContain('On Windows, preserve the source ACLs using platform-appropriate operations');
+      expect(raw).toContain('If the backup or replacement cannot be kept no broader than the original, leave the settings file untouched and do not apply cleanup');
+      expect(raw).toContain('every project-local settings file Claude Code may read');
+      expect(raw).toContain('Do not match other scripts merely because they are under a `hooks/` directory');
+      expect(raw).toContain('keyword-detector.sh');
+      expect(raw).toContain('persistent-mode.sh');
+      expect(raw).toContain('session-start.sh');
+      expect(raw).toContain('stop-continuation.sh');
+      expect(raw).toContain('`bash ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/silent-auto-update.sh`');
+      expect(raw).toContain('If a listed script exists, call it a duplicate only when the active plugin provides the payload\'s canonical or specifically verified equivalent handler under the registration\'s event');
+      expect(raw).toContain('standalone Node hook registrations under the active config directory');
+      expect(raw).toContain('`keyword-detector`, `persistent-mode`, `session-start`, `session-end`, `pre-tool-use`, `post-tool-use`, `post-tool-use-failure`, `code-simplifier`, or `stop-continuation`');
+      expect(raw).toContain('`.cjs` and `.js` variants are legacy too');
+      expect(raw).toContain('`node "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/keyword-detector.mjs"` is a legacy registration');
+      expect(raw).toContain('`node "%USERPROFILE%\\.claude\\hooks\\keyword-detector.mjs"`');
+      expect(raw).toContain('`%CLAUDE_CONFIG_DIR%\\hooks\\<filename>`');
+      expect(raw).toContain('with backslash separators as the same active config directory');
+      expect(raw).toContain('Before diagnosing a standalone registration as a duplicate, resolve plugin enablement with the runtime\'s precedence');
+      expect(raw).toContain('resolve plugin enablement with the runtime\'s precedence: managed and command-line settings first (read-only), then every applicable project-local settings file resolved above, then the primary working directory\'s `./.claude/settings.json`, then `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json`');
+      expect(raw).toContain('In a linked Git worktree, inspect the main checkout root\'s `.claude/settings.local.json`, not just the linked worktree\'s file');
+      expect(raw).toContain('identify the main checkout with `git worktree list --porcelain`');
+      expect(raw).toContain('On Windows, and whenever Claude Code keeps the local file beside the shared `.claude/settings.json`, inspect `.claude/settings.local.json` beside that shared settings file, including in a worktree');
+      expect(raw).toContain('Also inspect any starting-directory `.claude/settings.local.json` left by Claude Code versions before 2.1.211; Claude Code can still read it alongside the root file');
+      expect(raw).toContain('never ignore a `false` from the effective local file or fall through to a project/profile `true`');
+      expect(raw).toContain('If the main checkout root or any applicable local settings file cannot be resolved or read, treat settings and script references as inconclusive and do not remove hooks or scripts');
+      expect(raw).toContain('Include every applicable project-local file in the proposal, including main-checkout, Windows side-by-side, and legacy starting-directory files when present');
+      expect(raw).toContain('every applicable project-local `.claude/settings.local.json` path resolved above (main-checkout, Windows side-by-side, and legacy starting-directory paths where applicable)');
+      expect(raw).toContain('The first scope that explicitly mentions any supported OMC ID decides; unmentioned scopes are transparent');
+      expect(raw).toContain('The supported marketplace IDs are `oh-my-claudecode`, `oh-my-claudecode@omc`, and `oh-my-claudecode@oh-my-claudecode`');
+      expect(raw).toContain('also consider `oh-my-claudecode@inline` only after the active root\'s `.claude-plugin/plugin.json` has `"name": "oh-my-claudecode"`');
+      expect(raw).toContain('Treat that inline plugin as active for the session unless its manifest sets `"defaultEnabled": false` or an applicable settings source disables it; an explicit applicable `true` overrides the manifest default');
+      expect(raw).toContain('Within each scope, `enabledPlugins` is canonical, and legacy `plugins` is consulted only if `enabledPlugins` does not mention any supported OMC ID');
+      expect(raw).toContain('a canonical `false` overrides a stale legacy `true`, and a higher-precedence `false` overrides any lower-precedence `true`');
+      expect(raw).toContain('If applicable local sources conflict and the effective value cannot be determined, supported IDs in the winning field conflict, a relevant file is unreadable or malformed, or no effective enabled result can be established, treat plugin activity as inconclusive and do not auto-remove');
+      expect(raw).toContain('`CLAUDE_PLUGIN_ROOT` is only a locator, not proof that a plugin is enabled; an explicit effective `false` always blocks automatic removal');
+      expect(raw).toContain('| Legacy Hooks (settings.json) | OK/WARN/CRITICAL | ... |');
+      expect(raw).toContain('Inspect every hook source for the active root read-only');
+      expect(raw).toContain('the optional `.claude-plugin/plugin.json` `hooks` field accepts a path, an inline hooks object, or an array mixing paths and inline objects');
+      expect(raw).toContain('A malformed, unreadable, or unresolved declared source makes event ownership inconclusive');
+      expect(raw).toContain('A cached plugin version is insufficient');
+      expect(raw).toContain('compare its bytes or SHA-256 with the shipped OMC payload for that exact filename');
+      expect(raw).toContain('A matching name or path alone does not prove ownership');
+      expect(raw).toContain('| `session-start` | `SessionStart` |');
+      expect(raw).toContain('The active plugin must provide the canonical or specifically verified equivalent handler under the registration\'s event, and that handler must replace the payload\'s behavior');
+      expect(raw).toContain('a `session-start` script registered under `Stop` is not a duplicate even if the active plugin defines unrelated `Stop` handlers');
+      expect(raw).toContain('The tracked historical OMC Bash-hook payload fingerprints (SHA-256) are');
+      expect(raw).toContain('keyword-detector.sh`: `abe4dd5e4b16231060166264d271a51e781f08a31c6aa402b26976f9c40d424e`');
+      expect(raw).toContain('persistent-mode.sh`: `c131c6846573f0f69b6e39aed1e6db8f05279131a8976f604c1511a46f564ce5`');
+      expect(raw).toContain('session-start.sh`: `d87571c326c43cc43b6948aca661a9616faa6943cfe1d1131f482bd30f638134`');
+      expect(raw).toContain('stop-continuation.sh`: `f74deb67479c7861b0966bc959ffd3917152b8872ac83d9243a03c7cb707b51f`');
+      expect(raw).toContain('any validated retained package under `${CLAUDE_CONFIG_DIR:-~/.claude}/plugins/cache/omc/oh-my-claudecode/<version>/`');
+      expect(raw).toContain('the adjacent `node-hook-fingerprints.json` index');
+      expect(raw).toContain('exact stable release-tag provenance for every shipped Node module under `templates/hooks/**/*.mjs`, including hook helpers');
+      expect(raw).toContain('search by payload path and inspect only that block rather than loading the entire index');
+      expect(raw).toContain('Preserve these additional trusted historical `keyword-detector.mjs` fingerprints');
+      expect(raw).toContain('`22d612620f54f360797e42fe608bf7f98155b92a3b0bba187fd89e216395d65a` (`fb125b37`)');
+      expect(raw).toContain('`180fc09840baa8ada1661bcc5a13821c9ca802f43ac52cb4e517ca2cba75838a` (`387956a4`)');
+      expect(raw).toContain('`71a01806c1b0e29d8e553797de3900b7172654091980ae644d74e5e9291b8af2` (`0b46a595`)');
+      expect(fingerprintIndex.schemaVersion).toBe(1);
+      expect(fingerprintIndex.provenance.algorithm).toBe('SHA-256');
+      expect(fingerprintIndex.provenance.tagCount).toBeGreaterThan(0);
+      expect(fingerprintIndex.payloads.map(({ path }) => path)).toEqual(expectedNodeHookPaths);
+      expect(indexedHashes.length).toBeGreaterThan(0);
+      expect(indexedHashes.every((sha256) => /^[a-f0-9]{64}$/.test(sha256))).toBe(true);
+      expect(
+        fingerprintIndex.payloads.every((payload) =>
+          payload.fingerprints.every(({ tags }) => tags.length > 0),
+        ),
+      ).toBe(true);
+      expect(fingerprintIndex.additionalCommits.map(({ sha256 }) => sha256)).toEqual(
+        expect.arrayContaining([
+          '9df91d943d348dbabaaf8f517448192d32648bf64fa78edcc43b8e6bf38e6dd1',
+          'ea1dc28c226f168127156bd0d7ffe9c4cb57dc24316f24f13503e9feb6da6b37',
+        ]),
+      );
+      expect(raw).toContain('No tracked OMC payload fingerprint is available for `silent-auto-update.sh` or historical `.js`/`.cjs` variants');
+      expect(raw).toContain('If the plugin is inactive, does not provide that event, no payload or fingerprint exists');
+      expect(raw).toContain('Never run an unconditional `rm -f` based on basename');
+      expect(raw).toContain('plain direct invocation of exactly one listed file');
+      expect(raw).toContain('or the exact executable script path alone when the target has execute permission');
+      expect(raw).toContain('`$HOME/.claude/hooks/keyword-detector.sh`');
+      expect(raw).toContain('No form may include extra arguments, shell operators, or other commands');
+      expect(raw).toContain('`bash legacy.sh && run-my-check`');
+      expect(raw).toContain('report it for manual cleanup and leave the hook object unchanged');
+      expect(raw).toContain('If a composite or ambiguous command mentions a legacy path: WARN - manual cleanup required; never remove it automatically');
+      expect(raw).toContain('Match only exact listed filenames invoked with `node`');
+      expect(raw).toContain('do not match plugin-root commands or similarly named scripts in other directories');
+      expect(raw).toContain('Remove only those matching objects from their `hooks.<event>[].hooks[]` arrays');
+      expect(raw).toContain('Preserve every unmatched hook object and every matcher group that still has hooks, including user and third-party hooks');
+      expect(raw).toContain('If removing matched objects leaves a matcher group with no hooks, remove that now-empty group');
+      expect(raw).toContain('remove an event key when no groups remain and remove the top-level `"hooks"` key when no events remain');
+      expect(raw).toContain('For each affected profile-level, project-level, or project-local settings file');
+      expect(raw).toContain('Before deleting any script, inspect active session-scoped hook references in skill and subagent frontmatter, enabled plugin manifests, and settings sources');
+      expect(raw).toContain('Skill frontmatter hooks remain active for the rest of the session after invocation; subagent frontmatter hooks remain active while that subagent runs');
+      expect(raw).toContain('If active skill/subagent sources cannot be conclusively enumerated or read, leave the script in place');
+      expect(raw).toContain('If an active hook references the script, keep it until that skill or subagent is no longer active, then repeat the reference check');
+      expect(raw).toContain('Claude Code retains the current session\'s hook snapshot after a settings file is edited');
+      expect(raw).toContain('keep its script in place until the user restarts Claude Code; never delete a target in the same session that removed its settings hook');
+      expect(raw).toContain('In a later session, repeat the complete reference scan and final checks below before deleting the script');
+      expect(raw).toContain('Also enumerate every enabled or loaded plugin root, including marketplace plugins and local/inline plugins supplied through `--plugin-dir`, `--plugin-url`, or `CLAUDE_CODE_PLUGIN_DIRS`');
+      expect(raw).toContain('`${CLAUDE_CONFIG_DIR:-~/.claude}/plugins/installed_plugins.json` and its recorded install paths');
+      expect(raw).toContain('Read each plugin\'s `.claude-plugin/plugin.json` and `hooks/hooks.json` read-only');
+      expect(raw).toContain('Parse the manifest\'s optional `hooks` field as a `.json` path, an inline hooks object, or an array mixing paths and inline objects');
+      expect(raw).toContain('If any enabled/loaded plugin root, manifest, or declared hook source cannot be conclusively enumerated, resolved, or read, leave the script in place; if any source references it, leave the script in place');
+      expect(raw).toContain('The canonical event and equivalent-handler requirements from Step 2 also gate script deletion; an unrelated plugin handler under the same event cannot justify deleting a standalone payload');
+      expect(raw).toContain('The settings scan alone does not establish that no references remain; the active skill/subagent and enabled-plugin manifest scans above must also be complete and clean before deleting the target');
+      expect(raw).toContain('If any applicable project-local path, main checkout root, managed source, or command-line source cannot be resolved or inspected, if any source references the script, the user declined the relevant settings change, a file could not be updated, no shipped payload exists, or verification is inconclusive, leave the corresponding script in place');
+      expect(raw).toContain('re-check `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json`, the primary working directory\'s `.claude/settings.json`, every applicable project-local `.claude/settings.local.json` path resolved above (main-checkout, Windows side-by-side, and legacy starting-directory paths where applicable)');
+      expect(raw).toContain('Never edit managed settings or MDM/server policy');
+      expect(raw).toContain('inspect managed hook sources read-only');
+      expect(raw).toContain('/etc/claude-code/managed-settings.json');
+      expect(raw).toContain('C:\\Program Files\\ClaudeCode\\managed-settings.json');
+      expect(raw).toContain('any applicable MDM, server-managed, or command-line `--settings` sources');
+      expect(raw).toContain('no configured hook references remain in any source');
+      expect(raw).toContain('If any applicable project-local path, main checkout root, managed source, or command-line source cannot be resolved or inspected');
+      expect(raw).not.toContain('Remove the `"hooks"` section');
+    });
+
     it('ships a config-aware deep-interview SKILL.md for native skill-loader paths (issues #2723, #3030)', () => {
       const raw = readFileSync(join(originalCwd, 'skills', 'deep-interview', 'SKILL.md'), 'utf-8');
       expect(raw).toContain('Native Plugin Invocation Guard (Issue #3030)');
@@ -605,65 +678,7 @@ describe('Builtin Skills', () => {
       expect(rendered).not.toContain('"ambiguityThreshold": 0.2,');
     });
 
-    it('loads deep-dive ambiguityThreshold from deep-interview settings before state init and updates threshold copy', () => {
-      const profileDir = mkdtempSync(join(tmpdir(), 'omc-deep-dive-profile-'));
-      const projectDir = mkdtempSync(join(tmpdir(), 'omc-deep-dive-project-'));
-      tempDirs.push(profileDir, projectDir);
 
-      process.env.CLAUDE_CONFIG_DIR = profileDir;
-      writeFileSync(
-        join(profileDir, 'settings.json'),
-        JSON.stringify({ omc: { deepInterview: { ambiguityThreshold: 0.18 } } }),
-      );
-
-      mkdirSync(join(projectDir, '.claude'), { recursive: true });
-      writeFileSync(
-        join(projectDir, '.claude', 'settings.json'),
-        JSON.stringify({ omc: { deepInterview: { ambiguityThreshold: 0.11 } } }),
-      );
-
-      process.chdir(projectDir);
-      clearSkillsCache();
-
-      const skill = getBuiltinSkill('deep-dive');
-      expect(skill).toBeDefined();
-      const t = skill!.template;
-
-      expect(t).toContain('Load runtime settings');
-      expect(t).toContain('Resolve `omc.deepInterview.ambiguityThreshold` into `0.11`');
-      expect(t).toContain('"threshold": 0.11,');
-      expect(t).toContain('When ambiguity ≤ the resolved threshold for this run');
-      expect(t).toContain('Gate: ≤11% ambiguity');
-      expect(t).toContain('Interview continues until ambiguity ≤ 11%');
-      expect(t.indexOf('Load runtime settings')).toBeLessThan(
-        t.indexOf('Initialize state') ?? Number.POSITIVE_INFINITY,
-      );
-      expect(t).not.toContain('"threshold": 0.2,');
-      expect(t).not.toContain('omc.deepDive.ambiguityThreshold');
-    });
-
-    it('ships config-aware deep-dive SKILL.md using the deep-interview threshold namespace', () => {
-      const raw = readFileSync(join(originalCwd, 'skills', 'deep-dive', 'SKILL.md'), 'utf-8');
-
-      expect(raw).toContain('Load runtime settings');
-      expect(raw).toContain('Read `[$CLAUDE_CONFIG_DIR|~/.claude]/settings.json` and `./.claude/settings.json`');
-      expect(raw).toContain('Resolve `omc.deepInterview.ambiguityThreshold` into `<resolvedThreshold>`');
-      expect(raw).toContain('"threshold": <resolvedThreshold>,');
-      expect(raw).toContain('Gate: ≤<resolvedThresholdPercent> ambiguity');
-      expect(raw).toContain('Interview continues until ambiguity ≤ <resolvedThresholdPercent>');
-      expect(raw).toContain('"deepInterview":');
-      expect(raw).toContain('"ambiguityThreshold": <resolvedThreshold>');
-      expect(raw).toContain('glob `.omc/specs/deep-*.md` and `.omc/plans/*.md`');
-      expect(raw).toContain('later Round 1 interview design');
-      expect(raw).toContain('`.omc/specs/deep-dive-trace-{slug}.md`');
-      expect(raw).toContain('`.omc/specs/deep-dive-{slug}.md`');
-      expect(raw).toContain('`.omc/state/` or `state_write` for ephemeral artifacts');
-
-      expect(raw).not.toContain('omc.deepDive.ambiguityThreshold');
-      expect(raw).not.toContain('"threshold": 0.2,');
-      expect(raw).not.toContain('Gate: ≤20% ambiguity');
-      expect(raw).not.toContain('ambiguity ≤ 20%');
-    });
 
     it('renders deep-interview summary-gate hardening while preserving AskUserQuestion transport', () => {
       const skill = getBuiltinSkill('deep-interview');
@@ -771,13 +786,6 @@ describe('Builtin Skills', () => {
       expect(skill?.template).toContain('intentional brand');
     });
 
-    it('should require explicit tmux prerequisite checks for omc-teams', () => {
-      const skill = getBuiltinSkill('omc-teams');
-      expect(skill).toBeDefined();
-      expect(skill?.template).toContain('command -v tmux >/dev/null 2>&1');
-      expect(skill?.template).toContain('Do **not** say tmux is missing');
-      expect(skill?.template).toContain('tmux capture-pane -pt <pane-id> -S -20');
-    });
 
     it('should accept native Windows psmux before emitting WSL-required team guidance', () => {
       const skill = getBuiltinSkill('team');
@@ -789,25 +797,25 @@ describe('Builtin Skills', () => {
       expect(skill?.template).toContain('Only when no tmux-compatible binary is available');
     });
 
-    it('should document allowed omc-teams agent types and native team fallback', () => {
-      const skill = getBuiltinSkill('omc-teams');
+    it('documents fail-closed provider preflight instead of implicit Claude fallback', () => {
+      const skill = getBuiltinSkill('team');
       expect(skill).toBeDefined();
-      expect(skill?.template).toContain('/omc-teams` only supports **`claude`**, **`codex`**, **`gemini`**, **`antigravity`**, **`grok`**, and **`cursor`**');
-      expect(skill?.template).toContain('unsupported type such as `expert`');
-      expect(skill?.template).toContain('/oh-my-claudecode:team');
-      expect(skill?.template).toContain('Cursor workers as executor-style only');
-      expect(skill?.template).toContain('cursor-agent');
+      expect(skill?.template).toContain('Missing CLI preflight');
+      expect(skill?.template).toContain(
+        'strictly preflights only providers that are effective for its initial workers',
+      );
+      expect(skill?.template).toContain(
+        'fails before team state or multiplexer side effects are created',
+      );
+      expect(skill?.template).toContain(
+        'never silently changes a selected role to Claude when its provider is unavailable',
+      );
+      expect(skill?.template).toContain('fail closed if it is unavailable');
+      expect(skill?.template).toContain('omc doctor --team-routing');
+      expect(skill?.template).not.toContain('only when the Claude CLI is resolvable');
     });
 
-    it('should preserve the multi-repo omc-teams cwd and plan-path contract', () => {
-      const skill = getBuiltinSkill('omc-teams');
-      expect(skill).toBeDefined();
-      expect(skill?.template).toContain('shared workspace root');
-      expect(skill?.template).toContain('absolute plan path');
-      expect(skill?.template).toContain('--cwd <workspace-root>');
-      expect(skill?.template).toContain('Do not anchor the launch cwd to only the repo containing `.omc/plans/...`');
-      expect(skill?.template).toContain('single-cwd constraint');
-    });
+
 
     it('should be case-insensitive', () => {
       const skillLower = getBuiltinSkill('autopilot');
@@ -831,26 +839,30 @@ describe('Builtin Skills', () => {
     it('should return canonical skill names by default', () => {
       const names = listBuiltinSkillNames();
 
-      expect(names).toHaveLength(36);
+      expect(names).toHaveLength(48);
       expect(names).toContain('ai-slop-cleaner');
+      expect(names).toContain('minimal-code-discipline');
+      expect(names).toContain('launch');
+      expect(names).toContain('loft');
+      expect(names).toContain('harbor');
+      expect(names).toContain('drydock');
       expect(names).toContain('ask');
+      expect(names).toContain('ask-navigator');
       expect(names).toContain('autopilot');
       expect(names).toContain('autoresearch');
       expect(names).toContain('cancel');
-      expect(names).toContain('ccg');
       expect(names).toContain('configure-notifications');
-      expect(names).toContain('ralph');
+      expect(names).toContain('execute');
       expect(names).toContain('self-improve');
-      expect(names).toContain('ultrawork');
+      expect(names).toContain('session-flow');
       expect(names).toContain('ultragoal');
       expect(names).toContain('omc-plan');
-      expect(names).toContain('omc-reference');
       expect(names).toContain('deepinit');
       expect(names).toContain('release');
       expect(names).toContain('omc-doctor');
       expect(names).toContain('hud');
       expect(names).toContain('omc-setup');
-      expect(names).toContain('setup');
+      expect(names).toContain('tdd');
       expect(names).toContain('trace');
       expect(names).toContain('visual-verdict');
       expect(names).toContain('wiki');
@@ -868,11 +880,12 @@ describe('Builtin Skills', () => {
     it('should include aliases when explicitly requested', () => {
       const names = listBuiltinSkillNames({ includeAliases: true });
 
-      // swarm alias removed in #1131; cancel-ralph, psm, and learner aliases still exist
-      expect(names).toHaveLength(39);
+      // swarm alias removed in #1131; learner retired in 5.0.0; cancel-ralph and psm remain
+      expect(names).toHaveLength(50);
       expect(names).toContain('ai-slop-cleaner');
       expect(names).toContain('autoresearch');
       expect(names).toContain('self-improve');
+      expect(names).toContain('tdd');
       expect(names).toContain('trace');
       expect(names).toContain('ultragoal');
       expect(names).toContain('visual-verdict');
@@ -880,7 +893,6 @@ describe('Builtin Skills', () => {
       expect(names).not.toContain('swarm');
       expect(names).toContain('cancel-ralph');
       expect(names).toContain('psm');
-      expect(names).toContain('learner');
     });
   });
 
@@ -907,15 +919,19 @@ describe('Builtin Skills', () => {
   });
 
   describe('skininthegamebros-only builtin skills', () => {
-    it('keeps skininthegamebros-only skills hidden by default while skillify remains public', () => {
+    it('exposes remember/verify/debug to every user (ungated in 5.0.0)', () => {
+      process.env.USER_TYPE = '';
+      clearSkillsCache();
       const names = listBuiltinSkillNames({ includeAliases: true });
-      expect(names).not.toContain('remember');
-      expect(names).not.toContain('verify');
-      expect(names).not.toContain('debug');
+      // verify is a canonical Tier-0 workflow and remember is the retirement
+      // target for learner/writer-memory, so neither may be entitlement-gated.
+      expect(names).toContain('remember');
+      expect(names).toContain('verify');
+      expect(names).toContain('debug');
       expect(names).toContain('skillify');
     });
 
-    it('surfaces skininthegamebros-only skills when USER_TYPE=ant', () => {
+    it('exposes the same skill set when USER_TYPE=ant (entitlement set is empty)', () => {
       process.env.USER_TYPE = 'ant';
       clearSkillsCache();
 

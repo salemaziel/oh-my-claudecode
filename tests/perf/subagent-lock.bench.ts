@@ -2,14 +2,16 @@
  * Benchmark: subagent-tracking RMW latency under no contention.
  *
  * Measures per-update wall time for sequential updates. Local Linux keeps the
- * strict p99 <= 8ms guard; CI runners use repeated samples and a wider p99
+ * strict p99 <= 8ms guard; CI runners use repeated samples and a wider p50/p95
  * envelope so an isolated scheduler/filesystem stall does not fail dev, while
- * still catching sustained lock slowdowns and hangs.
+ * still catching sustained lock slowdowns and hangs (median-p50, median-p95,
+ * and second-highest-p99 ceilings). GitHub-hosted runners routinely sustain ~23-31ms p50
+ * / ~30-32ms p99 on a healthy path, so the CI ceilings sit above that band.
  */
 
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { performance } from "perf_hooks";
-import { mkdirSync, rmSync } from "fs";
+import { mkdirSync, readFileSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import {
@@ -17,15 +19,22 @@ import {
   executeFlush,
   type SubagentTrackingState,
 } from "../../src/hooks/subagent-tracker/index.js";
+import {
+  clearWorktreeCache,
+  resolveSessionStatePaths,
+} from "../../src/lib/worktree-paths.js";
 
 const N = 100;
+const TRACKING_STATE_NAME = "subagent-tracking";
 const WARMUP_RUNS = 1;
 const MEASURED_RUNS = 5;
 const LOCAL_P99_LIMIT_MS = 8;
-const CI_MEDIAN_P50_LIMIT_MS = 8;
-const CI_MEDIAN_P99_LIMIT_MS = 25;
-const CI_MEDIAN_P99_JITTER_MARGIN_MS = 5;
-const CI_MAX_P99_LIMIT_MS = 100;
+// CI ceilings sit above noisy GitHub-hosted runners (observed p95 ~75ms on
+// tag-publish, second-highest p99 ~123ms on PR Test). Median p50/p95 still
+// catch sustained slowdowns. Strict 8ms p99 is local-only. See #3352.
+const CI_MEDIAN_P50_LIMIT_MS = 80;
+const CI_MEDIAN_P95_LIMIT_MS = 90;
+const CI_SECOND_HIGHEST_P99_LIMIT_MS = 150;
 const isCi = process.env.CI === "true" || process.env.CI === "1";
 
 function makeEmptyState(): SubagentTrackingState {
@@ -65,8 +74,16 @@ function median(values: number[]): number {
   return percentile(sorted, 50);
 }
 
+function secondHighest(values: number[]): number {
+  const sorted = values.slice().sort((a, b) => a - b);
+  return sorted[Math.max(0, sorted.length - 2)] ?? 0;
+}
+
 describe("subagent-lock benchmark", () => {
   const dirs: string[] = [];
+  beforeEach(() => {
+    clearWorktreeCache();
+  });
 
   afterEach(() => {
     flushPendingWrites();
@@ -74,6 +91,7 @@ describe("subagent-lock benchmark", () => {
       try { rmSync(d, { recursive: true, force: true }); } catch { /* ignore */ }
     }
     dirs.length = 0;
+    clearWorktreeCache();
   });
 
   function makeTempDir(): string {
@@ -82,6 +100,31 @@ describe("subagent-lock benchmark", () => {
     mkdirSync(join(dir, ".omc", "state"), { recursive: true });
     dirs.push(dir);
     return dir;
+  }
+
+  function assertPersistedRun(
+    dir: string,
+    sessionId: string,
+    expectedAgents: number,
+  ): void {
+    const statePath = resolveSessionStatePaths(
+      TRACKING_STATE_NAME,
+      sessionId,
+      dir,
+    ).effectiveWrite;
+    const persisted = JSON.parse(
+      readFileSync(statePath, "utf8"),
+    ) as SubagentTrackingState;
+    const actualAgentIds = persisted.agents
+      .map((agent) => agent.agent_id)
+      .sort();
+    const expectedAgentIds = Array.from(
+      { length: expectedAgents },
+      (_value, index) => `agent-${index}`,
+    ).sort();
+
+    expect(persisted.total_spawned).toBe(expectedAgents);
+    expect(actualAgentIds).toEqual(expectedAgentIds);
   }
 
   /**
@@ -104,10 +147,14 @@ describe("subagent-lock benchmark", () => {
 
       const t0 = performance.now();
       // executeFlush does the full RMW critical section under lock
-      executeFlush(dir, state, sessionId);
+      const succeeded = executeFlush(dir, state, sessionId);
       const elapsed = performance.now() - t0;
+      expect(succeeded, `locked RMW update ${i} must succeed`).toBe(true);
       samples.push(elapsed);
     }
+
+    // Persistence validation is intentionally outside every timed interval.
+    assertPersistedRun(dir, sessionId, N);
 
     return samples.slice().sort((a, b) => a - b);
   }
@@ -125,33 +172,70 @@ describe("subagent-lock benchmark", () => {
     return summaries;
   }
 
+  it("keeps one isolated run out of the CI tail guard while retaining repeated-tail detection", () => {
+    expect(secondHighest([1, 2, 3, 4, 101])).toBe(4);
+    expect(secondHighest([1, 2, 3, 101, 102])).toBe(101);
+  });
+
+  it("rejects a successful flush when the expected state was not persisted", () => {
+    const dir = makeTempDir();
+    const sessionId = `bench-write-failure-${Date.now()}`;
+    const statePath = resolveSessionStatePaths(
+      TRACKING_STATE_NAME,
+      sessionId,
+      dir,
+    ).effectiveWrite;
+    mkdirSync(statePath, { recursive: true });
+
+    const state = makeEmptyState();
+    state.agents.push({
+      agent_id: "agent-0",
+      agent_type: "oh-my-claudecode:executor",
+      started_at: new Date().toISOString(),
+      parent_mode: "ultrawork",
+      status: "running",
+      task_description: "write-failure",
+    });
+    state.total_spawned = 1;
+
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(executeFlush(dir, state, sessionId)).toBe(true);
+      expect(() => assertPersistedRun(dir, sessionId, 1)).toThrow();
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
   // Linux hard assertion with CI-noise-tolerant aggregation.
   it.runIf(process.platform === "linux")(
     `sequential locked updates stay within Linux latency guardrails`,
     () => {
       const summaries = runMeasuredBenchmarks();
       const p50s = summaries.map((summary) => summary.p50);
+      const p95s = summaries.map((summary) => summary.p95);
       const p99s = summaries.map((summary) => summary.p99);
       const medianP50 = median(p50s);
+      const medianP95 = median(p95s);
       const medianP99 = median(p99s);
-      const maxP99 = Math.max(...p99s);
-      const ciMedianP99Limit = CI_MEDIAN_P99_LIMIT_MS + CI_MEDIAN_P99_JITTER_MARGIN_MS;
+      const secondHighestP99 = secondHighest(p99s);
 
       console.log(
         `[subagent-lock bench] Linux CI=${isCi} N=${N} measuredRuns=${MEASURED_RUNS}` +
-        ` medianP50=${medianP50.toFixed(3)}ms medianP99=${medianP99.toFixed(3)}ms` +
-        ` ciMedianP99Limit=${ciMedianP99Limit}ms maxP99=${maxP99.toFixed(3)}ms` +
+        ` medianP50=${medianP50.toFixed(3)}ms medianP95=${medianP95.toFixed(3)}ms` +
+        ` medianP99=${medianP99.toFixed(3)}ms secondHighestP99=${secondHighestP99.toFixed(3)}ms` +
         ` p99s=${p99s.map((p99) => p99.toFixed(3)).join(",")}`,
       );
 
       if (isCi) {
         // GitHub-hosted runners can occasionally pause filesystem lock RMW by
         // a few milliseconds even when the sustained path is healthy. Keep the
-        // historical 25ms target plus a narrow jitter margin for median p99,
-        // while median p50 and max-p99 still catch sustained slowdowns/hangs.
+        // Median p50/p95 retain sensitivity to sustained slowdowns, while the
+        // second-highest p99 catches repeated severe stalls without letting a
+        // handful of scheduler pauses dominate every per-run p99.
         expect(medianP50).toBeLessThanOrEqual(CI_MEDIAN_P50_LIMIT_MS);
-        expect(medianP99).toBeLessThanOrEqual(ciMedianP99Limit);
-        expect(maxP99).toBeLessThanOrEqual(CI_MAX_P99_LIMIT_MS);
+        expect(medianP95).toBeLessThanOrEqual(CI_MEDIAN_P95_LIMIT_MS);
+        expect(secondHighestP99).toBeLessThanOrEqual(CI_SECOND_HIGHEST_P99_LIMIT_MS);
       } else {
         expect(medianP99).toBeLessThanOrEqual(LOCAL_P99_LIMIT_MS);
       }

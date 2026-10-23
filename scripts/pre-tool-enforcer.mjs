@@ -6,19 +6,23 @@
  * Cross-platform: Windows, macOS, Linux
  */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'fs';
+import { closeSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, writeFileSync } from 'fs';
 import { createHash } from 'crypto';
 import { dirname, join, resolve, basename } from 'path';
 import { homedir } from 'os';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { getClaudeConfigDir } from './lib/config-dir.mjs';
 import { encodeProjectPath } from './lib/encode-project-path.mjs';
 import { evaluateAgentHeavyPreflight } from './lib/pre-tool-enforcer-preflight.mjs';
 import { evaluateForceAgentDelegation } from './lib/force-agent-delegation-preflight.mjs';
-import { resolveOmcStateRoot } from './lib/state-root.mjs';
+import { evaluateReadBudget } from './lib/read-budget-preflight.mjs';
+import { resolveOmcStateRoot, resolveSessionStatePathsForHook } from './lib/state-root.mjs';
 import { readStdin } from './lib/stdin.mjs';
 import { resolveConfiguredAgentModel } from './lib/agent-model-config.mjs';
+import { BOUNDED_GIT_TIMEOUT_MS } from './lib/bounded-git-timeout.mjs';
+import { isSkillVisibleToUser } from './lib/skill-entitlements.mjs';
+import { isJevShadowOptedIn, recordJevShadow } from './lib/jev-shadow.mjs';
 
 // Inlined from src/config/models.ts — avoids a dist/ import so the hook works
 // before a build and stays consistent with the TypeScript source.
@@ -163,6 +167,266 @@ function readAgentDefinitionModel(subagentType) {
     return null;
   }
 }
+// ---------------------------------------------------------------------------
+// Skill vs agent namespace guard (issue #3667)
+//
+// Task/Agent subagent_type identifiers and bundled skills share the same
+// `oh-my-claudecode:` namespace, so a caller can hand a skill name to
+// Task(subagent_type=...) and receive only Claude Code's generic native
+// "Agent type not found". OMC owns both registries (agents/*.md and
+// skills/*/SKILL.md), so the PreToolUse hook denies the call BEFORE the
+// native boundary with an error that names the Skill tool and the exact
+// identifier, and forbids closest-match substitution.
+// ---------------------------------------------------------------------------
+
+const SKILL_AGENT_NAMESPACE_PREFIXES = ['oh-my-claudecode:', 'omc:'];
+const SKILL_IDENTIFIER_PATTERN = /^[a-zA-Z0-9_-]+$/;
+
+function splitAgentNamespace(subagentType) {
+  const folded = subagentType.toLowerCase();
+  for (const prefix of SKILL_AGENT_NAMESPACE_PREFIXES) {
+    if (folded.startsWith(prefix.toLowerCase())) {
+      return { name: subagentType.slice(prefix.length), namespaced: true };
+    }
+  }
+  return { name: subagentType, namespaced: false };
+}
+
+function getPluginAgentDirs() {
+  const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT;
+  const scriptAgentsDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'agents');
+  return pluginRoot ? [join(pluginRoot, 'agents'), scriptAgentsDir] : [scriptAgentsDir];
+}
+
+function getPluginSkillsDirs() {
+  const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT;
+  const scriptSkillsDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'skills');
+  return pluginRoot ? [join(pluginRoot, 'skills'), scriptSkillsDir] : [scriptSkillsDir];
+}
+
+/**
+ * Whether an agent definition resolves for the given identifier.
+ * Namespaced identifiers (oh-my-claudecode:X / omc:X) resolve only against
+ * plugin agents; bare identifiers resolve through the full native chain
+ * (plugin, project .claude/agents, user config agents). A real agent always
+ * wins over a bundled skill with the same name (collision rule).
+ */
+function agentDefinitionExists(agentType, directory, namespaced) {
+  const agentDirs = getPluginAgentDirs();
+  if (!namespaced) {
+    agentDirs.push(join(directory, '.claude', 'agents'));
+    agentDirs.push(join(getClaudeConfigDir(), 'agents'));
+  }
+  return agentDirs.some((agentsDir) => existsSync(join(agentsDir, `${agentType}.md`)));
+}
+
+/**
+ * Extract the primary `name` and raw alias list from a bundled SKILL.md YAML
+ * frontmatter block. Mirrors readAgentDefinitionModel's frontmatter
+ * extraction: only the first `--- ... ---` block is inspected, so `name:`
+ * lines in the skill body cannot create false matches.
+ */
+function parseSkillFrontmatterIdentifiers(content) {
+  const fmMatch = content.match(/^---[\r\n]+([\s\S]*?)[\r\n]+---/);
+  if (!fmMatch) return { aliases: [], primary: null };
+  const fm = fmMatch[1];
+  const nameMatch = fm.match(/^name:\s*(\S+)/m);
+  const primary = nameMatch ? nameMatch[1].trim().replace(/^["']|["']$/g, '') : null;
+  const aliasMatch = fm.match(/^aliases:\s*(.+)$/m);
+  const aliases = [];
+  if (aliasMatch) {
+    const raw = aliasMatch[1].trim();
+    const tokens = raw.startsWith('[')
+      ? raw.slice(1, raw.indexOf(']') === -1 ? raw.length : raw.indexOf(']')).split(',')
+      : [raw.split(/\s+/)[0]];
+    for (const token of tokens) {
+      const clean = token.trim().replace(/^["']|["']$/g, '');
+      if (clean) aliases.push(clean);
+    }
+  }
+  return { aliases, primary };
+}
+
+/**
+ * Claude Code native command names that must not be shadowed by OMC skill
+ * short names. Mirrors src/features/builtin-skills/skills.ts:CC_NATIVE_COMMANDS
+ * and toSafeSkillName (plan -> omc-plan).
+ */
+const CC_NATIVE_SKILL_COMMANDS = new Set([
+  'review',
+  'plan',
+  'security-review',
+  'init',
+  'doctor',
+  'help',
+  'config',
+  'clear',
+  'compact',
+  'memory',
+]);
+
+function toSafeSkillName(name) {
+  const normalized = name.trim();
+  return CC_NATIVE_SKILL_COMMANDS.has(normalized.toLowerCase()) ? `omc-${normalized}` : normalized;
+}
+/**
+ * Whether a bundled skill directory is visible to the current user, mirroring
+ * loadSkillsFromDirectory's entitlement filter. Hidden skills must never be
+ * suggested as invocable, even when their directory exists on disk.
+ */
+let cachedCanonicalSkillRegistry = null;
+
+/**
+ * Build the canonical bundled-skill registry exactly like the runtime loader
+ * (src/features/builtin-skills/skills.ts loadSkillsFromDirectory +
+ * loadSkillFromFile):
+ * - `skillify` sorts first so it claims its deprecated alias `learner` before
+ *   the legacy skills/learner directory is seen;
+ * - primary names and aliases are normalized with toSafeSkillName;
+ * - the first claim of a name wins (seenNames dedup), so a directory whose
+ *   name is claimed as another skill's alias is not registered under its own
+ *   name.
+ * Returns Map<lowercaseName, primaryName>.
+ */
+function buildCanonicalSkillRegistry() {
+  if (cachedCanonicalSkillRegistry) return cachedCanonicalSkillRegistry;
+  const registry = new Map();
+  for (const skillsDir of getPluginSkillsDirs()) {
+    let entries = [];
+    try {
+      entries = readdirSync(skillsDir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    entries.sort((a, b) => {
+      if (a.name === 'skillify') return -1;
+      if (b.name === 'skillify') return 1;
+      return a.name.localeCompare(b.name);
+    });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      // Entitlement filter: hidden skills are not registered for this user.
+      if (!isSkillVisibleToUser(entry.name)) continue;
+      const skillPath = join(skillsDir, entry.name, 'SKILL.md');
+      if (!existsSync(skillPath)) continue;
+      let parsed;
+      try {
+        parsed = parseSkillFrontmatterIdentifiers(readFileSync(skillPath, 'utf-8'));
+      } catch {
+        continue;
+      }
+      const primary = toSafeSkillName(parsed.primary || entry.name);
+      const allNames = [primary, ...parsed.aliases.map(toSafeSkillName)];
+      for (const candidate of allNames) {
+        const key = candidate.toLowerCase();
+        if (registry.has(key)) continue;
+        registry.set(key, primary);
+      }
+    }
+  }
+  cachedCanonicalSkillRegistry = registry;
+  return registry;
+}
+
+/**
+ * Resolve a Task/Agent subagent_type against the bundled skill registry.
+ * Returns { primary } when the identifier names a bundled skill (exact match
+ * only — no fuzzy/closest-match substitution), or null otherwise.
+ *
+ * Canonical registry precedence wins before any directory shortcut: a name
+ * claimed as a deprecated alias (e.g. `learner` owned by `skillify`) resolves
+ * to its canonical primary even when a directory with the same name exists
+ * (skills/learner).
+ *
+ * Bare (un-namespaced) identifiers are denied ONLY on canonical registry
+ * claims. The directory shortcut would otherwise mistake legitimate runtime
+ * agents for skills: Claude Code's built-in `Plan` agent and session-defined
+ * agents are not visible to file-based plugin/project/user agent discovery,
+ * yet `skills/plan` exists (registering `omc-plan`). Bare names therefore
+ * never consult the directory shortcut; explicitly namespaced identifiers
+ * (`oh-my-claudecode:` / `omc:`) are pinned to the OMC plugin namespace and
+ * keep the full canonical + shortcut resolution (e.g. `oh-my-claudecode:plan`
+ * -> `omc-plan`).
+ */
+function resolveBundledSkill(subagentType, directory) {
+  const { name, namespaced } = splitAgentNamespace(subagentType);
+  if (!SKILL_IDENTIFIER_PATTERN.test(name)) return null;
+  // Case-fold once, before every check: registry, alias, visibility, and
+  // filesystem lookups must agree even on case-insensitive filesystems
+  // (Windows/macOS), where a case-variant identifier resolves the same dir.
+  const foldedName = name.toLowerCase();
+  // A real agent definition wins over a skill with the same name.
+  if (agentDefinitionExists(foldedName, directory, namespaced)) return null;
+  // Canonical registry first: covers primaries and aliases (incl. collisions
+  // like learner -> skillify, cancel-ralph -> cancel).
+  const canonicalPrimary = buildCanonicalSkillRegistry().get(foldedName);
+  if (canonicalPrimary) return { primary: canonicalPrimary };
+  // Bare identifiers stop here: the directory shortcut is reserved for the
+  // pinned plugin namespace so native/session-defined agents (e.g. `Plan`)
+  // are never denied (issue #3667 P1).
+  if (!namespaced) return null;
+  // Directory shortcut fallback only for names the canonical registry does not
+  // claim (e.g. the plan/ dir whose frontmatter registers as omc-plan).
+  // Fail closed: a directory that is hidden from this user must never be
+  // suggested as an invocable bundled skill, even though it exists on disk.
+  if (!isSkillVisibleToUser(foldedName)) return null;
+  for (const skillsDir of getPluginSkillsDirs()) {
+    const directPath = join(skillsDir, foldedName, 'SKILL.md');
+    if (existsSync(directPath)) {
+      let primary = foldedName;
+      try {
+        const parsed = parseSkillFrontmatterIdentifiers(readFileSync(directPath, 'utf-8'));
+        if (parsed.primary) primary = parsed.primary;
+      } catch {
+        // Keep the directory name when the file cannot be parsed.
+      }
+      return { primary: toSafeSkillName(primary) };
+    }
+  }
+  return null;
+}
+
+/**
+ * Preflight contract for #3667: when a Task/Agent call names a bundled skill
+ * as its subagent_type, deny the call with a precise, non-substitutable error
+ * that names the Skill tool and the correct identifier.
+ */
+function evaluateSkillAsAgentCall(toolName, toolInput, directory) {
+  if (!toolInput || typeof toolInput !== 'object') return null;
+  const rawSubagentType = toolInput.subagent_type;
+  if (typeof rawSubagentType !== 'string') return null;
+  const subagentType = rawSubagentType.trim();
+  if (subagentType.length === 0) return null;
+
+  const skill = resolveBundledSkill(subagentType, directory);
+  if (!skill) return null;
+
+  const { name } = splitAgentNamespace(subagentType);
+  // Always suggest the canonical plugin-namespaced identifier. A bare skill
+  // name can resolve to a different project/user skill or fail: bundled
+  // skills are exposed under the `oh-my-claudecode:` namespace (issue #3667
+  // review), so the recovery must be unambiguous regardless of the caller's
+  // input namespace form.
+  const skillIdentifier = `oh-my-claudecode:${skill.primary}`;
+  const isPrimaryMatch = name.toLowerCase() === skill.primary.toLowerCase();
+  const queriedName = isPrimaryMatch
+    ? `"${subagentType}"`
+    : `"${subagentType}" (alias of "${skill.primary}")`;
+  const reason =
+    `[SKILL vs AGENT] ${queriedName} is a Skill, not an agent. ` +
+    `Do NOT call it via ${toolName}(subagent_type=...) — that subagent type does not exist, ` +
+    `and Claude Code will fail the call with a generic "Agent type not found". ` +
+    `Use the Skill tool instead: Skill(skill="${skillIdentifier}"). ` +
+    `Do NOT substitute a similarly-named agent as a "closest match".`;
+  return {
+    continue: true,
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'deny',
+      permissionDecisionReason: reason,
+    },
+  };
+}
 
 
 const SLOP_RISK_TOOL_NAMES = new Set([
@@ -290,6 +554,97 @@ function shouldWarnForSlopFallbackLanguage(data, toolName, inspectedText) {
   return hasSlopFallbackActionShape(inspectedText);
 }
 
+// --- Jev script-side shadow points ---
+
+const SLOP_WARNING_QUESTIONS = {
+  slop_advisory: {
+    type: 'noul',
+    instructions: 'Does this tool input contain fallback/workaround language worth an advisory warning?',
+    criteria: {
+      'true': 'Contains fallback/workaround phrasing outside doc or self-referential context',
+      'false': 'No advisory-worthy language',
+    },
+  },
+};
+
+const MODEL_ROUTING_QUESTIONS = {
+  'model-tier': {
+    type: 'choice',
+    instructions: 'Which model tier should this delegated task use?',
+    criteria: {
+      haiku: 'Quick lookups and lightweight, mechanical work',
+      sonnet: 'Standard coding and orchestration work',
+      opus: 'Complex architecture and deep analysis',
+    },
+  },
+};
+
+function recordSlopWarningShadow(toolName, toolInput, warned, permissionMode) {
+  recordJevShadow({
+    point: 'slop-warning',
+    state: { toolName, toolInput },
+    questions: SLOP_WARNING_QUESTIONS,
+    heuristic: warned,
+    permissionMode,
+  });
+}
+
+const MODEL_ROUTING_METADATA_MAX_CHARS = 500;
+
+function boundModelRoutingInput(toolInput) {
+  const bounded = {};
+  for (const key of ['description', 'prompt', 'subagent_type', 'model', 'resume']) {
+    if (typeof toolInput[key] === 'string') {
+      bounded[key] = toolInput[key].slice(0, MODEL_ROUTING_METADATA_MAX_CHARS);
+    }
+  }
+  if (typeof toolInput.run_in_background === 'boolean') {
+    bounded.run_in_background = toolInput.run_in_background;
+  }
+  return bounded;
+}
+
+function recordModelRoutingShadow(toolName, toolInput, updatedToolInput, permissionMode) {
+  if (!isJevShadowOptedIn('model-routing', process.env, permissionMode)) return;
+
+  const originalInput = boundModelRoutingInput(toolInput);
+  const modifiedInput = boundModelRoutingInput(updatedToolInput || toolInput);
+  const selectedModel = modifiedInput.model || readAgentDefinitionModel(originalInput.subagent_type);
+  const model = isTierAlias(selectedModel) ? selectedModel.toLowerCase() : normalizeToCcAlias(selectedModel);
+  if (!['haiku', 'sonnet', 'opus'].includes(model)) return;
+  
+  const heuristic = {
+    originalInput,
+    modifiedInput,
+    injected: Boolean(updatedToolInput),
+    model,
+  };
+  
+  const jevResult = recordJevShadow({
+    point: 'model-routing',
+    state: {
+      tool_name: toolName,
+      subagent_type: originalInput.subagent_type || '',
+      task: originalInput.prompt || '',
+    },
+    questions: MODEL_ROUTING_QUESTIONS,
+    heuristic,
+    permissionMode,
+  });
+  
+  // In active mode with valid answer, update the toolInput model to Jev's choice
+  if (jevResult && jevResult.mode === 'active' && jevResult.answer) {
+    const jevChoice = jevResult.answer.choice?.toLowerCase();
+    if (jevChoice && ['haiku', 'sonnet', 'opus'].includes(jevChoice)) {
+      // Jev says use this tier; update the tool input
+      if (!updatedToolInput) updatedToolInput = { ...toolInput };
+      updatedToolInput.model = jevChoice;
+    }
+  }
+  
+  return updatedToolInput;
+}
+
 function generateSlopWarning(data, toolName) {
   const toolInput = data.toolInput || data.tool_input || {};
   const promptLikeFields = {
@@ -301,7 +656,9 @@ function generateSlopWarning(data, toolName) {
   const inspectedText = collectStringValues(toolInput)
     .concat(collectStringValues(promptLikeFields))
     .join('\n');
-  if (!shouldWarnForSlopFallbackLanguage(data, toolName, inspectedText)) return '';
+  const warned = shouldWarnForSlopFallbackLanguage(data, toolName, inspectedText);
+  recordSlopWarningShadow(toolName, data.toolInput || data.tool_input || {}, warned, data.permission_mode);
+  if (!warned) return '';
 
   return '[SLOP WARNING] Detected fallback/workaround language in this tool input. ' +
     'Do not make potential slop: avoid ad-hoc fallback layers, workaround shims, or environment-specific patches unless explicitly justified. ' +
@@ -409,8 +766,6 @@ const MODE_STATE_FILES = [
   'ultrapilot-state.json',
   'ralph-state.json',
   'ultragoal-state.json',
-  'ultrawork-state.json',
-  'ultraqa-state.json',
   'pipeline-state.json',
   'team-state.json',
   'omc-teams-state.json',
@@ -476,11 +831,12 @@ function resolveOmcRoot(startDir) {
 
   // 3) git rev-parse --show-toplevel
   try {
-    const top = execSync('git rev-parse --show-toplevel', {
+    const top = execFileSync('git', ['rev-parse', '--show-toplevel'], {
       cwd: dir,
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
-      timeout: 5000,
+      timeout: BOUNDED_GIT_TIMEOUT_MS,
+      windowsHide: true,
     }).trim();
     if (top) return join(top, '.omc');
   } catch {
@@ -512,19 +868,23 @@ function resolveTranscriptPath(transcriptPath, cwd) {
 
   const effectiveCwd = cwd || process.cwd();
   try {
-    const gitCommonDir = execSync('git rev-parse --git-common-dir', {
+    const gitCommonDir = execFileSync('git', ['rev-parse', '--git-common-dir'], {
       cwd: effectiveCwd,
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: BOUNDED_GIT_TIMEOUT_MS,
+      windowsHide: true,
     }).trim();
 
     const absoluteCommonDir = resolve(effectiveCwd, gitCommonDir);
     const mainRepoRoot = dirname(absoluteCommonDir);
 
-    const worktreeTop = execSync('git rev-parse --show-toplevel', {
+    const worktreeTop = execFileSync('git', ['rev-parse', '--show-toplevel'], {
       cwd: effectiveCwd,
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: BOUNDED_GIT_TIMEOUT_MS,
+      windowsHide: true,
     }).trim();
 
     if (mainRepoRoot !== worktreeTop) {
@@ -558,16 +918,66 @@ function extractJsonField(input, field, defaultValue = '') {
   }
 }
 
-// Get agent tracking info from state file
-function getAgentTrackingInfo(stateDir) {
-  const trackingFile = join(stateDir, 'subagent-tracking.json');
+// Get agent tracking info from state file.
+// Path resolution is owned by the canonical resolveSessionStatePathsForHook()
+// helper (validation/migration-aware, session-scoped-first read with legacy
+// fallback), so this reader cannot drift from the other OmC consumers again.
+// Issue #3732: the pre-fix manual path construction read legacy-only while
+// post-tool-verifier::getAgentCompletionSummary read session-scoped first,
+// producing contradicting agent counts for the same session.
+//
+// Name note: the canonical resolver normalizes `subagent-tracking` to
+// `<stateDir>/sessions/<sid>/subagent-tracking-state.json` (Wave-A layout) with
+// read fallback to `<stateDir>/subagent-tracking-state.json`. When the
+// session-scoped file exists but is malformed, the canonical legacy file for
+// the same name is probed explicitly (never skipped). The pre-Wave-A legacy
+// file was plain `subagent-tracking.json` (still read by
+// session-end/post-tool-verifier and written by pre-Wave-A installs), so after
+// the canonical probe finds nothing the plain legacy filename is read
+// directly. When no sessionId is observable only the two legacy filenames are
+// probed.
+async function getAgentTrackingInfo(stateDir, directory, sessionId = '') {
+  // The session id arrives from the hook payload and is influenceable, so it
+  // is validated against the canonical allowlist BEFORE any scoped resolution.
+  // An invalid id must skip every session-scoped candidate and only probe the
+  // safe legacy roots: the canonical resolver would throw on it, and the
+  // unvalidated path would let a payload like `../evil` escape the sessions
+  // directory and read unrelated state (issue #3732 review).
+  const safeSessionId = isValidSessionId(sessionId) ? sessionId : '';
+  const candidates = [];
   try {
-    if (existsSync(trackingFile)) {
-      const data = JSON.parse(readFileSync(trackingFile, 'utf-8'));
-      const running = (data.agents || []).filter(a => a.status === 'running').length;
-      return { running, total: data.total_spawned || 0 };
-    }
+    // Session-scoped effective read for the canonical state name (scoped-first
+    // with canonical-legacy read fallback).
+    const { readPath } = await resolveSessionStatePathsForHook(directory, 'subagent-tracking', safeSessionId || undefined);
+    candidates.push(readPath);
+    // Explicit canonical legacy read: when the session-scoped file exists but
+    // is malformed the effective read above points at it, and without this
+    // probe the valid <stateDir>/subagent-tracking-state.json would be
+    // silently skipped. The canonical legacy file is probed even when no
+    // session id is observable (issue #3732 review). Both reads stay owned by
+    // the canonical resolver — never the suffixed `subagent-tracking.json`
+    // state name, which the resolver would corrupt into `-state.json`.
+    const legacy = await resolveSessionStatePathsForHook(directory, 'subagent-tracking', undefined);
+    if (legacy.readPath !== readPath) candidates.push(legacy.readPath);
   } catch {}
+  // Pre-Wave-A legacy filename, read directly (outside the canonical naming
+  // scheme) so old installs keep working. resolveSessionStatePathsForHook
+  // appends `-state.json`, which would corrupt a name that already ends in
+  // `.json`, hence the direct join here under the resolved state root.
+  candidates.push(join(stateDir, 'subagent-tracking.json'));
+
+  for (const trackingFile of candidates) {
+    const data = readJsonFile(trackingFile);
+    // Shape-validate per candidate: a parseable file with a non-array `agents`
+    // field is a malformed candidate, never a reason to abort the whole hook
+    // (which would drop the spawn advisory and any configured model injection).
+    // Skip it and continue with the next canonical/legacy candidate.
+    if (!data || typeof data !== 'object' || Array.isArray(data) || !Array.isArray(data.agents)) {
+      continue;
+    }
+    const running = data.agents.filter(a => a && typeof a === 'object' && a.status === 'running').length;
+    return { running, total: data.total_spawned || 0 };
+  }
   return { running: 0, total: 0 };
 }
 
@@ -636,6 +1046,25 @@ const ULTRAGOAL_TERMINAL_PHASES = new Set([
   'canceled',
   'aborted',
 ]);
+
+const AWAITING_CONFIRMATION_TTL_MS = 2 * 60 * 1000;
+
+function isAwaitingConfirmation(state) {
+  if (!state || state.awaiting_confirmation !== true) return false;
+
+  const preferred = state.awaiting_confirmation_set_at;
+  const timestamp = typeof preferred === 'string' && preferred.trim()
+    ? preferred
+    : typeof state.started_at === 'string' && state.started_at.trim()
+      ? state.started_at
+      : null;
+  if (!timestamp) return false;
+
+  const timestampMs = new Date(timestamp).getTime();
+  const ageMs = Date.now() - timestampMs;
+  return Number.isFinite(ageMs) && ageMs >= 0 && ageMs < AWAITING_CONFIRMATION_TTL_MS;
+}
+
 
 function isStaleModeState(state) {
   if (!state || typeof state !== 'object') return true;
@@ -713,7 +1142,107 @@ function getExpectedUltragoalObjective(state, directory) {
   return '';
 }
 
-function extractClaudeGoalSnapshot(data) {
+// Upper bound on the transcript we are willing to read on every tool call.
+const MAX_TRANSCRIPT_BYTES = 25 * 1024 * 1024;
+// The authoritative `/goal` signal is the slash-command *invocation* record, not the
+// `<local-command-stdout>` display echo (which Claude Code also emits for ordinary
+// user-typed/pasted prompts, so display text is spoofable). A real record looks like
+// `<command-name>/goal</command-name> ... <command-args>OBJECTIVE</command-args>`.
+const GOAL_COMMAND_MARKER = /<command-name>\s*\/goal\s*<\/command-name>/;
+const GOAL_COMMAND_ARGS = /<command-args>([\s\S]*?)<\/command-args>/;
+// Any line that plausibly carries `/goal` state — intentionally broad (matches even
+// truncated markers) so a malformed goal-bearing record fails closed instead of
+// silently keeping a stale goal active.
+const GOAL_BEARING_HINT = /\/goal|Goal set|Goal cleared|local-command-stdout/;
+
+// Read a bounded regular file without following symlinks and without a stat->open race:
+// reject symlinks via lstat, then stat the open fd (fstat) and read through that same fd.
+function readBoundedTranscript(path) {
+  let linkStat;
+  try {
+    linkStat = lstatSync(path);
+  } catch {
+    return null;
+  }
+  if (linkStat.isSymbolicLink() || !linkStat.isFile()) return null;
+
+  let fd;
+  try {
+    fd = openSync(path, 'r');
+  } catch {
+    return null;
+  }
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size === 0 || stat.size > MAX_TRANSCRIPT_BYTES) return null;
+    const buffer = Buffer.allocUnsafe(stat.size);
+    let read = 0;
+    while (read < stat.size) {
+      const n = readSync(fd, buffer, read, stat.size - read, read);
+      if (n <= 0) break;
+      read += n;
+    }
+    return buffer.toString('utf-8', 0, read);
+  } catch {
+    return null;
+  } finally {
+    try { closeSync(fd); } catch { /* ignore */ }
+  }
+}
+
+// Recover the active Claude `/goal` from the session transcript.
+//
+// Claude Code does not expose live `/goal` state to hooks (the PreToolUse payload
+// carries none of the goal fields read below), but every hook receives
+// `transcript_path`, where a `/goal` invocation is recorded as a command record.
+// Reading it lets the guard observe a goal the user actually set instead of denying
+// forever (issue #3341) — without trusting arbitrary transcript text.
+//
+// Authorization boundary (PR review on #3465/#3466):
+// - resolve worktree-encoded paths via the shared resolver, then require the file to be
+//   the active session's own transcript (`<sessionId>.jsonl`);
+// - read a bounded, non-symlink regular file through a stable fd;
+// - trust only command-originated `/goal` records (`<command-name>/goal</command-name>`),
+//   never `<local-command-stdout>` display text;
+// - apply set/clear strictly in order (last-event-wins) and fail closed if any
+//   goal-bearing record is malformed.
+function extractGoalFromTranscript(rawTranscriptPath, sessionId, cwd) {
+  if (typeof rawTranscriptPath !== 'string' || !rawTranscriptPath) return null;
+  if (typeof sessionId !== 'string' || !sessionId) return null;
+
+  const resolved = resolveTranscriptPath(rawTranscriptPath, cwd);
+  if (typeof resolved !== 'string' || !resolved) return null;
+  // Bind to the active session; Claude Code names the transcript `<sessionId>.jsonl`.
+  if (basename(resolved).replace(/\.jsonl$/i, '') !== sessionId) return null;
+
+  const content = readBoundedTranscript(resolved);
+  if (content === null) return null;
+
+  let objective = '';
+  for (const line of content.split('\n')) {
+    if (!line || !GOAL_BEARING_HINT.test(line)) continue;
+    let entry;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      return null; // fail closed: a malformed goal-bearing record invalidates recovery
+    }
+    if (entry?.type !== 'user') continue;
+    const message = entry.message;
+    if (!message || message.role !== 'user' || typeof message.content !== 'string') continue;
+    // Trust only command-originated `/goal` records, not display stdout text.
+    if (!GOAL_COMMAND_MARKER.test(message.content)) continue;
+    const argsMatch = message.content.match(GOAL_COMMAND_ARGS);
+    const args = argsMatch ? argsMatch[1].trim() : '';
+    // `/goal clear` (or empty args) clears; any other args are the objective.
+    objective = args === '' || args.toLowerCase() === 'clear' ? '' : args;
+  }
+
+  if (!objective) return null;
+  return { objective, status: 'active' };
+}
+
+function extractClaudeGoalSnapshot(data, sessionId, cwd) {
   const candidates = [
     data.goal,
     data.claude_goal,
@@ -735,15 +1264,55 @@ function extractClaudeGoalSnapshot(data) {
       }
     }
   }
-  return null;
+  // Runtime injected no goal field (the standard Claude Code case): fall back to the
+  // transcript, the only place a hook can observe an active `/goal`.
+  return extractGoalFromTranscript(data.transcript_path ?? data.transcriptPath, sessionId, cwd);
 }
 
+
+// A bootstrap/exit bypass must apply to one indivisible command only. Reject shell
+// chaining/expansion so a recognized token cannot smuggle other commands past the guard
+// (e.g. `omc ultragoal checkpoint ... && npm test`). See PR review on #3465.
+function isSingleShellCommand(command) {
+  return typeof command === 'string'
+    && command.trim().length > 0
+    && !/[\n\r;&|`]|\$\(|<\(|>\(/.test(command);
+}
+
+function isCancelSkillBootstrapTool(toolName, toolInput) {
+  const skillName = extractSkillName(toolInput);
+  if (toolName === 'Skill' && skillName === 'cancel') return true;
+  if (toolName === 'ToolSearch') return true;
+
+  if (toolName === 'Read') {
+    const filePath = typeof toolInput.file_path === 'string'
+      ? toolInput.file_path
+      : typeof toolInput.path === 'string'
+        ? toolInput.path
+        : '';
+    const normalized = filePath.replace(/\\/g, '/');
+    if (/(?:^|\/)(?:skills|skill-bodies)\/cancel\/SKILL\.md$/i.test(normalized)) return true;
+  }
+
+  if (/state_(?:clear|read|write|list_active|get_status)$/i.test(toolName)) return true;
+  if (/^mcp__.*__state_(?:clear|read|write|list_active|get_status)$/i.test(toolName)) return true;
+
+  if (toolName !== 'Bash') return false;
+  const command = typeof toolInput.command === 'string' ? toolInput.command : '';
+  if (!isSingleShellCommand(command)) return false;
+  // Bare CLI names (PATH installs) or trusted plugin entrypoint via node/nodejs.
+  // Basename is constrained to oh-my-claudecode.js; arbitrary node scripts stay denied.
+  // isSingleShellCommand above rejects chaining/expansion so a recognized token cannot
+  // smuggle other commands past the guard (e.g. `... cancel && npm test`).
+  return /^(?:(?:node|nodejs)\s+(?:"[^"\n]*[/\\]oh-my-claudecode\.js"|'[^'\n]*[/\\]oh-my-claudecode\.js'|[^\s;|&`]*[/\\]oh-my-claudecode\.js)\s+|(?:omc|oh-my-claudecode|gjc)\s+)(?:state\s+(?:clear|read|write|list-active|get-status)|cancel)\b/.test(command.trim());
+}
 
 function isUltragoalBootstrapTool(toolName, toolInput) {
   if (toolName === 'Skill' && extractSkillName(toolInput) === 'ultragoal') return true;
   if (toolName !== 'Bash') return false;
   const command = typeof toolInput.command === 'string' ? toolInput.command : '';
-  return /(?:^|[;&|\s])(?:omc|oh-my-claudecode)\s+ultragoal\s+(?:create(?:-goals)?|create-goals|complete(?:-goals)?|complete-goals|next|start-next|status)\b/.test(command);
+  if (!isSingleShellCommand(command)) return false;
+  return /^(?:omc|oh-my-claudecode)\s+ultragoal\s+(?:create(?:-goals)?|complete(?:-goals)?|next|start-next|status|checkpoint|record-review-blockers)\b/.test(command.trim());
 }
 
 function evaluateUltragoalPreToolEnforcement(stateDir, directory, sessionId, data) {
@@ -751,21 +1320,30 @@ function evaluateUltragoalPreToolEnforcement(stateDir, directory, sessionId, dat
   const toolName = data.tool_name || data.toolName || '';
   const toolInput = data.toolInput || data.tool_input || {};
   if (isUltragoalBootstrapTool(toolName, toolInput)) return null;
+  if (isCancelSkillBootstrapTool(toolName, toolInput)) return null;
   const loaded = readSessionModeState(stateDir, 'ultragoal', sessionId);
   const state = loaded.state;
   if (!state?.active) return null;
   if (isStaleModeState(state)) return null;
   if (state.project_path && resolve(String(state.project_path)) !== resolve(directory)) return null;
   if (isUltragoalTerminalState(state, directory)) return null;
+  if (isAwaitingConfirmation(state)) return null;
 
   const expected = getExpectedUltragoalObjective(state, directory);
-  const actual = extractClaudeGoalSnapshot(data);
+  const actual = extractClaudeGoalSnapshot(data, sessionId, directory);
   const actualObjective = normalizeText(actual?.objective);
   const expectedObjective = normalizeText(expected);
   const status = normalizePhase(actual?.status);
   const objectiveMatches = Boolean(actualObjective && expectedObjective && actualObjective === expectedObjective);
   const activeStatus = status === '' || status === 'active' || status === 'in_progress' || status === 'running';
 
+  // #3341: Claude Code does not expose live `/goal` state to a PreToolUse hook, so
+  // `actual` may be recovered from the session transcript (see extractGoalFromTranscript)
+  // in addition to the payload. Objective/status matching semantics are otherwise
+  // unchanged: an explicit or recovered goal must match the expected ultragoal objective
+  // (or the expected objective must be unseeded). Denying when no active goal is
+  // observable at all is preserved below, so the guard stays meaningful.
+  if (!expectedObjective && actualObjective && activeStatus) return null;
   if (objectiveMatches && activeStatus) return null;
 
   const mismatch = actualObjective
@@ -916,7 +1494,7 @@ function getActiveTeamState(stateDir, sessionId) {
 }
 
 // Generate agent spawn message with metadata
-function generateAgentSpawnMessage(toolInput, stateDir, todoStatus, sessionId) {
+async function generateAgentSpawnMessage(toolInput, stateDir, directory, todoStatus, sessionId) {
   if (!toolInput || typeof toolInput !== 'object') {
     if (QUIET_LEVEL >= 2) return '';
     return `${todoStatus}Launch multiple agents in parallel when tasks are independent. Use run_in_background for long operations.`;
@@ -926,7 +1504,7 @@ function generateAgentSpawnMessage(toolInput, stateDir, todoStatus, sessionId) {
   const model = toolInput.model || 'inherit';
   const desc = toolInput.description || '';
   const bg = toolInput.run_in_background ? ' [BACKGROUND]' : '';
-  const tracking = getAgentTrackingInfo(stateDir);
+  const tracking = await getAgentTrackingInfo(stateDir, directory, sessionId);
 
   // Team-routing guidance:
   // Claude Code 2.1.178+ removed TeamCreate/TeamDelete. When OMC team state is
@@ -990,8 +1568,7 @@ const SKILL_PROTECTION_CONFIGS = {
 
 const SKILL_PROTECTION_MAP = {
   // === Already have mode state → no additional protection ===
-  autopilot: 'none', ralph: 'none', ultragoal: 'none', ultrawork: 'none', team: 'none',
-  'omc-teams': 'none', ultraqa: 'none', cancel: 'none',
+  'omc-teams': 'none', cancel: 'none',
 
   // === Instant / read-only → no protection needed ===
   trace: 'none', hud: 'none', 'omc-doctor': 'none', 'omc-help': 'none',
@@ -1011,7 +1588,7 @@ const SKILL_PROTECTION_MAP = {
   'mcp-setup': 'medium', 'project-session-manager': 'medium',
   psm: 'medium',          // alias for project-session-manager
   'writer-memory': 'medium', 'ralph-init': 'medium',
-  release: 'medium', ccg: 'medium',
+  release: 'medium',
 
   // === Heavy protection (long-running, 10 reinforcements) ===
   deepinit: 'heavy',
@@ -1148,13 +1725,9 @@ function confirmSkillModeStates(stateDir, skillName, sessionId) {
   switch (skillName) {
     case 'ralph':
       clearAwaitingConfirmationFlag(stateDir, 'ralph', sessionId);
-      clearAwaitingConfirmationFlag(stateDir, 'ultrawork', sessionId);
       break;
     case 'ultragoal':
       clearAwaitingConfirmationFlag(stateDir, 'ultragoal', sessionId);
-      break;
-    case 'ultrawork':
-      clearAwaitingConfirmationFlag(stateDir, 'ultrawork', sessionId);
       break;
     case 'autopilot':
       clearAwaitingConfirmationFlag(stateDir, 'autopilot', sessionId);
@@ -1261,6 +1834,14 @@ async function main() {
     //   DENY  no-model calls when the session model itself has [1m] — guide to OMC_SUBAGENT_MODEL
     if (toolName === 'Task' || toolName === 'Agent') {
       const toolInput = data.toolInput || data.tool_input || {};
+      // Skill vs agent namespace guard (issue #3667): deny BEFORE the native
+      // boundary when a bundled skill name is passed as subagent_type, with an
+      // error that names the Skill tool and the correct identifier.
+      const skillAgentDeny = evaluateSkillAsAgentCall(toolName, toolInput, directory);
+      if (skillAgentDeny) {
+        console.log(JSON.stringify(skillAgentDeny));
+        return;
+      }
       const toolModel = toolInput.model;
       if (isForceInheritEnabled()) {
         // Check both vars: if either carries [1m] the session model is unsafe for sub-agents.
@@ -1303,7 +1884,7 @@ async function main() {
         } else if (sessionHasLmSuffix) {
           // No model param, but the session model has a [1m] context-window suffix.
           // Sub-agents would inherit it and fail — the runtime strips [1m] to a bare
-          // Anthropic model ID (e.g. claude-sonnet-4-6) which is invalid on Bedrock.
+          // Anthropic model ID (e.g. claude-sonnet-5) which is invalid on Bedrock.
           // Fix: pass a tier alias (sonnet/haiku/opus). The Agent tool schema only accepts
           // tier aliases for the model param — full Bedrock IDs are rejected by the schema.
           const tierAlias = normalizeToCcAlias(sessionModel) || 'sonnet';
@@ -1367,6 +1948,13 @@ async function main() {
       }
     }
 
+    if (toolName === 'Task' || toolName === 'Agent') {
+      const toolInput = data.toolInput || data.tool_input || {};
+      const jevUpdated = recordModelRoutingShadow(toolName, toolInput, updatedToolInput, data.permission_mode);
+      // In active mode, Jev may override the model choice
+      if (jevUpdated) updatedToolInput = jevUpdated;
+    }
+
     // Send notification when AskUserQuestion is about to execute (user input needed)
     // Fires in PreToolUse so users get notified BEFORE the tool blocks for input (#597)
     if (toolName === 'AskUserQuestion') {
@@ -1419,6 +2007,39 @@ async function main() {
       return;
     }
 
+    // Read budget (issue #4054): enforce the <Context_Budget> rule that has only
+    // existed as prose in agents/explore.md. A full-file Read of an oversized file
+    // is warned once and denied afterwards; targeted reads, small files,
+    // allowlisted paths, and OMC_READ_BUDGET=off pass through.
+    const readBudget = evaluateReadBudget({
+      toolName,
+      toolInput: data.toolInput || data.tool_input || {},
+      stateDir,
+      loadOmcConfig,
+      cwd: directory,
+    });
+    if (readBudget?.decision === 'block') {
+      console.log(JSON.stringify({
+        continue: true,
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason: readBudget.reason,
+        },
+      }));
+      return;
+    }
+    if (readBudget?.decision === 'warn') {
+      console.log(JSON.stringify({
+        continue: true,
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          additionalContext: readBudget.reason,
+        },
+      }));
+      return;
+    }
+
     if (toolName === 'Task' || toolName === 'Agent') {
       const rawTranscriptPath = data.transcript_path || data.transcriptPath || '';
       const transcriptPath = resolveTranscriptPath(rawTranscriptPath, directory);
@@ -1442,7 +2063,7 @@ async function main() {
     if (toolName === 'Task' || toolName === 'Agent') {
       const toolInput = data.toolInput || data.tool_input || null;
       // Reflect any injected per-agent model (issue #3242) in the advisory label.
-      message = generateAgentSpawnMessage(updatedToolInput || toolInput, stateDir, todoStatus, sessionId);
+      message = await generateAgentSpawnMessage(updatedToolInput || toolInput, stateDir, directory, todoStatus, sessionId);
     } else {
       message = generateMessage(toolName, todoStatus, modeActive);
     }

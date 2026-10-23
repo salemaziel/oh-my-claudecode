@@ -10,27 +10,28 @@
  * 2. ralph: Persistence mode until task completion
  * 3. autopilot: Full autonomous execution
  * 4. team: Explicit-only via /team (not auto-triggered)
- * 5. ultrawork/ulw: Maximum parallel execution
- * 5. ccg: Claude-Codex-Gemini tri-model orchestration
- * 6. ralplan: Iterative planning with consensus
- * 7. deep interview: Socratic interview workflow
- * 8. ai-slop-cleaner: Cleanup/deslop anti-slop workflow
- * 9. tdd: Test-driven development
- * 10. code review: Comprehensive review mode
- * 11. security review: Security-focused review mode
- * 12. ultrathink: Extended reasoning
- * 13. deepsearch: Codebase search (restricted patterns)
- * 14. analyze: Analysis mode (restricted patterns)
+ * 5. ralplan: Iterative planning with consensus
+ * 6. deep interview: Socratic interview workflow
+ * 7. ai-slop-cleaner: Cleanup/deslop anti-slop workflow
+ * 8. tdd: Test-driven development
+ * 9. code review: Comprehensive review mode
+ * 10. security review: Security-focused review mode
+ * 11. ultrathink: Extended reasoning
+ * 12. deepsearch: Codebase search (restricted patterns)
+ * 13. analyze: Analysis mode (restricted patterns)
  */
 
 import { writeFileSync, readFileSync, mkdirSync, existsSync, unlinkSync } from 'fs';
-import { join, dirname } from 'path';
+import { join, dirname, isAbsolute } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
 import { getClaudeConfigDir } from './lib/config-dir.mjs';
-import { atomicWriteFileSync } from './lib/atomic-write.mjs';
+import { atomicWriteFileSync, getStateFileLockFailureMessage, recoverEmergencyStateFile, withStateFileLockSync } from './lib/atomic-write.mjs';
 import { readStdin } from './lib/stdin.mjs';
-import { resolveOmcStateRoot } from './lib/state-root.mjs';
+import { resolveOmcStateRoot, resolveSessionStatePathsForHook } from './lib/state-root.mjs';
+import { parseWorkflowInvocation, selectWorkflowProfile, createWorkflowState, isValidWorkflowTrackingState, isWorkflowRuntimeSupported, resolveWorkflowStagePrompt, takeWorkflowTranscriptFailure } from './lib/workflow-profile-runtime.mjs';
+import { isJevShadowOptedIn, recordJevShadow } from './lib/jev-shadow.mjs';
+import { initializeRalphStateForSkill, createPrdScaffold } from './lib/ralph-startup.mjs';
 
 // Resolve OMC package root: CLAUDE_PLUGIN_ROOT (plugin system) or derive from this script's location
 const _omcRoot = process.env.CLAUDE_PLUGIN_ROOT ||
@@ -152,6 +153,7 @@ ANALYSIS MODE. Gather context before diving deep:
 const TDD_MESSAGE = `<tdd-mode>
 [TDD MODE ACTIVATED]
 Write or update tests first when practical, confirm they fail for the right reason, then implement the minimal fix and re-run verification.
+Call the Skill tool with "tdd" for the full discipline at pre-agreed seams.
 </tdd-mode>
 
 ---
@@ -206,7 +208,11 @@ function isExplicitRalplanSlashInvocation(prompt) {
 }
 
 function isExplicitAskSlashInvocation(prompt) {
-  return /^\s*\/(?:oh-my-claudecode:)?ask\s+(?:claude|codex|gemini|antigravity|agy|grok|cursor)\b/i.test(prompt);
+  return /^\s*\/(?:oh-my-claudecode:)?ask\s+(?:claude|codex|gemini|antigravity|agy|grok|cursor|muse)\b/i.test(prompt);
+}
+
+function isRetiredSlashInvocation(prompt) {
+  return /^\s*\/(?:omc:|oh-my-claudecode:)?(?:ultrawork|ulw|uw|울트라워크|ウルトラワーク|ccg|claude-codex-gemini|씨씨지|シーシージー)(?=\s|$|[?!.,;:])/i.test(prompt);
 }
 
 // Sanitize text to prevent false positives from code blocks, XML tags, URLs, and file paths
@@ -243,8 +249,8 @@ function sanitizeForKeywordDetection(text) {
   return stripPastedCommandPayloads(text)
     // 0. Strip HTML/markdown comments before tag stripping
     .replace(/<!--[\s\S]*?-->/g, '')
-    // 1. Strip XML-style tag blocks: <tag-name ...>...</tag-name> (multi-line, greedy on tag name)
-    .replace(/<(\w[\w-]*)[\s>][\s\S]*?<\/\1>/g, '')
+    // 1. Strip XML-style tag blocks; closing-tag attributes stay on one line and stop at adjacent tags.
+    .replace(/<(\w[\w-]*)[\s>][\s\S]*?<\/\1(?:[ \t][^<>\r\n]*)?>/g, '')
     // 2. Strip self-closing XML tags: <tag-name />, <tag-name attr="val" />
     .replace(/<\w[\w-]*(?:\s[^>]*)?\s*\/>/g, '')
     // 3. Strip URLs: http://... or https://... up to whitespace
@@ -398,6 +404,7 @@ const INFORMATIONAL_INTENT_PATTERNS = [
   /(?:뭐야|뭔데|무엇(?:이야|인가요)?|어떻게|설명(?!서\s*(?:작성|만들|생성|추가|업데이트|수정|편집|쓰))|사용법|알려\s?줘|알려줄래|소개해?\s?줘|소개\s*부탁|설명해\s?줘|뭐가\s*달라|어떤\s*기능|기능\s*(?:알려|설명|뭐)|방법\s*(?:알려|설명|뭐))/u,
   /(?:とは|って何|使い方|説明|(?:について|に関して|違い)[^\n]{0,24}(?:教えて|説明|知りたい)|(?:どう|何が|どこが)違う)/u,
   /(?:什么是|什麼是|怎(?:么|樣)用|如何使用|解释|說明|说明)/u,
+  /(?:ทำไม|อะไร|ยังไง|อย่างไร|คืออะไร|หมายถึง|แปลว่า|อธิบาย|มั้ย|ไหม|เหรอ|หรอ|หรือไม่|หรือเปล่า|ใช่ไหม|ถูกมั้ย|เกี่ยวกับ|เหมือน)/u,
 ];
 const INFORMATIONAL_CONTEXT_WINDOW = 80;
 const QUOTED_SPAN_PATTERN =
@@ -406,6 +413,7 @@ const REFERENCE_META_PATTERNS = [
   /\b(?:vs\.?|versus|compared\s+to|comparison|compare|article|blog\s+post|documentation|docs?|reference)\b/i,
   /(?:비교|차이|설명|정리|문서|자료|가이드|이\s*(?:글|비교|문서)는|블로그)/u,
   /\b(?:this\s+(?:article|comparison|guide|documentation|doc)|quoted|quote(?:d)?)\b/i,
+  /(?:เปรียบเทียบ|ต่างกัน|ความต่าง|เอกสาร|บทความ|ไกด์|คู่มือ|เกี่ยวกับ|เหมือน)/u,
 ];
 const REFERENCE_EXPLANATION_PATTERNS = [
   /(?:^|\n)\s*(?:결론|특징|예시|요약|장점|단점|설명)\s*[:：]/u,
@@ -416,6 +424,7 @@ const REFERENCE_EXPLANATION_PATTERNS = [
 const QUESTION_FOLLOWUP_PATTERNS = [
   /\b(?:how\s+many|how\s+much|why|what\s+happened|what\s+went\s+wrong|token\s+budget|cost|pricing)\b/i,
   /(?:왜|얼마|몇\s*번|몇번|토큰|가격|비용|질문)/u,
+  /(?:ทำไม|อะไร|ยังไง|อย่างไร|เท่าไหร่|กี่|มั้ย|ไหม|เหรอ|หรอ|หรือไม่|หรือเปล่า|ใช่ไหม|ถูกมั้ย)/u,
 ];
 
 // Patterns that identify system-generated echoes (hook outputs) which can be
@@ -447,7 +456,6 @@ const SYSTEM_ECHO_BLOCK_PATTERNS = [
   buildEchoBlockRegex('\\[AUTOPILOT[^\\]\\n]*\\]'),
   buildEchoBlockRegex('\\[ULTRAPILOT[^\\]\\n]*\\]'),
   buildEchoBlockRegex('\\[ULTRAWORK[^\\]\\n]*\\]'),
-  buildEchoBlockRegex('\\[ULTRAQA[^\\]\\n]*\\]'),
   buildEchoBlockRegex('\\[PIPELINE[^\\]\\n]*\\]'),
   buildEchoBlockRegex('\\[SWARM[^\\]\\n]*\\]'),
   buildEchoBlockRegex('\\[TOOL ERROR[^\\]\\n]*\\]'),
@@ -471,6 +479,9 @@ const SYSTEM_ECHO_SIGNATURES = [
 ];
 
 const MAX_STATE_PROMPT_LEN = 500;
+// Must match PASTED_ECHO_PROMPT_SENTINEL in persistent-mode.mjs/.cjs and
+// src/hooks/autopilot/enforcement.ts, which treat it as an orphan marker.
+const PASTED_ECHO_PROMPT_SENTINEL = '(prompt omitted: pasted system echo)';
 
 function stripSystemEchoes(text) {
   if (typeof text !== 'string' || text.length === 0) return '';
@@ -521,7 +532,7 @@ function sanitizePromptForState(prompt) {
   }
 
   if (looksLikeSystemEcho(trimmed)) {
-    return '(prompt omitted: pasted system echo)';
+    return PASTED_ECHO_PROMPT_SENTINEL;
   }
 
   // Fallback (stripping left nothing but original isn't recognizably an echo)
@@ -554,6 +565,24 @@ function isWithinQuotedSpan(text, position) {
     }
   }
   return false;
+}
+
+// Bounds of the specific quoted span containing `position`, or null if none.
+// Used to scope the execution-directive check for the quote exemption to
+// this keyword's own quote — not the generic ±80-char context window, which
+// can otherwise pick up an unrelated genuine command elsewhere in the same
+// message and wrongly neutralize the exemption for a keyword that is purely
+// quoted as an example.
+function findQuotedSpanBounds(text, position) {
+  for (const match of text.matchAll(QUOTED_SPAN_PATTERN)) {
+    if (match.index === undefined) continue;
+    const start = match.index;
+    const end = start + match[0].length;
+    if (position >= start && position < end) {
+      return { start, end };
+    }
+  }
+  return null;
 }
 
 function stripQuotedSpans(text) {
@@ -602,6 +631,23 @@ function hasDirectInvocationPrefix(text, position) {
   return /^\s*(?:[$/!]\s*|force:\s*|oh-my-(?:claudecode|codex):\s*)?$/i.test(prefix);
 }
 
+function hasConversationalInvocationNearKeyword(text, position, _keywordLength, _keywordText) {
+  if (isWithinQuotedSpan(text, position)) {
+    return false;
+  }
+
+  const start = Math.max(0, position - INFORMATIONAL_CONTEXT_WINDOW);
+  const prefix = stripQuotedSpans(text.slice(start, position));
+  const conversationalInvocationPatterns = [
+    /\bplease\s+$/i,
+    /\blet['’]?s\s+$/i,
+    /\bi\s+(?:want|need|would\s+like)\s+(?:a|an)\s+$/i,
+    /\b(?:can|could|would|will)\s+you\s+$/i,
+  ];
+
+  return conversationalInvocationPatterns.some((pattern) => pattern.test(prefix));
+}
+
 function hasExplicitInvocationContext(text, position, keywordLength, keywordText) {
   if (hasDirectInvocationPrefix(text, position)) {
     return true;
@@ -610,7 +656,42 @@ function hasExplicitInvocationContext(text, position, keywordLength, keywordText
   const start = Math.max(0, position - INFORMATIONAL_CONTEXT_WINDOW);
   const end = Math.min(text.length, position + keywordLength + INFORMATIONAL_CONTEXT_WINDOW);
   const context = text.slice(start, end);
-  return hasActivationIntentNearKeyword(context, keywordText);
+  if (hasActivationIntentNearKeyword(context, keywordText)) {
+    return true;
+  }
+
+  return hasConversationalInvocationNearKeyword(text, position, keywordLength, keywordText);
+}
+
+function hasExplicitRalphInvocationContext(text, position, keywordLength, keywordText) {
+  const normalizedKeyword = (keywordText || '').toLowerCase().replace(/\s+/g, '');
+  const prefix = text.slice(0, position);
+  const suffix = text.slice(position + keywordLength);
+
+  if (/^\s*(?:[$/!]\s*|force:\s*|\/?oh-my-(?:claudecode|codex):\s*)$/i.test(prefix)) {
+    return true;
+  }
+
+  const start = Math.max(0, position - INFORMATIONAL_CONTEXT_WINDOW);
+  const end = Math.min(text.length, position + keywordLength + INFORMATIONAL_CONTEXT_WINDOW);
+  const context = text.slice(start, end);
+  if (hasActivationIntentNearKeyword(context, keywordText)) {
+    return true;
+  }
+
+  if (normalizedKeyword === '랄프' || normalizedKeyword === 'ラルフ') {
+    return /^\s*(?:켜|켜줘|실행|시작|돌려|돌려줘|써|써줘|사용해|진행해|起動|開始|実行|使って|やって|を?実行|を?起動|を?開始)/u.test(suffix);
+  }
+
+  if (normalizedKeyword !== 'ralph') {
+    return false;
+  }
+
+  if (/^\s*[:：]\s*\S/.test(suffix)) {
+    return true;
+  }
+
+  return /^['"]?\s+(?:this\b|and\s+)?(?:fix\b|debug\b|investigate\b|resolve\b|handle\b|patch\b|address\b|implement\b|run\b|start\b|enable\b|activate\b|invoke\b|trigger\b|launch\b)|^['"]?\s+this\b|^\s+the\s+[^.?!\n]{0,60}\buntil\b/i.test(suffix);
 }
 
 function hasDiagnosticIntentNearKeyword(context, keyword) {
@@ -627,6 +708,19 @@ function hasDiagnosticIntentNearKeyword(context, keyword) {
   ];
 
   return patterns.some((pattern) => pattern.test(context));
+}
+
+function isAutopilotCreationAlias(keywordText) {
+  const normalized = (keywordText || '').toLowerCase().trim();
+  return /^(?:build|create|make)\s+me\b/.test(normalized) || /^i\s+want\s+an?(?:\s+(?:app|feature|project|tool|plugin|website|api|server|cli|script|system|service|dashboard|bot|extension))?\s*$/.test(normalized);
+}
+
+function hasActionableCommandAfterSeparator(text, position, keywordLength) {
+  const suffix = text.slice(position + keywordLength).match(/^\s*[:：]\s*([^\n]{0,80})/u)?.[1] ?? '';
+  if (/\?|？|\b(?:what(?:'s|\s+is)|how\s+(?:to|do\s+i)\s+use|explain|describe|tell\s+me\s+about)\b/iu.test(suffix)) {
+    return false;
+  }
+  return /\b(?:fix|debug|investigate|resolve|handle|patch|address|implement|build|create|make|run|start|enable|activate|invoke|trigger|launch)\b|(?:ทำ|ทํา|สร้าง|แก้|เปิด|รัน|เรียก|เริ่ม)/iu.test(suffix);
 }
 
 function isRalphUltraworkMetaOrBanterContext(context, keywordText) {
@@ -663,13 +757,77 @@ function isInformationalKeywordContext(text, position, keywordLength, keywordTex
   const start = Math.max(0, position - INFORMATIONAL_CONTEXT_WINDOW);
   const end = Math.min(text.length, position + keywordLength + INFORMATIONAL_CONTEXT_WINDOW);
   const context = text.slice(start, end);
+  const hasInformationalIntent = INFORMATIONAL_INTENT_PATTERNS.some((pattern) => pattern.test(context));
+  const hasStrongHelpQueryIntent = /\?|？|\b(?:how\s+(?:to|do\s+i)\s+use|what(?:'s|\s+is)|explain|describe|tell\s+me\s+about)\b|(?:사용법|使い方|什么是|怎么用|如何使用)/iu.test(context);
   const lineBounds = getLineBounds(text, position);
   const line = text.slice(lineBounds.start, lineBounds.end);
   const questionOutsideQuotes = stripQuotedSpans(text);
   const keywordInsideQuotes = isWithinQuotedSpan(text, position);
+  const hasExecutionDirective = /\b(?:fix|debug|investigate|resolve|handle|patch|address|implement|build)\b/i.test(context);
+  const hasCommandSeparatorInvocation =
+    hasDirectInvocationPrefix(text, position) && /^\s*[:：]/.test(text.slice(position + keywordLength));
+  const hasActionableCommandSeparatorInvocation =
+    hasCommandSeparatorInvocation && hasActionableCommandAfterSeparator(text, position, keywordLength);
+
+  // A keyword occurrence inside a quoted span is usually reported/example
+  // text, not a command directed at the assistant — e.g. an example sentence
+  // like `"use autopilot"` inside a paragraph discussing that exact phrasing.
+  // But a quoted keyword paired with a nearby execution directive OR
+  // activation verb (e.g. `"ralph" fix the auth bug`, or `run "ralph" on
+  // this issue`) is still a genuine request stylistically wrapped in quotes,
+  // so the exemption only applies when neither is present.
+  //
+  // This check is scoped to text immediately OUTSIDE this keyword's own
+  // quoted span (±28 chars before/after the span's bounds), not the generic
+  // ±80-char context window used elsewhere in this function, and NOT the
+  // quote's own interior. Three failure modes this avoids:
+  // - Scoping to the wide window: an unrelated genuine command elsewhere in
+  //   the same message could sit inside it and wrongly neutralize the
+  //   exemption for a keyword that is purely quoted as an example.
+  // - Scoping to (or including) the quote's own interior: a directive or
+  //   activation word used INSIDE the quoted text itself — extremely common
+  //   in narrated examples and bug reports, e.g. `"please fix autopilot"
+  //   they said` or `"...told it to use autopilot..."` — would make the
+  //   quote self-report as command-bearing and defeat the exemption for
+  //   exactly the reported-speech case it exists to catch.
+  // - Checking only execution-directive verbs (fix/debug/...) and not
+  //   activation verbs (use/run/start/...): genuine commands stylistically
+  //   quoting just the mode name, e.g. `run "ralph" on this issue` or
+  //   `use "autopilot" on this task`, would be wrongly suppressed even
+  //   though they activated before this exemption existed.
+  if (keywordInsideQuotes) {
+    const span = findQuotedSpanBounds(text, position);
+    const hasGenuineCommandNearQuote = span
+      ? /\b(?:fix|debug|investigate|resolve|handle|patch|address|implement|build|use|run|start|enable|activate|invoke|trigger|launch)\b/i.test(
+          text.slice(Math.max(0, span.start - 28), span.start) +
+            ' ' +
+            text.slice(span.end, Math.min(text.length, span.end + 28)),
+        )
+      : hasExecutionDirective;
+    if (!hasGenuineCommandNearQuote) {
+      return true;
+    }
+  }
 
   if (keywordText) {
-    if (hasActivationIntentNearKeyword(context, keywordText)) {
+    const hasActivationIntent = hasActivationIntentNearKeyword(context, keywordText);
+    if (hasActionableCommandSeparatorInvocation) {
+      return false;
+    }
+
+    if (isAutopilotCreationAlias(keywordText)) {
+      return false;
+    }
+    if (hasActivationIntent && hasExecutionDirective) {
+      return false;
+    }
+    if (hasInformationalIntent && hasStrongHelpQueryIntent) {
+      return true;
+    }
+    if (hasActivationIntent) {
+      return false;
+    }
+    if (hasConversationalInvocationNearKeyword(text, position, keywordLength, keywordText)) {
       return false;
     }
     if (isRalphUltraworkMetaOrBanterContext(context, keywordText)) {
@@ -692,7 +850,7 @@ function isInformationalKeywordContext(text, position, keywordLength, keywordTex
     return true;
   }
 
-  return INFORMATIONAL_INTENT_PATTERNS.some((pattern) => pattern.test(context));
+  return hasInformationalIntent;
 }
 
 function hasActionableKeyword(text, pattern) {
@@ -763,6 +921,33 @@ function hasExplicitActionableKeyword(text, pattern) {
   return false;
 }
 
+function hasActionableRalphKeyword(text, pattern) {
+  const searchText = looksLikeSystemEcho(text)
+    ? stripSystemEchoes(text)
+    : text;
+
+  const flags = pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`;
+  const globalPattern = new RegExp(pattern.source, flags);
+
+  for (const match of searchText.matchAll(globalPattern)) {
+    if (match.index === undefined) {
+      continue;
+    }
+
+    if (isInformationalKeywordContext(searchText, match.index, match[0].length, match[0])) {
+      continue;
+    }
+
+    if (!hasExplicitRalphInvocationContext(searchText, match.index, match[0].length, match[0])) {
+      continue;
+    }
+
+    return true;
+  }
+
+  return false;
+}
+
 function hasActionableRalplanKeyword(text, pattern) {
   // Same echo guard as hasActionableKeyword.
   const searchText = looksLikeSystemEcho(text)
@@ -793,9 +978,22 @@ function hasActionableRalplanKeyword(text, pattern) {
   return false;
 }
 
+const WORKFLOW_MARKER_KEYS = ['workflow', 'workflowRunId', 'pipelineTracking'];
+
+function hasWorkflowMarker(state) {
+  return state !== null && typeof state === 'object' && !Array.isArray(state) &&
+    WORKFLOW_MARKER_KEYS.some((key) => Object.prototype.hasOwnProperty.call(state, key));
+}
+
+function hasValidWorkflowDescriptor(state, sessionId) {
+  return hasWorkflowMarker(state) &&
+    WORKFLOW_MARKER_KEYS.every((key) => Object.prototype.hasOwnProperty.call(state, key)) &&
+    isValidWorkflowTrackingState(state, sessionId);
+}
+
+
 // Create state file for a mode
-function activateState(directory, prompt, stateName, sessionId, omcRoot) {
-  const _omcRoot = omcRoot;
+async function activateState(directory, prompt, stateName, sessionId) {
   const now = new Date().toISOString();
   // Sanitize prompt BEFORE writing to state: prevents pasted system echoes
   // and oversized blobs from being persisted and re-emitted by Stop hook.
@@ -812,10 +1010,10 @@ function activateState(directory, prompt, stateName, sessionId, omcRoot) {
       prompt: safePrompt,
       session_id: sessionId || undefined,
       project_path: directory,
-      linked_ultrawork: true,
       awaiting_confirmation: true,
       awaiting_confirmation_set_at: now,
-      last_checked_at: now
+      last_checked_at: now,
+      prd_mode: true, // CRITICAL: Enable PRD mode for ralph (issue #4363)
     };
   } else if (stateName === 'ralplan') {
     // Ralplan needs active + session_id for stop-hook enforcement
@@ -858,25 +1056,153 @@ function activateState(directory, prompt, stateName, sessionId, omcRoot) {
     };
   }
 
-  // Write to session-scoped path if sessionId available. Use atomic writes
-  // so that concurrent hook processes cannot expose half-written JSON to
-  // persistent-mode.mjs's readJsonFile (which would otherwise return null
-  // and temporarily drop mode enforcement).
-  if (sessionId && /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,255}$/.test(sessionId)) {
-    const sessionDir = join(_omcRoot, 'state', 'sessions', sessionId);
-    if (!existsSync(sessionDir)) {
-      try { mkdirSync(sessionDir, { recursive: true }); } catch {}
+  const safeSessionId = sessionId && /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,255}$/.test(sessionId) ? sessionId : undefined;
+
+  // Initialize PRD scaffold for ralph state (issue #4363)
+  if (stateName === 'ralph') {
+    try {
+      const omcRoot = await resolveOmcStateRoot(directory);
+      createPrdScaffold(omcRoot, safeSessionId);
+    } catch (e) {
+      // PRD creation failure should not block ralph activation
+      if (process.env.OMC_DEBUG) console.error('[keyword-detector] PRD creation failed:', e.message);
     }
-    try { atomicWriteFileSync(join(sessionDir, `${stateName}-state.json`), JSON.stringify(state, null, 2)); } catch {}
-    return;
   }
 
-  // Fallback: write to legacy local .omc/state directory
-  const localDir = join(_omcRoot, 'state');
-  if (!existsSync(localDir)) {
-    try { mkdirSync(localDir, { recursive: true }); } catch {}
+  const { writePath } = await resolveSessionStatePathsForHook(directory, stateName, safeSessionId);
+  try {
+    mkdirSync(dirname(writePath), { recursive: true });
+    let workflowIntegrityFailure = false;
+    const locked = withStateFileLockSync(writePath, () => {
+      if (!recoverEmergencyStateFile(writePath)) return;
+      // A legacy autopilot activation must never replace named state. Own
+      // markers are authoritative even when their values are falsy.
+      if (stateName === 'autopilot' && existsSync(writePath)) {
+        try {
+          const current = JSON.parse(readFileSync(writePath, 'utf8'));
+          if (hasWorkflowMarker(current)) {
+            if (!hasValidWorkflowDescriptor(current, sessionId)) workflowIntegrityFailure = true;
+            return;
+          }
+        } catch {
+          // A malformed existing state is not safe to replace while serialized.
+          return;
+        }
+      }
+      atomicWriteFileSync(writePath, JSON.stringify(state, null, 2));
+    });
+    if (!locked.acquired) return getStateFileLockFailureMessage();
+    return workflowIntegrityFailure ? 'workflow_descriptor_integrity_failed' : null;
+  } catch { return null; }
+}
+
+function retireStaleWorkflowCancelSignal(statePath, workflowRunId) {
+  const signalPath = join(dirname(statePath), 'cancel-signal-state.json');
+  const locked = withStateFileLockSync(signalPath, () => {
+    if (!existsSync(signalPath)) return;
+    try {
+      const signal = JSON.parse(readFileSync(signalPath, 'utf8'));
+      if (signal.target_workflow_run_id !== workflowRunId) unlinkSync(signalPath);
+    } catch {
+      // Malformed signals fail closed in Stop and are left for explicit cleanup.
+    }
+  });
+  if (!locked.acquired) return getStateFileLockFailureMessage();
+  return null;
+}
+
+function resumeWorkflowProfile(directory, sessionId, workflowName, omcRoot) {
+  const safeSessionId = sessionId && /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,255}$/.test(sessionId) ? sessionId : '';
+  const target = safeSessionId
+    ? join(omcRoot, 'state', 'sessions', safeSessionId, 'autopilot-state.json')
+    : join(omcRoot, 'state', 'autopilot-state.json');
+  try {
+    mkdirSync(dirname(target), { recursive: true });
+    const result = withStateFileLockSync(target, () => {
+      if (!recoverEmergencyStateFile(target)) return { error: 'workflow_recovery_failure' };
+      if (!existsSync(target)) return null;
+      const current = JSON.parse(readFileSync(target, 'utf8'));
+      if (hasWorkflowMarker(current) && !hasValidWorkflowDescriptor(current, sessionId)) return { error: 'workflow_integrity_failure' };
+      if (!hasValidWorkflowDescriptor(current, sessionId) || current.active !== false || current.workflow.workflowName !== workflowName) return null;
+      const terminal = current.phase === 'complete' && current.pipelineTracking.currentStageIndex === current.workflow.stages.length;
+      if (terminal) return null;
+
+      const resumed = { ...current, active: true };
+      if (!isValidWorkflowTrackingState(resumed, sessionId)) return { error: takeWorkflowTranscriptFailure(sessionId) || 'workflow_integrity_failure' };
+      const stageId = resumed.workflow.stages[resumed.pipelineTracking.currentStageIndex];
+      const stagePrompt = resolveWorkflowStagePrompt(resumed, stageId);
+      if (!stagePrompt) return { error: 'workflow_integrity_failure' };
+      atomicWriteFileSync(target, JSON.stringify(resumed, null, 2));
+      return { stagePrompt, workflowRunId: resumed.workflowRunId };
+    });
+    if (result.value?.error === 'workflow_recovery_failure') throw new Error('workflow_emergency_recovery_failed');
+    if (result.value?.error === 'workflow_transcript_record_too_large') throw new Error('workflow_transcript_record_too_large');
+    if (result.value?.error) throw new Error('workflow_descriptor_integrity_failed');
+    if (!result.acquired || !result.value?.stagePrompt) return null;
+    const cleanupFailure = retireStaleWorkflowCancelSignal(target, result.value.workflowRunId);
+    if (cleanupFailure) process.stderr.write(`[OMC] ${cleanupFailure}\n`);
+    return result.value.stagePrompt;
+  } catch (error) {
+    if (error?.message === 'workflow_emergency_recovery_failed' || error?.message === 'workflow_transcript_record_too_large') throw error;
+    return false;
   }
-  try { atomicWriteFileSync(join(localDir, `${stateName}-state.json`), JSON.stringify(state, null, 2)); } catch {}
+}
+
+function activateWorkflowProfile(directory, sessionId, task, workflow, omcRoot, transcriptPath) {
+  const stateInput = { directory, sessionId, task, workflow, transcriptPath };
+  const safeSessionId = sessionId && /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,255}$/.test(sessionId) ? sessionId : '';
+  const target = safeSessionId
+    ? join(omcRoot, 'state', 'sessions', safeSessionId, 'autopilot-state.json')
+    : join(omcRoot, 'state', 'autopilot-state.json');
+  try {
+    mkdirSync(dirname(target), { recursive: true });
+    const result = withStateFileLockSync(target, () => {
+      if (!recoverEmergencyStateFile(target)) return { error: 'workflow_recovery_failure' };
+      if (existsSync(target)) {
+        try {
+          const current = JSON.parse(readFileSync(target, 'utf8'));
+          if (hasWorkflowMarker(current) && !hasValidWorkflowDescriptor(current, sessionId)) return { error: 'workflow_integrity_failure' };
+          if (!hasValidWorkflowDescriptor(current, sessionId) && current?.active === true) return { error: 'active_workflow_conflict' };
+          if (hasValidWorkflowDescriptor(current, sessionId)) {
+            if (current.active === true) return { error: 'active_workflow_conflict' };
+            const terminal = current.phase === 'complete' && current.pipelineTracking.currentStageIndex === current.workflow.stages.length;
+            if (terminal) {
+              // A valid terminal state intentionally starts a fresh run below.
+            } else {
+              if (current.workflow.workflowName !== workflow.workflowName) return { error: 'active_workflow_conflict' };
+              const resumed = { ...current, active: true };
+              if (!isValidWorkflowTrackingState(resumed, sessionId)) return { error: takeWorkflowTranscriptFailure(sessionId) || 'workflow_integrity_failure' };
+              const stageId = resumed.workflow.stages[resumed.pipelineTracking.currentStageIndex];
+              const stagePrompt = resolveWorkflowStagePrompt(resumed, stageId);
+              if (!stagePrompt) return { error: 'workflow_integrity_failure' };
+              atomicWriteFileSync(target, JSON.stringify(resumed, null, 2));
+              return { stagePrompt, workflowRunId: resumed.workflowRunId };
+            }
+          }
+        } catch {
+          return { error: 'active_workflow_conflict' };
+        }
+
+      }
+      const state = createWorkflowState(stateInput);
+      if (!state) return { error: takeWorkflowTranscriptFailure(sessionId) || 'workflow_integrity_failure' };
+      const stagePrompt = resolveWorkflowStagePrompt(state, workflow.stages[0]);
+      if (!stagePrompt) return null;
+      atomicWriteFileSync(target, JSON.stringify(state, null, 2));
+      return { stagePrompt, workflowRunId: state.workflowRunId };
+    });
+    if (result.acquired && result.value?.error === 'active_workflow_conflict') throw new Error('an autopilot workflow is already active; run /cancel before activating another workflow');
+    if (result.acquired && result.value?.error === 'workflow_transcript_record_too_large') throw new Error('workflow_transcript_record_too_large');
+    if (result.acquired && result.value?.error === 'workflow_integrity_failure') throw new Error('workflow_descriptor_integrity_failed');
+    if (result.acquired && result.value?.error === 'workflow_recovery_failure') throw new Error('workflow_emergency_recovery_failed');
+    if (!result.acquired || !result.value || typeof result.value.stagePrompt !== 'string') return null;
+    const cleanupFailure = retireStaleWorkflowCancelSignal(target, result.value.workflowRunId);
+    if (cleanupFailure) process.stderr.write(`[OMC] ${cleanupFailure}\n`);
+    return result.value.stagePrompt;
+  } catch (error) {
+    if (error?.message === 'workflow_emergency_recovery_failed' || error?.message === 'workflow_transcript_record_too_large') throw error;
+    return false;
+  }
 }
 
 function activateRalplanStartupState(directory, prompt, sessionId, omcRoot) {
@@ -894,39 +1220,27 @@ function activateRalplanStartupState(directory, prompt, sessionId, omcRoot) {
     last_checked_at: now
   };
 
+  const persist = statePath => {
+    try {
+      mkdirSync(dirname(statePath), { recursive: true });
+      const locked = withStateFileLockSync(statePath, () => {
+        atomicWriteFileSync(statePath, JSON.stringify(state, null, 2));
+      });
+      return locked.acquired ? null : getStateFileLockFailureMessage();
+    } catch {
+      return 'Could not persist ralplan state.';
+    }
+  };
+
   if (sessionId && /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,255}$/.test(sessionId)) {
     const sessionDir = join(_omcRoot, 'state', 'sessions', sessionId);
-    if (!existsSync(sessionDir)) {
-      try { mkdirSync(sessionDir, { recursive: true }); } catch {}
-    }
-    try { atomicWriteFileSync(join(sessionDir, 'ralplan-state.json'), JSON.stringify(state, null, 2)); } catch {}
-    return;
+    return persist(join(sessionDir, 'ralplan-state.json'));
   }
 
   const localDir = join(_omcRoot, 'state');
-  if (!existsSync(localDir)) {
-    try { mkdirSync(localDir, { recursive: true }); } catch {}
-  }
-  try { atomicWriteFileSync(join(localDir, 'ralplan-state.json'), JSON.stringify(state, null, 2)); } catch {}
+  return persist(join(localDir, 'ralplan-state.json'));
 }
 
-/**
- * Clear state files for cancel operation
- */
-function clearStateFiles(directory, modeNames, sessionId, omcRoot) {
-  const _omcRoot = omcRoot;
-  for (const name of modeNames) {
-    const localPath = join(_omcRoot, 'state', `${name}-state.json`);
-    const globalPath = join(homedir(), '.omc', 'state', `${name}-state.json`);
-    try { if (existsSync(localPath)) unlinkSync(localPath); } catch {}
-    try { if (existsSync(globalPath)) unlinkSync(globalPath); } catch {}
-    // Clear session-scoped file too
-    if (sessionId && /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,255}$/.test(sessionId)) {
-      const sessionPath = join(_omcRoot, 'state', 'sessions', sessionId, `${name}-state.json`);
-      try { if (existsSync(sessionPath)) unlinkSync(sessionPath); } catch {}
-    }
-  }
-}
 
 /**
  * Link ralph and team state files for composition.
@@ -992,22 +1306,288 @@ function isTeamEnabled() {
 }
 
 /**
+ * Detect an installed AND enabled official Anthropic `ralph-loop` plugin
+ * that exposes a `/ralph-loop` command, without scanning any plugin payloads.
+ *
+ * Two independent signals, following existing installer semantics
+ * (`hasEnabledOmcPlugin` in src/installer/index.ts):
+ *
+ * 1. INSTALLED: the machine-readable plugin registry
+ *    `[$CLAUDE_CONFIG_DIR|~/.claude]/plugins/installed_plugins.json` contains
+ *    the official id `ralph-loop@claude-plugins-official` with a real
+ *    `commands/ralph-loop.md` payload under its installPath. The registry's
+ *    own `enabled` flag is deliberately NOT consulted: it does not
+ *    authoritatively encode enablement (a plugin disabled through canonical
+ *    settings can still carry `enabled: true`, and vice versa).
+ * 2. ENABLED: the official id is enabled by the effective Claude Code settings
+ *    for the active project, resolved highest-precedence-first across
+ *    `<project>/.claude/settings.local.json`, `<project>/.claude/settings.json`
+ *    and `[$CLAUDE_CONFIG_DIR|~/.claude]/settings.json`. Within a file the
+ *    canonical `enabledPlugins` field decides (legacy `plugins` field accepted
+ *    for backward compatibility), as an array of plugin ids or a map whose
+ *    value is not `false`. Missing or malformed settings are treated as not
+ *    enabled, exactly like the installer.
+ *
+ * Both signals match the FULL plugin id exactly, marketplace suffix included.
+ * The suffix is never stripped, so a same-named community plugin
+ * (`ralph-loop@community`) can never stand in for the official one — not even
+ * when the official plugin is installed and explicitly disabled.
+ *
+ * No SKILL.md body, command body, or private payload is ever read.
+ *
+ * Returns a short notice string, or '' when the official plugin is not
+ * installed and enabled.
+ */
+const OFFICIAL_RALPH_LOOP_PLUGIN_ID = 'ralph-loop@claude-plugins-official';
+
+function isOfficialRalphLoopPluginId(value) {
+  return typeof value === 'string'
+    && value.trim().toLowerCase() === OFFICIAL_RALPH_LOOP_PLUGIN_ID;
+}
+
+/**
+ * Enablement verdict of a single settings field for the official plugin:
+ * `true`/`false` when the field mentions the official id, `null` when it does
+ * not mention it at all (so the next field may decide).
+ */
+function officialRalphLoopEnablementIn(field) {
+  if (Array.isArray(field)) {
+    return field.some((id) => isOfficialRalphLoopPluginId(id)) ? true : null;
+  }
+  if (field && typeof field === 'object') {
+    for (const [id, value] of Object.entries(field)) {
+      if (isOfficialRalphLoopPluginId(id)) return value !== false;
+    }
+  }
+  return null;
+}
+
+function officialRalphLoopEnablementInSettings(settings) {
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return null;
+  // Canonical `enabledPlugins` wins outright when it mentions the official id;
+  // the legacy `plugins` field only decides when canonical is silent about it.
+  for (const field of [settings.enabledPlugins, settings.plugins]) {
+    const verdict = officialRalphLoopEnablementIn(field);
+    if (verdict !== null) return verdict;
+  }
+  return null;
+}
+
+/**
+ * A hook payload's cwd is caller-supplied. Only an absolute path is a usable
+ * project root; anything else would silently resolve a caller-controlled
+ * fragment against the hook process cwd, so it is rejected in favour of the
+ * hook's own cwd.
+ */
+function resolveSettingsProjectRoot(directory) {
+  return typeof directory === 'string' && directory.length > 0 && isAbsolute(directory)
+    ? directory
+    : process.cwd();
+}
+
+/**
+ * Claude Code resolves `enabledPlugins` across settings scopes, so a project may
+ * enable a plugin the user scope never mentions, or disable one the user scope
+ * enables. Highest precedence first; the first scope that mentions the official
+ * id decides, scopes that never mention it are transparent, and a malformed
+ * file fails closed (no notice).
+ */
+function isOfficialRalphLoopEnabledForProject(directory) {
+  const projectRoot = resolveSettingsProjectRoot(directory);
+  const settingsPaths = [
+    join(projectRoot, '.claude', 'settings.local.json'),
+    join(projectRoot, '.claude', 'settings.json'),
+    join(getClaudeConfigDir(), 'settings.json'),
+  ];
+  for (const settingsPath of settingsPaths) {
+    if (!existsSync(settingsPath)) continue;
+    let settings;
+    try {
+      settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    } catch {
+      return false;
+    }
+    const verdict = officialRalphLoopEnablementInSettings(settings);
+    if (verdict !== null) return verdict;
+  }
+  return false;
+}
+
+function findOfficialRalphLoopNotice(directory) {
+  if (!isOfficialRalphLoopEnabledForProject(directory)) {
+    return '';
+  }
+
+  const installedPluginsPath = join(getClaudeConfigDir(), 'plugins', 'installed_plugins.json');
+  if (!existsSync(installedPluginsPath)) {
+    return '';
+  }
+
+  let registry;
+  try {
+    registry = JSON.parse(readFileSync(installedPluginsPath, 'utf-8'));
+  } catch {
+    return '';
+  }
+  if (!registry || typeof registry !== 'object' || Array.isArray(registry)) {
+    return '';
+  }
+
+  const plugins = registry.plugins ?? registry;
+  if (!plugins || typeof plugins !== 'object' || Array.isArray(plugins)) {
+    return '';
+  }
+
+  const entries = plugins[OFFICIAL_RALPH_LOOP_PLUGIN_ID];
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return '';
+  }
+
+  for (const entry of entries) {
+    if (!entry || typeof entry !== 'object') continue;
+    const installPath = entry.installPath;
+    if (typeof installPath !== 'string' || installPath.length === 0) continue;
+    const commandFile = join(installPath, 'commands', 'ralph-loop.md');
+    if (existsSync(commandFile)) {
+      return 'Note: the official Anthropic `ralph-loop` plugin is also installed. `/ralph` runs OMC\'s ralph; use `/ralph-loop` for the official plugin.';
+    }
+  }
+
+  return '';
+}
+
+// Read the OMC JSONC config the way src/config/loader.ts does, inlined so the
+// standalone hook stays build-independent (mirrors scripts/lib/agent-model-config.mjs).
+function getOmcUserConfigDir() {
+  if (process.platform === 'win32') {
+    return process.env.APPDATA || join(homedir(), 'AppData', 'Roaming');
+  }
+  return process.env.XDG_CONFIG_HOME || join(homedir(), '.config');
+}
+
+// Mirrors src/utils/jsonc.ts:stripJsoncComments (strips comments AND trailing commas)
+function stripJsoncComments(content) {
+  return stripTrailingCommas(stripComments(content));
+}
+
+function stripComments(content) {
+  let result = '';
+  let i = 0;
+  while (i < content.length) {
+    if (content[i] === '/' && content[i + 1] === '/') {
+      while (i < content.length && content[i] !== '\n') i++;
+      continue;
+    }
+    if (content[i] === '/' && content[i + 1] === '*') {
+      i += 2;
+      while (i < content.length && !(content[i] === '*' && content[i + 1] === '/')) i++;
+      if (i >= content.length) throw new SyntaxError('Unterminated JSONC block comment');
+      i += 2;
+      result += ' ';
+      continue;
+    }
+    if (content[i] === '"') {
+      result += content[i++];
+      while (i < content.length && content[i] !== '"') {
+        if (content[i] === '\\') {
+          result += content[i++];
+          if (i < content.length) result += content[i++];
+          continue;
+        }
+        result += content[i++];
+      }
+      if (i < content.length) result += content[i++];
+      continue;
+    }
+    result += content[i++];
+  }
+  return result;
+}
+
+// Mirrors src/utils/jsonc.ts:stripTrailingCommas (comma before a closing } or ]).
+function stripTrailingCommas(content) {
+  let result = '';
+  let i = 0;
+  while (i < content.length) {
+    if (content[i] === '"') {
+      result += content[i++];
+      while (i < content.length && content[i] !== '"') {
+        if (content[i] === '\\') {
+          result += content[i++];
+          if (i < content.length) result += content[i++];
+          continue;
+        }
+        result += content[i++];
+      }
+      if (i < content.length) result += content[i++];
+      continue;
+    }
+    if (content[i] === ',') {
+      let j = i + 1;
+      while (j < content.length && /\s/.test(content[j])) j++;
+      if (content[j] === '}' || content[j] === ']') {
+        i++;
+        continue;
+      }
+    }
+    result += content[i++];
+  }
+  return result;
+}
+
+function loadJsoncConfig(path) {
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(stripJsoncComments(readFileSync(path, 'utf-8')));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Skills the user opted out of via `keywordDetector.disabled` in the OMC
+ * config: project `.claude/omc.jsonc` first, then user
+ * `~/.config/claude-omc/config.jsonc`, the same JSONC surface
+ * src/config/loader.ts reads. Empty when unset, so default behavior is
+ * unchanged. `cancel` is never disableable: it is the emergency stop.
+ * @param {string} directory project working directory
+ * @returns {Set<string>} disabled skill names (never includes 'cancel')
+ */
+function loadDisabledKeywords(directory) {
+  const configPaths = [
+    join(directory || process.cwd(), '.claude', 'omc.jsonc'),
+    join(getOmcUserConfigDir(), 'claude-omc', 'config.jsonc'),
+  ];
+  for (const configPath of configPaths) {
+    const config = loadJsoncConfig(configPath);
+    const disabled = config?.keywordDetector?.disabled;
+    if (Array.isArray(disabled)) {
+      return new Set(disabled.filter((name) => name !== 'cancel'));
+    }
+  }
+  return new Set();
+}
+
+/**
  * Create a compact skill invocation guide without inlining SKILL.md bodies.
  * Full skill text remains available by path, avoiding UserPromptSubmit token blowups.
  */
-function createSkillInvocation(skillName, originalPrompt, args = '') {
+function createSkillInvocation(skillName, originalPrompt, args = '', directory = '') {
   const argsSection = args ? `
 Arguments: ${args}` : '';
   const skillPath = resolveSkillPath(skillName);
   const pathStatus = existsSync(skillPath)
     ? `Read fallback: open ${skillPath} and follow its SKILL.md instructions.`
     : `Read fallback: locate skills/${skillName}/SKILL.md in the active oh-my-claudecode plugin/install and follow it.`;
+  const ralphLoopNotice = skillName === 'ralph' ? findOfficialRalphLoopNotice(directory) : '';
 
   return `[MAGIC KEYWORD: ${skillName.toUpperCase()}]
 
 Skill routing detected: ${skillName}
 Preferred invocation: /oh-my-claudecode:${skillName}${args ? ` ${args}` : ''}
-${pathStatus}${argsSection}
+${pathStatus}${argsSection}${ralphLoopNotice ? `
+
+${ralphLoopNotice}` : ''}
 
 User request (compact echo; original prompt remains authoritative):
 ${compactHookText(originalPrompt)}
@@ -1018,10 +1598,10 @@ IMPORTANT: Start the ${skillName} workflow immediately. If the slash invocation 
 /**
  * Create multi-skill invocation message for combined keywords
  */
-function createMultiSkillInvocation(skills, originalPrompt) {
+function createMultiSkillInvocation(skills, originalPrompt, directory = '') {
   if (skills.length === 0) return '';
   if (skills.length === 1) {
-    return createSkillInvocation(skills[0].name, originalPrompt, skills[0].args);
+    return createSkillInvocation(skills[0].name, originalPrompt, skills[0].args, directory);
   }
 
   const skillBlocks = skills.map((s, i) => {
@@ -1034,29 +1614,24 @@ function createMultiSkillInvocation(skills, originalPrompt) {
 Preferred invocation: /oh-my-claudecode:${s.name}${argsText}
 ${pathStatus}`;
   }).join('\n\n');
+  // Multi-skill routing (e.g. `/ralph deep-interview`) must carry the same
+  // disambiguation notice as the single-skill path, or it becomes a bypass.
+  const ralphLoopNotice = skills.some((s) => s.name === 'ralph')
+    ? findOfficialRalphLoopNotice(directory)
+    : '';
 
   return `[MAGIC KEYWORDS DETECTED: ${skills.map(s => s.name.toUpperCase()).join(', ')}]
 
 Execute ALL detected workflows in order using compact invocation guidance. Do not inline full SKILL.md files into the prompt.
 
-${skillBlocks}
+${skillBlocks}${ralphLoopNotice ? `
+
+${ralphLoopNotice}` : ''}
 
 User request (compact echo; original prompt remains authoritative):
 ${compactHookText(originalPrompt)}
 
 IMPORTANT: Complete ALL skills listed above in order. Start with the first skill IMMEDIATELY.`;
-}
-
-/**
- * Create combined output for multiple skill matches
- */
-function createCombinedOutput(skillMatches, originalPrompt) {
-  const parts = [];
-  if (skillMatches.length > 0) {
-    parts.push('## Section 1: Skill Invocations\n\n' + createMultiSkillInvocation(skillMatches, originalPrompt));
-  }
-  const allNames = skillMatches.map(m => m.name.toUpperCase());
-  return `[MAGIC KEYWORDS DETECTED: ${allNames.join(', ')}]\n\n${parts.join('\n\n---\n\n')}\n\nIMPORTANT: Complete ALL sections above in order.`;
 }
 
 /**
@@ -1075,8 +1650,8 @@ function resolveConflicts(matches) {
   // Team keyword detection removed — team is now explicit-only via /team skill.
 
   // Sort by priority order
-  const priorityOrder = ['cancel','ralph','ultragoal','autopilot','ultrawork',
-    'ccg','ralplan','deep-interview','ai-slop-cleaner','tdd','code-review','security-review','ultrathink','deepsearch','analyze'];
+  const priorityOrder = ['cancel','ralph','ultragoal','autopilot','ralplan',
+    'deep-interview','ai-slop-cleaner','tdd','code-review','security-review','ultrathink','deepsearch','analyze'];
   resolved.sort((a, b) => priorityOrder.indexOf(a.name) - priorityOrder.indexOf(b.name));
 
   return resolved;
@@ -1096,11 +1671,63 @@ function createHookOutput(additionalContext) {
   };
 }
 
+const SKILL_TRIGGER_QUESTIONS = {
+  'skill-trigger': {
+    type: 'choice',
+    instructions: 'Which skill or mode should this user prompt trigger?',
+    criteria: {
+      cancel: 'The prompt explicitly invokes the cancel trigger.',
+      ralph: 'The prompt explicitly invokes the ralph trigger.',
+      autopilot: 'The prompt explicitly invokes the autopilot trigger.',
+      ralplan: 'The prompt explicitly invokes the ralplan trigger.',
+      tdd: 'The prompt explicitly invokes the tdd trigger.',
+      'code-review': 'The prompt explicitly invokes the code-review trigger.',
+      'security-review': 'The prompt explicitly invokes the security-review trigger.',
+      ultrathink: 'The prompt explicitly invokes the ultrathink trigger.',
+      deepsearch: 'The prompt explicitly invokes the deepsearch trigger.',
+      analyze: 'The prompt explicitly invokes the analyze trigger.',
+      'deep-interview': 'The prompt explicitly invokes the deep-interview trigger.',
+      codex: 'The prompt explicitly invokes the codex trigger.',
+      none: 'No trigger fires; handle the prompt without a mode or skill.',
+    },
+  },
+};
+
+const INTENT_QUESTIONS = {
+  intent: {
+    type: 'noul',
+    instructions:
+      'Does this user prompt start an Intent-intake request (a non-engineer contributor stating a problem/goal/constraints to start the requirements intake flow)?',
+    criteria: {
+      true: 'The prompt states a problem, goal, or constraints from a contributor and starts the Intent intake — a goal-level intent.md with problem/goal/users-and-systems/constraints/open-questions, not a solution design.',
+      false: 'Everything else: solution or engineering work, informational questions, or an existing workflow. Not an Intent-intake request.',
+    },
+  },
+};
+
+const TASK_SIZE_QUESTIONS = {
+  'task-size': {
+    type: 'choice',
+    instructions: 'What size is this task — how much orchestration does it warrant?',
+    criteria: {
+      small: 'Single-file or few-line change; run directly without heavy modes',
+      medium: 'Multi-file but single-area change; standard delegation',
+      large: 'Multi-area or architectural change; heavy orchestration (ralph/autopilot/team) is warranted',
+    },
+  },
+};
+
+const INTENT_SLASH_PATTERN = /^\s*\/(?:oh-my-claudecode:|omc:)?intent(?=\s|$|[?!.,;:])/i;
+
 // Main
 async function main() {
   // Skip guard: check OMC_SKIP_HOOKS env var (see issue #838)
   const _skipHooks = (process.env.OMC_SKIP_HOOKS || '').split(',').map(s => s.trim());
-  if (process.env.DISABLE_OMC === '1' || _skipHooks.includes('keyword-detector')) {
+  if (
+    process.env.DISABLE_OMC === '1' ||
+    process.env.DISABLE_OMC === 'true' ||
+    _skipHooks.includes('keyword-detector')
+  ) {
     console.log(JSON.stringify({ continue: true }));
     return;
   }
@@ -1131,6 +1758,44 @@ async function main() {
       return;
     }
 
+    // Named profiles are an explicit command surface. Handle them before generic
+    // autopilot keyword activation so only a complete, validated state is written.
+    const workflowInvocation = parseWorkflowInvocation(prompt);
+    if (workflowInvocation.kind === 'invalid-explicit-workflow-invocation') {
+      console.log(JSON.stringify(createHookOutput(
+        `[AUTOPILOT WORKFLOW ERROR] ${workflowInvocation.error} No autopilot state was activated.`
+      )));
+      return;
+    }
+    if (workflowInvocation.kind === 'valid') {
+      try {
+        if (!isWorkflowRuntimeSupported()) throw new Error('named autopilot workflow profiles require Linux with flock');
+        const resumedPrompt = resumeWorkflowProfile(directory, sessionId, workflowInvocation.workflowName, omcRoot);
+        if (resumedPrompt === false) throw new Error('workflow_descriptor_integrity_failed');
+        if (resumedPrompt) {
+          console.log(JSON.stringify(createHookOutput(resumedPrompt)));
+          return;
+        }
+        const workflow = selectWorkflowProfile(directory, workflowInvocation.workflowName);
+        const stagePrompt = activateWorkflowProfile(directory, sessionId, workflowInvocation.task, workflow, omcRoot, data.transcript_path || data.transcriptPath);
+        if (!stagePrompt) {
+          throw new Error('Could not persist workflow state.');
+        }
+        console.log(JSON.stringify(createHookOutput(stagePrompt)));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Workflow activation failed.';
+        console.log(JSON.stringify(createHookOutput(
+          `[AUTOPILOT WORKFLOW ERROR] ${message} No autopilot state was activated.`
+        )));
+      }
+      return;
+    }
+
+    if (isRetiredSlashInvocation(prompt)) {
+      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      return;
+    }
+
     // `/ask <provider> ...` delegates the remainder of the prompt to an
     // advisor process. Magic keywords inside that delegated payload must not
     // activate modes in the current Claude Code session.
@@ -1140,12 +1805,18 @@ async function main() {
     }
 
     if (isExplicitRalplanSlashInvocation(prompt)) {
-      activateRalplanStartupState(directory, prompt, sessionId, omcRoot);
+      const activationError = activateRalplanStartupState(directory, prompt, sessionId, omcRoot);
+      if (activationError) {
+        console.log(JSON.stringify(createHookOutput(
+          `[OMC STATE ERROR] ${activationError} No ralplan state was activated.`,
+        )));
+        return;
+      }
       console.log(JSON.stringify(createHookOutput(
         `[RALPLAN INIT]\n` +
         `Explicit /ralplan invoke detected during UserPromptSubmit.\n` +
         `ralplan state has been initialized immediately and marked awaiting confirmation so the stop hook will not block this startup path.\n\n` +
-        createSkillInvocation('ralplan', prompt)
+        createSkillInvocation('ralplan', prompt, '', directory)
       )));
       return;
     }
@@ -1168,7 +1839,7 @@ async function main() {
     }
 
     // Ralph keywords
-    if (hasActionableKeyword(cleanPrompt, /\b(ralph|don't stop|must complete|until done)\b|(랄프)(?!로렌)|(ラルフ)(?!・?ローレン)/i)) {
+    if (hasActionableRalphKeyword(cleanPrompt, /\b(ralph)\b|(랄프)(?!로렌)|(ラルフ)(?!・?ローレン)/i)) {
       matches.push({ name: 'ralph', args: '' });
     }
 
@@ -1179,8 +1850,8 @@ async function main() {
     // templates/hooks/keyword-detector.mjs, which already exclude it.
     if (hasActionableKeyword(cleanPrompt, /\b(autopilot|auto pilot|auto-pilot|full auto|fullsend)\b|(오토파일럿)|(オートパイロット)/i) ||
         hasActionableKeyword(cleanPrompt, /\b(build|create|make)\s+me\s+(an?\s+)?(app|feature|project|tool|plugin|website|api|server|cli|script|system|service|dashboard|bot|extension)\b/i) ||
-        hasActionableKeyword(cleanPrompt, /\bi\s+want\s+a\s+/i) ||
-        hasActionableKeyword(cleanPrompt, /\bi\s+want\s+an\s+/i) ||
+        hasActionableKeyword(cleanPrompt, /\bi\s+want\s+a\s+(app|feature|project|tool|plugin|website|api|server|cli|script|system|service|dashboard|bot|extension)\b/i) ||
+        hasActionableKeyword(cleanPrompt, /\bi\s+want\s+an\s+(app|feature|project|tool|plugin|website|api|server|cli|script|system|service|dashboard|bot|extension)\b/i) ||
         hasActionableKeyword(cleanPrompt, /\bhandle\s+it\s+all\b/i) ||
         hasActionableKeyword(cleanPrompt, /\bend\s+to\s+end\b/i) ||
         hasActionableKeyword(cleanPrompt, /\be2e\s+this\b/i)) {
@@ -1194,18 +1865,8 @@ async function main() {
 
     // Ultrapilot keywords removed — routed to team which is now explicit-only (/team).
 
-    // Ultrawork keywords
-    if (hasActionableKeyword(cleanPrompt, /\b(ultrawork|ulw|uw)\b|(울트라워크)|(ウルトラワーク)/i)) {
-      matches.push({ name: 'ultrawork', args: '' });
-    }
-
     // Team keyword detection removed — team mode is now explicit-only via /team skill.
     // This prevents infinite spawning when Claude workers receive prompts containing "team".
-
-    // CCG keywords (Claude-Codex-Gemini tri-model orchestration)
-    if (hasActionableKeyword(cleanPrompt, /\b(ccg|claude-codex-gemini)\b|(씨씨지)|(シーシージー)/i)) {
-      matches.push({ name: 'ccg', args: '' });
-    }
 
     // Ralplan keyword
     if (hasActionableRalplanKeyword(cleanPrompt, /\b(ralplan)\b|(랄플랜)|(ラルプラン)/i)) {
@@ -1263,10 +1924,15 @@ async function main() {
       matches.push({ name: 'wiki', args: '' });
     }
 
-    // Deduplicate matches by keyword name before conflict resolution
+    // Drop user-disabled keywords, then dedupe before conflict resolution.
+    // This chokepoint covers both magic-keyword and mode-injection keywords.
+    const disabledKeywords = loadDisabledKeywords(directory);
     const seen = new Set();
     const uniqueMatches = [];
     for (const m of matches) {
+      if (disabledKeywords.has(m.name)) {
+        continue;
+      }
       if (!seen.has(m.name)) {
         seen.add(m.name);
         uniqueMatches.push(m);
@@ -1274,7 +1940,58 @@ async function main() {
     }
 
     // Resolve conflicts
-    const resolved = resolveConflicts(uniqueMatches);
+    let resolved = resolveConflicts(uniqueMatches);
+
+    const permissionMode = data.permission_mode;
+    if (isJevShadowOptedIn('skill-trigger', process.env, permissionMode)) {
+      const jevResult = recordJevShadow({
+        point: 'skill-trigger',
+        state: { prompt: cleanPrompt, source: 'user-prompt-submit' },
+        questions: SKILL_TRIGGER_QUESTIONS,
+        heuristic: resolved.map((match) => match.name),
+        permissionMode,
+      });
+      
+      // In active mode, use Jev's skill choice
+      if (jevResult && jevResult.mode === 'active' && jevResult.answer) {
+        const jevChoice = jevResult.answer.choice?.toLowerCase();
+        if (jevChoice && jevChoice !== 'none') {
+          // Override with Jev's chosen skill
+          const matchedKeyword = uniqueMatches.find((m) => m.name === jevChoice);
+          resolved = matchedKeyword ? [matchedKeyword] : resolved;
+        } else if (jevChoice === 'none') {
+          // Jev says no trigger
+          resolved = [];
+        }
+      }
+    }
+    if (isJevShadowOptedIn('intent', process.env, permissionMode)) {
+      const jevResult = recordJevShadow({
+        point: 'intent',
+        state: { prompt: cleanPrompt, mode_name: 'intent' },
+        questions: INTENT_QUESTIONS,
+        heuristic: INTENT_SLASH_PATTERN.test(cleanPrompt),
+        permissionMode,
+      });
+      // In active mode, intent Jev answer could be used here if needed
+      // Currently logging-only: resolved keywords come from skill-trigger
+    }
+    if (isJevShadowOptedIn('task-size', process.env, permissionMode)) {
+      try {
+        const { classifyTaskSize } = await import('../dist/hooks/task-size-detector/index.js');
+        const jevResult = recordJevShadow({
+          point: 'task-size',
+          state: { prompt: cleanPrompt, source: 'user-prompt-submit' },
+          questions: TASK_SIZE_QUESTIONS,
+          heuristic: classifyTaskSize(cleanPrompt),
+          permissionMode,
+        });
+        // In active mode, task-size Jev answer could be used here if needed
+        // Currently logging-only: task sizing is handled on TypeScript side
+      } catch {
+        // The compiled twin is optional for script-only installs; never affect prompt handling.
+      }
+    }
 
     // Import flow tracer once (best-effort)
     let tracer = null;
@@ -1324,11 +2041,11 @@ async function main() {
         });
 
         if (isTeamFollowup) {
-          console.log(JSON.stringify(createHookOutput(createSkillInvocation('team', prompt))));
+          console.log(JSON.stringify(createHookOutput(createSkillInvocation('team', prompt, '', directory))));
           return;
         }
         if (isRalphFollowup) {
-          console.log(JSON.stringify(createHookOutput(createSkillInvocation('ralph', prompt))));
+          console.log(JSON.stringify(createHookOutput(createSkillInvocation('ralph', prompt, '', directory))));
           return;
         }
 
@@ -1344,11 +2061,11 @@ async function main() {
       }
     }
 
-    // No matches - pass through.
+    // Nothing left to act on (no keywords, or all opted out) - pass through.
     // Keep this after approved follow-up handling so short post-ralplan
     // prompts like "team" can launch the approved execution path even
     // though generic team keyword auto-detection is disabled.
-    if (matches.length === 0) {
+    if (resolved.length === 0) {
       console.log(JSON.stringify({ continue: true, suppressOutput: true }));
       return;
     }
@@ -1360,17 +2077,32 @@ async function main() {
       }
     }
 
-    // Handle cancel specially - clear states and emit
+    // Route cancellation without mutating state; the cancel workflow commits the primary mode first.
     if (resolved.length > 0 && resolved[0].name === 'cancel') {
-      clearStateFiles(directory, ['ralph', 'ultragoal', 'autopilot', 'ultrawork', 'swarm', 'ralplan'], sessionId, omcRoot);
-      console.log(JSON.stringify(createHookOutput(createSkillInvocation('cancel', prompt))));
+      console.log(JSON.stringify(createHookOutput(createSkillInvocation('cancel', prompt, '', directory))));
       return;
     }
 
     // Activate states for modes that need them (team removed — explicit-only via /team skill)
-    const stateModes = resolved.filter(m => ['ralph', 'ultragoal', 'autopilot', 'ultrawork', 'ralplan'].includes(m.name));
+    // A prompt that sanitizes to the pasted-echo sentinel has no recoverable
+    // user request, so a state armed from it can never be attributed or
+    // confirmed and would block every Stop after the confirmation TTL (#4250).
+    const isPastedEchoPrompt = sanitizePromptForState(prompt) === PASTED_ECHO_PROMPT_SENTINEL;
+    const stateModes = isPastedEchoPrompt
+      ? []
+      : resolved.filter(m => ['ralph', 'ultragoal', 'autopilot', 'ralplan'].includes(m.name));
     for (const mode of stateModes) {
-      activateState(directory, prompt, mode.name, sessionId, omcRoot);
+      const activationError = await activateState(directory, prompt, mode.name, sessionId);
+      if (activationError === 'workflow_descriptor_integrity_failed') {
+        console.log(JSON.stringify(createHookOutput('workflow_descriptor_integrity_failed')));
+        return;
+      }
+      if (activationError) {
+        console.log(JSON.stringify(createHookOutput(
+          `[OMC STATE ERROR] ${activationError} No ${mode.name} state was activated.`,
+        )));
+        return;
+      }
     }
 
     // Record mode changes to flow trace
@@ -1378,13 +2110,6 @@ async function main() {
       for (const mode of stateModes) {
         try { tracer.recordModeChange(directory, sessionId, 'none', mode.name); } catch { /* silent */ }
       }
-    }
-
-    // Special: Ralph with ultrawork
-    const hasRalph = resolved.some(m => m.name === 'ralph');
-    const hasUltrawork = resolved.some(m => m.name === 'ultrawork');
-    if (hasRalph && !hasUltrawork) {
-      activateState(directory, prompt, 'ultrawork', sessionId, omcRoot);
     }
 
     const additionalContextParts = [];
@@ -1402,7 +2127,7 @@ async function main() {
     }
 
     if (resolved.length > 0) {
-      additionalContextParts.push(createMultiSkillInvocation(resolved, prompt));
+      additionalContextParts.push(createMultiSkillInvocation(resolved, prompt, directory));
     }
 
     if (additionalContextParts.length > 0) {

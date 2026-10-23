@@ -1,10 +1,12 @@
+import { createHash } from "crypto";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { execSync } from "child_process";
-import { checkPersistentModes } from "./index.js";
-import { activateUltrawork, deactivateUltrawork } from "../ultrawork/index.js";
+import { checkPersistentModes, createHookOutput } from "./index.js";
+import { clearModeStateFile, writeModeState } from "../../lib/mode-state-io.js";
+import { initAutopilot } from "../autopilot/index.js";
 
 function writePendingTodo(tempDir: string, content: string): void {
   mkdirSync(join(tempDir, '.claude'), { recursive: true });
@@ -22,6 +24,21 @@ function writePendingTodo(tempDir: string, content: string): void {
   );
 }
 
+function activateUltrawork(prompt: string, sessionId: string | undefined, directory: string): boolean {
+  return writeModeState('ultrawork', {
+    active: true,
+    original_prompt: prompt,
+    session_id: sessionId,
+    started_at: new Date().toISOString(),
+    last_checked_at: new Date().toISOString(),
+    reinforcement_count: 0,
+  }, directory, sessionId);
+}
+
+function deactivateUltrawork(directory: string, sessionId?: string): boolean {
+  return clearModeStateFile('ultrawork', directory, sessionId);
+}
+
 describe("Persistent Mode Session Isolation (Issue #311)", () => {
   let tempDir: string;
 
@@ -32,17 +49,18 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
 
   afterEach(() => {
     rmSync(tempDir, { recursive: true, force: true });
+    delete process.env.OMC_TEST_FLOCK_AVAILABLE;
   });
 
   describe("checkPersistentModes session isolation", () => {
-    it("should block stop when session_id matches active ultrawork", async () => {
+    it("ignores retired ultrawork state even when session_id matches", async () => {
       const sessionId = "session-owner";
       activateUltrawork("Fix the bug", sessionId, tempDir);
       writePendingTodo(tempDir, "Finish the bug fix");
 
       const result = await checkPersistentModes(sessionId, tempDir);
-      expect(result.shouldBlock).toBe(true);
-      expect(result.mode).toBe("ultrawork");
+      expect(result.shouldBlock).toBe(false);
+      expect(result.mode).toBe("none");
     });
 
     it("should NOT block stop when session_id does not match", async () => {
@@ -77,7 +95,250 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
       expect(result.shouldBlock).toBe(false);
     });
 
-    it("should support session-scoped state files", async () => {
+    it("propagates a named workflow integrity diagnostic through the public Stop output", async () => {
+      const sessionId = "partial-named-diagnostic";
+      const sessionDir = join(tempDir, ".omc", "state", "sessions", sessionId);
+      mkdirSync(sessionDir, { recursive: true });
+      writeFileSync(
+        join(sessionDir, "autopilot-state.json"),
+        JSON.stringify({
+          active: true,
+          phase: "ralplan",
+          session_id: sessionId,
+          project_path: tempDir,
+          started_at: new Date().toISOString(),
+          workflow: false,
+        }),
+      );
+
+      const result = await checkPersistentModes(sessionId, tempDir);
+
+      expect(result).toMatchObject({
+        shouldBlock: false,
+        mode: "autopilot",
+        message: "workflow_descriptor_integrity_failed",
+      });
+      expect(createHookOutput(result)).toEqual({
+        continue: true,
+        message: "workflow_descriptor_integrity_failed",
+      });
+    });
+
+    it("honors requested_at cancellation for an active non-autopilot mode beside a terminal named record", async () => {
+      const sessionId = "terminal-named-cancel-coexist";
+      activateUltrawork("Finish the task", sessionId, tempDir);
+      const sessionDir = join(tempDir, ".omc", "state", "sessions", sessionId);
+      writeFileSync(
+        join(sessionDir, "autopilot-state.json"),
+        JSON.stringify({
+          active: true,
+          phase: "complete",
+          session_id: sessionId,
+          project_path: tempDir,
+          started_at: new Date().toISOString(),
+          workflow: false,
+        }),
+      );
+      writeFileSync(
+        join(sessionDir, "cancel-signal-state.json"),
+        JSON.stringify({ requested_at: new Date().toISOString() }),
+      );
+
+      await expect(checkPersistentModes(sessionId, tempDir)).resolves.toMatchObject({
+        shouldBlock: false,
+        mode: "none",
+      });
+    });
+
+    it("requires an authenticated exact digest before cancelling an active legacy autopilot target", async () => {
+      const sessionId = "legacy-autopilot-cancel-auth";
+      const sessionDir = join(tempDir, ".omc", "state", "sessions", sessionId);
+      mkdirSync(sessionDir, { recursive: true });
+      const state = initAutopilot(tempDir, "Finish the task", sessionId)!;
+      state.phase = "planning";
+      state.project_path = tempDir;
+      writeFileSync(join(sessionDir, "autopilot-state.json"), JSON.stringify(state));
+      const signalPath = join(sessionDir, "cancel-signal-state.json");
+      const signal = (target_state_sha256?: string) => {
+        const requestedAt = Date.now();
+        return {
+          active: true,
+          mode: "autopilot",
+          source: "state_clear",
+          requested_at: new Date(requestedAt).toISOString(),
+          expires_at: new Date(requestedAt + 30_000).toISOString(),
+          ...(target_state_sha256 ? { target_state_sha256 } : {}),
+        };
+      };
+
+      writeFileSync(signalPath, JSON.stringify(signal()));
+      await expect(checkPersistentModes(sessionId, tempDir)).resolves.toMatchObject({
+        shouldBlock: true,
+        mode: "autopilot",
+      });
+
+      const currentState = JSON.parse(readFileSync(join(sessionDir, "autopilot-state.json"), "utf-8"));
+      writeFileSync(
+        signalPath,
+        JSON.stringify(signal(createHash("sha256").update(JSON.stringify(currentState)).digest("hex"))),
+      );
+      await expect(checkPersistentModes(sessionId, tempDir)).resolves.toMatchObject({
+        shouldBlock: false,
+        mode: "none",
+      });
+    });
+
+    it("does not honor an autopilot cancel signal without an exclusive state lock", async () => {
+      const sessionId = "legacy-autopilot-cancel-no-flock";
+      const sessionDir = join(tempDir, ".omc", "state", "sessions", sessionId);
+      mkdirSync(sessionDir, { recursive: true });
+      const state = initAutopilot(tempDir, "Finish the task", sessionId)!;
+      state.phase = "planning";
+      state.project_path = tempDir;
+      writeFileSync(join(sessionDir, "autopilot-state.json"), JSON.stringify(state));
+      const now = Date.now();
+      writeFileSync(join(sessionDir, "cancel-signal-state.json"), JSON.stringify({
+        active: true,
+        mode: "autopilot",
+        source: "state_clear",
+        requested_at: new Date(now).toISOString(),
+        expires_at: new Date(now + 30_000).toISOString(),
+        target_state_sha256: createHash("sha256").update(JSON.stringify(state)).digest("hex"),
+      }));
+      // Corrupt owner metadata must fail closed without executing the cancellation callback.
+      writeFileSync(join(sessionDir, 'autopilot-state.json.mutation.lock'), '{invalid owner');
+
+      await expect(checkPersistentModes(sessionId, tempDir)).resolves.toMatchObject({
+        shouldBlock: true,
+        mode: "autopilot",
+      });
+    });
+
+    it("honors a requested-at-only Ultrawork cancellation without flock when canonical autopilot discovery finds no target", async () => {
+      const sessionId = "portable-generic-cancel-no-autopilot";
+      activateUltrawork("Finish the task", sessionId, tempDir);
+      writePendingTodo(tempDir, "Finish the task");
+      const sessionDir = join(tempDir, ".omc", "state", "sessions", sessionId);
+      writeFileSync(join(sessionDir, "cancel-signal-state.json"), JSON.stringify({
+        active: true,
+        requested_at: new Date().toISOString(),
+        source: "state_clear",
+      }));
+      process.env.OMC_TEST_FLOCK_AVAILABLE = "0";
+
+      await expect(checkPersistentModes(sessionId, tempDir)).resolves.toMatchObject({
+        shouldBlock: false,
+        mode: "none",
+      });
+    });
+
+    it.each([
+      ["active", (state: Record<string, unknown>) => state],
+      ["replacement", (state: Record<string, unknown>) => ({ ...state, originalIdea: "Replacement run" })],
+    ])("does not let a requested-at-only Ultrawork cancellation suppress a %s autopilot without flock", async (_name, replace) => {
+      const sessionId = `portable-generic-cancel-autopilot-${_name}`;
+      activateUltrawork("Finish the task", sessionId, tempDir);
+      writePendingTodo(tempDir, "Finish the task");
+      const sessionDir = join(tempDir, ".omc", "state", "sessions", sessionId);
+      mkdirSync(sessionDir, { recursive: true });
+      const state = initAutopilot(tempDir, "Finish the task", sessionId)!;
+      state.phase = "planning";
+      state.project_path = tempDir;
+      writeFileSync(join(sessionDir, "autopilot-state.json"), JSON.stringify(replace(state as unknown as Record<string, unknown>)));
+      writeFileSync(join(sessionDir, "cancel-signal-state.json"), JSON.stringify({
+        active: true,
+        requested_at: new Date().toISOString(),
+        source: "state_clear",
+      }));
+      process.env.OMC_TEST_FLOCK_AVAILABLE = "0";
+
+      await expect(checkPersistentModes(sessionId, tempDir)).resolves.toMatchObject({
+        shouldBlock: true,
+        mode: "autopilot",
+      });
+    });
+
+    it.each([
+      ['stage advance', (state: Record<string, unknown>) => ({ ...state, phase: 'execution' })],
+      ['replacement run', (state: Record<string, unknown>) => ({ ...state, originalIdea: 'Replacement run' })],
+    ])('does not let a cancel signal for a prior autopilot generation suppress a %s', async (_name, replace) => {
+      const sessionId = `autopilot-cancel-prior-generation-${_name.replace(' ', '-')}`;
+      const sessionDir = join(tempDir, '.omc', 'state', 'sessions', sessionId);
+      mkdirSync(sessionDir, { recursive: true });
+      const state = initAutopilot(tempDir, 'Finish the task', sessionId)!;
+      state.phase = 'planning';
+      state.project_path = tempDir;
+      const statePath = join(sessionDir, 'autopilot-state.json');
+      const signalPath = join(sessionDir, 'cancel-signal-state.json');
+      writeFileSync(statePath, JSON.stringify(state));
+      const requestedAt = Date.now();
+      writeFileSync(signalPath, JSON.stringify({
+        active: true,
+        mode: 'autopilot',
+        source: 'state_clear',
+        requested_at: new Date(requestedAt).toISOString(),
+        expires_at: new Date(requestedAt + 30_000).toISOString(),
+        target_state_sha256: createHash('sha256').update(JSON.stringify(state)).digest('hex'),
+      }));
+      writeFileSync(statePath, JSON.stringify(replace(state as unknown as Record<string, unknown>)));
+
+      await expect(checkPersistentModes(sessionId, tempDir)).resolves.toMatchObject({
+        shouldBlock: true,
+        mode: 'autopilot',
+      });
+    });
+
+    it.each([
+      ['future-dated', 6_000, true],
+      ['stale', -30_001, true],
+      ['fresh', 0, false],
+    ])('applies requested_at freshness to an exact-digest active legacy autopilot cancellation (%s)', async (_name, offsetMs, shouldBlock) => {
+      const sessionId = `legacy-autopilot-cancel-freshness-${offsetMs}`;
+      const sessionDir = join(tempDir, '.omc', 'state', 'sessions', sessionId);
+      mkdirSync(sessionDir, { recursive: true });
+      const state = initAutopilot(tempDir, 'Finish the task', sessionId)!;
+      state.phase = 'planning';
+      state.project_path = tempDir;
+      writeFileSync(join(sessionDir, 'autopilot-state.json'), JSON.stringify(state));
+      const requestedAt = Date.now() + offsetMs;
+      writeFileSync(join(sessionDir, 'cancel-signal-state.json'), JSON.stringify({
+        active: true,
+        mode: 'autopilot',
+        source: 'state_clear',
+        requested_at: new Date(requestedAt).toISOString(),
+        expires_at: new Date(requestedAt + 30_000).toISOString(),
+        target_state_sha256: createHash('sha256').update(JSON.stringify(state)).digest('hex'),
+      }));
+
+      await expect(checkPersistentModes(sessionId, tempDir)).resolves.toMatchObject({
+        shouldBlock,
+        mode: shouldBlock ? 'autopilot' : 'none',
+      });
+    });
+
+    it.each([
+      ['future-dated', 6_000],
+      ['stale', -30_001],
+      ['fresh', 0],
+    ])('ignores requested_at-only cancellation for retired state (%s)', async (_name, offsetMs) => {
+      const sessionId = `ultrawork-cancel-freshness-${offsetMs}`;
+      activateUltrawork('Finish the task', sessionId, tempDir);
+      writePendingTodo(tempDir, 'Finish the task');
+      const requestedAt = Date.now() + offsetMs;
+      const sessionDir = join(tempDir, '.omc', 'state', 'sessions', sessionId);
+      writeFileSync(join(sessionDir, 'cancel-signal-state.json'), JSON.stringify({
+        active: true,
+        requested_at: new Date(requestedAt).toISOString(),
+        source: 'state_clear',
+      }));
+
+      await expect(checkPersistentModes(sessionId, tempDir)).resolves.toMatchObject({
+        shouldBlock: false,
+        mode: 'none',
+      });
+    });
+
+    it("ignores retired session-scoped state files", async () => {
       const sessionId = "session-scoped-test";
       writePendingTodo(tempDir, "Finish the session-scoped task");
       // Create state in session-scoped directory
@@ -96,8 +357,8 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
       );
 
       const result = await checkPersistentModes(sessionId, tempDir);
-      expect(result.shouldBlock).toBe(true);
-      expect(result.mode).toBe("ultrawork");
+      expect(result.shouldBlock).toBe(false);
+      expect(result.mode).toBe("none");
     });
 
     it("Session A cannot see Session B state in session-scoped dirs", async () => {
@@ -181,7 +442,7 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
       );
     }
 
-    it("should block when sessionId matches ultrawork state", () => {
+    it("ignores retired state when sessionId matches", () => {
       const sessionId = "test-session-match";
       createUltraworkState(tempDir, sessionId, "Test task");
 
@@ -190,8 +451,8 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
         sessionId: sessionId,
       });
 
-      expect(output.decision).toBe("block");
-      expect(output.reason).toContain("ULTRAWORK");
+      expect(output.continue).toBe(true);
+      expect(output.decision).toBeUndefined();
     });
 
     it("should NOT block when sessionId does not match ultrawork state", () => {
@@ -249,7 +510,7 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
       expect(output.decision).toBeUndefined();
     });
 
-    it("should block legacy state when invalid sessionId is provided (falls back to legacy)", () => {
+    it("ignores retired legacy state when invalid sessionId falls back", () => {
       const stateDir = join(tempDir, ".omc", "state");
       mkdirSync(stateDir, { recursive: true });
       writeFileSync(
@@ -272,8 +533,8 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
         sessionId: "../session-valid",
       });
 
-      // Invalid sessionId sanitizes to "", falls back to legacy path, blocks
-      expect(output.decision).toBe("block");
+      expect(output.continue).toBe(true);
+      expect(output.decision).toBeUndefined();
     });
 
     it("should allow stop when cancel signal only includes requested_at", () => {
@@ -303,6 +564,23 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
       expect(output.decision).toBeUndefined();
     });
 
+    it.each([
+      ["inactive", { active: false, session_id: "session-cancel-coexist", project_path: "/inactive-project" }],
+      ["cross-project", { active: true, phase: "execution", session_id: "session-cancel-coexist", project_path: "/other-project", last_checked_at: new Date().toISOString() }],
+    ])("allows requested_at-only cancellation for ultrawork with a %s autopilot record", (_kind, autopilotState) => {
+      const sessionId = "session-cancel-coexist";
+      createUltraworkState(tempDir, sessionId, "Task being cancelled");
+      const sessionDir = join(tempDir, ".omc", "state", "sessions", sessionId);
+      writeFileSync(join(sessionDir, "autopilot-state.json"), JSON.stringify(autopilotState));
+      writeFileSync(join(sessionDir, "cancel-signal-state.json"), JSON.stringify({
+        active: true,
+        requested_at: new Date().toISOString(),
+        source: "test",
+      }));
+
+      expect(runPersistentModeScript({ directory: tempDir, sessionId })).toMatchObject({ continue: true });
+    });
+
     it("should NOT block for legacy autopilot state when sessionId is provided", () => {
       const stateDir = join(tempDir, ".omc", "state");
       mkdirSync(stateDir, { recursive: true });
@@ -329,7 +607,7 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
       expect(output.decision).toBeUndefined();
     });
 
-    it("should block for legacy state when no sessionId provided (backward compat)", () => {
+    it("ignores retired legacy state when no sessionId is provided", () => {
       const stateDir = join(tempDir, ".omc", "state");
       mkdirSync(stateDir, { recursive: true });
       writeFileSync(
@@ -351,9 +629,8 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
         directory: tempDir,
       });
 
-      // Legacy state blocks when no sessionId (backward compat)
-      expect(output.decision).toBe("block");
-      expect(output.reason).toContain("ULTRAWORK");
+      expect(output.continue).toBe(true);
+      expect(output.decision).toBeUndefined();
     });
 
     it("should block for legacy autopilot state when no sessionId provided", () => {
@@ -472,8 +749,8 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
         sessionId: sessionId,
       });
 
-      expect(output.decision).toBe("block");
-      expect(output.reason).toContain("ULTRAWORK");
+      expect(output.continue).toBe(true);
+      expect(output.decision).toBeUndefined();
     });
 
     it("should accept session_id (snake_case) for session identification", () => {
@@ -485,8 +762,8 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
         session_id: sessionId,
       });
 
-      expect(output.decision).toBe("block");
-      expect(output.reason).toContain("ULTRAWORK");
+      expect(output.continue).toBe(true);
+      expect(output.decision).toBeUndefined();
     });
 
     it("should accept sessionid (lowercase) for session identification", () => {
@@ -498,8 +775,8 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
         sessionid: sessionId,
       });
 
-      expect(output.decision).toBe("block");
-      expect(output.reason).toContain("ULTRAWORK");
+      expect(output.continue).toBe(true);
+      expect(output.decision).toBeUndefined();
     });
 
     it("should prefer sessionId over session_id when both provided", () => {
@@ -513,8 +790,8 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
         session_id: wrongSession,   // This should be ignored
       });
 
-      expect(output.decision).toBe("block");
-      expect(output.reason).toContain("ULTRAWORK");
+      expect(output.continue).toBe(true);
+      expect(output.decision).toBeUndefined();
     });
 
     it("should prefer session_id over sessionid when both provided", () => {
@@ -528,8 +805,8 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
         sessionid: wrongSession,     // This should be ignored
       });
 
-      expect(output.decision).toBe("block");
-      expect(output.reason).toContain("ULTRAWORK");
+      expect(output.continue).toBe(true);
+      expect(output.decision).toBeUndefined();
     });
 
     it("should prefer sessionId over sessionid when both provided", () => {
@@ -543,8 +820,8 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
         sessionid: wrongSession,    // This should be ignored
       });
 
-      expect(output.decision).toBe("block");
-      expect(output.reason).toContain("ULTRAWORK");
+      expect(output.continue).toBe(true);
+      expect(output.decision).toBeUndefined();
     });
 
     it("should fall back to session_id when sessionId is empty", () => {
@@ -557,8 +834,8 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
         session_id: sessionId,
       });
 
-      expect(output.decision).toBe("block");
-      expect(output.reason).toContain("ULTRAWORK");
+      expect(output.continue).toBe(true);
+      expect(output.decision).toBeUndefined();
     });
   });
 
@@ -616,8 +893,8 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
         sessionId: sessionId,
       });
 
-      expect(output.decision).toBe("block");
-      expect(output.reason).toContain("ULTRAWORK");
+      expect(output.continue).toBe(true);
+      expect(output.decision).toBeUndefined();
     });
 
     it("should NOT block when project_path does not match current directory", () => {
@@ -729,8 +1006,8 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
         sessionId: "..\\session-valid",
       });
 
-      // Invalid sessionId sanitizes to "", falls back to legacy path, blocks
-      expect(output.decision).toBe("block");
+      expect(output.continue).toBe(true);
+      expect(output.decision).toBeUndefined();
     });
 
     it("should block for legacy local state when no sessionId (backward compat)", () => {
@@ -756,8 +1033,8 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
       });
 
       // Legacy state blocks when no sessionId
-      expect(output.decision).toBe("block");
-      expect(output.reason).toContain("ULTRAWORK");
+      expect(output.continue).toBe(true);
+      expect(output.decision).toBeUndefined();
     });
   });
 });

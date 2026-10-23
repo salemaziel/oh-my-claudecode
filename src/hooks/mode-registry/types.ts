@@ -9,9 +9,8 @@ export type ExecutionMode =
   | 'autoresearch'
   | 'team'
   | 'ralph'
-  | 'ultrawork'
-  | 'ultraqa'
   | 'deep-interview'
+  | 'merge-readiness'
   | 'self-improve';
 
 export interface ModeConfig {

@@ -611,5 +611,455 @@ describe('unified MCP registry sync', () => {
         expect(result.serverNames).toEqual(['gitnexus']);
         expect(result.bootstrappedFromClaude).toBe(false);
     });
+    // ---------------------------------------------------------------------------
+    // Issue #3601: Codex TOML literal-string parsing.
+    // `codex mcp add` writes TOML *literal* strings (single-quoted) on Windows.
+    // The parser previously accepted only *basic* strings (double-quoted), causing
+    // present MCP servers to be reported as `codexMissing`.
+    // ---------------------------------------------------------------------------
+    it('parses Codex TOML literal-string commands and args on Windows (issue #3601)', () => {
+        // Construct Windows paths with String.raw so actual backslashes survive.
+        // Include both \t and \n character-pair segments to prove byte fidelity.
+        const winCommand = String.raw `H:\tools\new\python.exe`;
+        const winArg = String.raw `H:\path\to\node\nserver.js`;
+        // Byte-safety assertion: the JS values contain literal backslashes, not control chars.
+        expect(winCommand).toBe('H:\\tools\\new\\python.exe');
+        expect(winArg).toBe('H:\\path\\to\\node\\nserver.js');
+        expect(winCommand).not.toContain('\t');
+        expect(winCommand).not.toContain('\n');
+        expect(winArg).not.toContain('\t');
+        expect(winArg).not.toContain('\n');
+        const registry = {
+            fred: { command: winCommand, args: [winArg, '--stdio'] },
+        };
+        writeFileSync(getUnifiedMcpRegistryPath(), JSON.stringify(registry, null, 2));
+        writeFileSync(getClaudeMcpConfigPath(), JSON.stringify({ mcpServers: registry }, null, 2));
+        writeFileSync(getCodexConfigPath(), [
+            '[mcp_servers.fred]',
+            `command = '${winCommand}'`,
+            `args = ['${winArg}', '--stdio']`,
+            '',
+        ].join('\n'));
+        const status = inspectUnifiedMcpRegistrySync();
+        expect(status.codexMissing).toEqual([]);
+        expect(status.codexMismatched).toEqual([]);
+        expect(status.claudeMissing).toEqual([]);
+        expect(status.claudeMismatched).toEqual([]);
+    });
+    it('still accepts basic (double-quoted) strings including escaped quotes and backslashes', () => {
+        const registry = {
+            gitnexus: {
+                command: 'C:\\tools\\gitnexus.exe',
+                args: ['--config=C:\\data\\app.json', '--name="my server"'],
+            },
+        };
+        writeFileSync(getUnifiedMcpRegistryPath(), JSON.stringify(registry, null, 2));
+        writeFileSync(getClaudeMcpConfigPath(), JSON.stringify({ mcpServers: registry }, null, 2));
+        writeFileSync(getCodexConfigPath(), [
+            '[mcp_servers.gitnexus]',
+            'command = "C:\\\\tools\\\\gitnexus.exe"',
+            'args = ["--config=C:\\\\data\\\\app.json", "--name=\\"my server\\""]',
+            '',
+        ].join('\n'));
+        const status = inspectUnifiedMcpRegistrySync();
+        expect(status.codexMissing).toEqual([]);
+        expect(status.codexMismatched).toEqual([]);
+    });
+    it('escapes newlines in args so the rendered Codex TOML stays valid and round-trips (issue #4157)', () => {
+        const script = '# ok-mcp-v2\nBUNDLE="$HOME/ok.sh"\r\nexec "$BUNDLE" mcp';
+        const registry = {
+            'open-knowledge': { command: '/bin/sh', args: ['-l', '-c', script] },
+        };
+        writeFileSync(getUnifiedMcpRegistryPath(), JSON.stringify(registry, null, 2));
+        writeFileSync(getClaudeMcpConfigPath(), JSON.stringify({ mcpServers: registry }, null, 2));
+        syncUnifiedMcpRegistryTargets({});
+        const toml = readFileSync(getCodexConfigPath(), 'utf-8');
+        expect(toml).toContain('args = ["-l", "-c", "# ok-mcp-v2\\nBUNDLE=\\"$HOME/ok.sh\\"\\r\\nexec \\"$BUNDLE\\" mcp"]');
+        const status = inspectUnifiedMcpRegistrySync();
+        expect(status.codexMissing).toEqual([]);
+        expect(status.codexMismatched).toEqual([]);
+    });
+    it('parses mixed literal and basic string arrays with delimiters and escapes', () => {
+        // Literal token contains comma, bracket, equals, hash, and backslash (delimiter-rich).
+        const literalRich = String.raw `C:\data\file,[name]=#.py`;
+        // Basic token has escaped quote and paired backslashes.
+        const basicEscaped = '--name="my, server"  \\path';
+        const registry = {
+            mixed: { command: 'python', args: [literalRich, basicEscaped] },
+        };
+        writeFileSync(getUnifiedMcpRegistryPath(), JSON.stringify(registry, null, 2));
+        writeFileSync(getClaudeMcpConfigPath(), JSON.stringify({ mcpServers: registry }, null, 2));
+        writeFileSync(getCodexConfigPath(), [
+            '[mcp_servers.mixed]',
+            'command = "python"',
+            `args = ['${literalRich}', "${basicEscaped.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"]`,
+            '',
+        ].join('\n'));
+        const status = inspectUnifiedMcpRegistrySync();
+        expect(status.codexMissing).toEqual([]);
+        expect(status.codexMismatched).toEqual([]);
+    });
+    it('ignores inferable omitted Codex MCP types and key order while reporting real differences (issue #4294)', () => {
+        const registry = {
+            context7: {
+                command: '/tools/context7-mcp.sh',
+                type: 'stdio',
+                env: { ZED: 'last', ALPHA: 'first' },
+            },
+            deepwiki: { url: 'https://mcp.deepwiki.com/mcp', type: 'http' },
+            changed: { command: 'python', args: ['server.py'], type: 'stdio' },
+            typeMismatch: { url: 'https://mcp.example.com', type: 'http' },
+            typeComment: { url: 'https://mcp.example.com/comment', type: 'http' },
+            typeLiteralComment: { url: 'https://mcp.example.com/literal-comment', type: 'http' },
+            sseOmitted: { url: 'https://mcp.example.com/sse', type: 'sse' },
+            unparsedType: { command: 'node', type: 'stdio' },
+            quotedTypeMismatch: { url: 'https://mcp.example.com/quoted', type: 'http' },
+            httpAlias: { url: 'https://mcp.example.com/http-alias', type: 'http' },
+            streamableAlias: { url: 'https://mcp.example.com/streamable-alias', type: 'streamable-http' },
+            streamableOmitted: { url: 'https://mcp.example.com/streamable-omitted', type: 'streamable-http' },
+            unicodeTypeMismatch: { url: 'https://mcp.example.com/unicode', type: 'http' },
+            implicitStdio: { command: '/tools/implicit-stdio.sh' },
+            implicitHttp: { url: 'https://mcp.example.com/implicit-http' },
+            implicitTypeMismatch: { url: 'https://mcp.example.com/implicit-mismatch' },
+            multilineType: { url: 'https://mcp.example.com/multiline-type' },
+            multilineLiteralType: { url: 'https://mcp.example.com/multiline-literal-type' },
+            multilineContinuationType: { url: 'https://mcp.example.com/multiline-continuation' },
+            multilineSpacedContinuationType: { url: 'https://mcp.example.com/multiline-spaced-continuation' },
+        };
+        writeFileSync(getUnifiedMcpRegistryPath(), JSON.stringify(registry, null, 2));
+        writeFileSync(getClaudeMcpConfigPath(), JSON.stringify({ mcpServers: registry }, null, 2));
+        writeFileSync(getCodexConfigPath(), [
+            '[mcp_servers.context7]',
+            'command = "/tools/context7-mcp.sh"',
+            'env = { ALPHA = "first", ZED = "last" }',
+            '',
+            '[mcp_servers.deepwiki]',
+            'url = "https://mcp.deepwiki.com/mcp"',
+            '',
+            '[mcp_servers.changed]',
+            'command = "node"',
+            'args = ["server.py"]',
+            '',
+            '[mcp_servers.typeMismatch]',
+            'url = "https://mcp.example.com"',
+            'type = "sse" # transport',
+            '',
+            '[mcp_servers.typeComment]',
+            'url = "https://mcp.example.com/comment"',
+            'type = "http" # transport',
+            '',
+            '[mcp_servers.typeLiteralComment]',
+            'url = "https://mcp.example.com/literal-comment"',
+            "type = 'http' # transport",
+            '',
+            '[mcp_servers.sseOmitted]',
+            'url = "https://mcp.example.com/sse"',
+            '',
+            '[mcp_servers.unparsedType]',
+            'command = "node"',
+            'type = 17',
+            '',
+            '[mcp_servers.quotedTypeMismatch]',
+            'url = "https://mcp.example.com/quoted"',
+            '"type" = "sse"',
+            '',
+            '[mcp_servers.httpAlias]',
+            'url = "https://mcp.example.com/http-alias"',
+            'type = "streamable-http"',
+            '',
+            '[mcp_servers.streamableAlias]',
+            'url = "https://mcp.example.com/streamable-alias"',
+            'type = "http"',
+            '',
+            '[mcp_servers.streamableOmitted]',
+            'url = "https://mcp.example.com/streamable-omitted"',
+            '',
+            '[mcp_servers.unicodeTypeMismatch]',
+            'url = "https://mcp.example.com/unicode"',
+            '"\\U00000074ype" = "sse"',
+            '',
+            '[mcp_servers.implicitStdio]',
+            'command = "/tools/implicit-stdio.sh"',
+            'type = "stdio"',
+            '',
+            '[mcp_servers.implicitHttp]',
+            'url = "https://mcp.example.com/implicit-http"',
+            'type = "streamable-http"',
+            '',
+            '[mcp_servers.implicitTypeMismatch]',
+            'url = "https://mcp.example.com/implicit-mismatch"',
+            'type = "sse"',
+            '',
+            '[mcp_servers.multilineType]',
+            'url = "https://mcp.example.com/multiline-type"',
+            'type = """',
+            'http"""',
+            '',
+            '[mcp_servers.multilineLiteralType]',
+            'url = "https://mcp.example.com/multiline-literal-type"',
+            "type = '''",
+            "http'''",
+            '',
+            '[mcp_servers.multilineContinuationType]',
+            'url = "https://mcp.example.com/multiline-continuation"',
+            'type = """ht\\',
+            '    tp"""',
+            '',
+            '[mcp_servers.multilineSpacedContinuationType]',
+            'url = "https://mcp.example.com/multiline-spaced-continuation"',
+            'type = """ht\\   ',
+            '    tp"""',
+            '',
+        ].join('\n'));
+        const status = inspectUnifiedMcpRegistrySync();
+        expect(status.codexMissing).toEqual([]);
+        expect(status.codexMismatched).toEqual(['changed', 'implicitTypeMismatch', 'quotedTypeMismatch', 'sseOmitted', 'typeMismatch', 'unicodeTypeMismatch', 'unparsedType']);
+        expect(status.claudeMissing).toEqual([]);
+        expect(status.claudeMismatched).toEqual([]);
+    });
+    it('parses literal url, type, and nested header values (issue #3601)', () => {
+        const registry = {
+            remote: {
+                url: 'https://lab.example.com/mcp',
+                type: 'sse',
+                headers: { Authorization: 'Bearer test-token' },
+            },
+        };
+        writeFileSync(getUnifiedMcpRegistryPath(), JSON.stringify(registry, null, 2));
+        writeFileSync(getClaudeMcpConfigPath(), JSON.stringify({ mcpServers: registry }, null, 2));
+        writeFileSync(getCodexConfigPath(), [
+            '[mcp_servers.remote]',
+            "url = 'https://lab.example.com/mcp'",
+            "type = 'sse'",
+            '',
+            '[mcp_servers.remote.headers]',
+            "Authorization = 'Bearer test-token'",
+            '',
+        ].join('\n'));
+        const status = inspectUnifiedMcpRegistrySync();
+        expect(status.codexMissing).toEqual([]);
+        expect(status.codexMismatched).toEqual([]);
+    });
+    it('rejects malformed literal arrays and does not accept valid prefixes (issue #3601)', () => {
+        // Poisoned args: each has a valid first member but is malformed after it.
+        // For each poisoned server, the registry args are the valid prefix ['prefix'].
+        // A command-only control uses the same malformed Codex args but has no registry args,
+        // so it should be NEITHER missing nor mismatched on correct rejection.
+        const poisonedCodexArgs = {
+            poison_trailing_garbage: `['prefix'] garbage`,
+            poison_missing_comma: `['prefix' '--stdio']`,
+            poison_non_string_member: `['prefix', 1]`,
+            poison_unterminated_quote: `['prefix', '--std`,
+            poison_triple_literal: `['prefix'''']`,
+            poison_embedded_apostrophe: `['pre'fix', '--stdio']`,
+            poison_odd_backslash: `["prefix\\", "--stdio"]`,
+            poison_nul_byte: `['pre\x00fix', '--stdio']`,
+        };
+        const registry = {};
+        const registryControl = {};
+        for (const name of Object.keys(poisonedCodexArgs)) {
+            registry[name] = { command: 'python', args: ['prefix'] };
+            registryControl[`${name}_control`] = { command: 'python' };
+        }
+        // Add a valid neighboring server to prove the fixture is not broadly broken.
+        registry.valid_neighbor = { command: 'node', args: ['server.js'] };
+        const fullRegistry = { ...registry, ...registryControl };
+        writeFileSync(getUnifiedMcpRegistryPath(), JSON.stringify(fullRegistry, null, 2));
+        writeFileSync(getClaudeMcpConfigPath(), JSON.stringify({ mcpServers: fullRegistry }, null, 2));
+        const codexLines = [];
+        for (const [name, argsValue] of Object.entries(poisonedCodexArgs)) {
+            codexLines.push(`[mcp_servers.${name}]`, `command = 'python'`, `args = ${argsValue}`, '');
+            // Control carries the SAME malformed args so any non-empty parse mismatches it.
+            codexLines.push(`[mcp_servers.${name}_control]`, `command = 'python'`, `args = ${argsValue}`, '');
+        }
+        codexLines.push('[mcp_servers.valid_neighbor]', `command = 'node'`, `args = ['server.js']`, '');
+        writeFileSync(getCodexConfigPath(), codexLines.join('\n'));
+        const status = inspectUnifiedMcpRegistrySync();
+        // The valid neighbor should be clean.
+        expect(status.codexMissing).not.toContain('valid_neighbor');
+        expect(status.codexMismatched).not.toContain('valid_neighbor');
+        // Each poisoned server should be mismatched (its registry has args, Codex parsed args failed).
+        const expectedMismatched = Object.keys(poisonedCodexArgs).sort();
+        for (const name of expectedMismatched) {
+            expect(status.codexMismatched).toContain(name);
+            expect(status.codexMissing).not.toContain(name);
+        }
+        // Each command-only control should be clean (no args in registry, no args parsed from Codex).
+        for (const name of Object.keys(poisonedCodexArgs)) {
+            const controlName = `${name}_control`;
+            expect(status.codexMissing).not.toContain(controlName);
+            expect(status.codexMismatched).not.toContain(controlName);
+        }
+        // Exact status-array oracle: no poisoned server or control is missing,
+        // and the mismatched list is exactly the sorted poisoned-server names.
+        expect(status.codexMissing).toEqual([]);
+        expect(status.codexMismatched).toEqual(expectedMismatched);
+    });
+    it('rejects arrays missing opening or closing brackets (issue #3601)', () => {
+        const registry = {
+            no_open: { command: 'python', args: ['prefix'] },
+            no_close: { command: 'python', args: ['prefix'] },
+        };
+        const registryControl = {
+            no_open_control: { command: 'python' },
+            no_close_control: { command: 'python' },
+        };
+        const fullRegistry = { ...registry, ...registryControl };
+        writeFileSync(getUnifiedMcpRegistryPath(), JSON.stringify(fullRegistry, null, 2));
+        writeFileSync(getClaudeMcpConfigPath(), JSON.stringify({ mcpServers: fullRegistry }, null, 2));
+        writeFileSync(getCodexConfigPath(), [
+            '[mcp_servers.no_open]',
+            "command = 'python'",
+            "args = 'prefix']",
+            '',
+            '[mcp_servers.no_open_control]',
+            "command = 'python'",
+            "args = 'prefix']",
+            '',
+            '[mcp_servers.no_close]',
+            "command = 'python'",
+            "args = ['prefix'",
+            '',
+            '[mcp_servers.no_close_control]',
+            "command = 'python'",
+            "args = ['prefix'",
+            '',
+        ].join('\n'));
+        const status = inspectUnifiedMcpRegistrySync();
+        expect(status.codexMissing).toEqual([]);
+        expect(status.codexMismatched).toEqual(['no_close', 'no_open']);
+        expect(status.claudeMissing).toEqual([]);
+        expect(status.claudeMismatched).toEqual([]);
+    });
+    it('rejects physical multiline arrays (issue #3601)', () => {
+        const registry = {
+            multiline: { command: 'python', args: ['prefix', 'second'] },
+        };
+        const registryControl = {
+            multiline_control: { command: 'python' },
+        };
+        const fullRegistry = { ...registry, ...registryControl };
+        writeFileSync(getUnifiedMcpRegistryPath(), JSON.stringify(fullRegistry, null, 2));
+        writeFileSync(getClaudeMcpConfigPath(), JSON.stringify({ mcpServers: fullRegistry }, null, 2));
+        writeFileSync(getCodexConfigPath(), [
+            '[mcp_servers.multiline]',
+            "command = 'python'",
+            "args = ['prefix',",
+            "  'second']",
+            '',
+            '[mcp_servers.multiline_control]',
+            "command = 'python'",
+            "args = ['prefix',",
+            "  'second']",
+            '',
+        ].join('\n'));
+        const status = inspectUnifiedMcpRegistrySync();
+        expect(status.codexMissing).toEqual([]);
+        expect(status.codexMismatched).toEqual(['multiline']);
+        expect(status.claudeMissing).toEqual([]);
+        expect(status.claudeMismatched).toEqual([]);
+    });
+    it('accepts TOML v1.0 trailing commas in literal arrays (issue #3601)', () => {
+        const registry = {
+            trailing: { command: 'python', args: ['first', 'second'] },
+        };
+        writeFileSync(getUnifiedMcpRegistryPath(), JSON.stringify(registry, null, 2));
+        writeFileSync(getClaudeMcpConfigPath(), JSON.stringify({ mcpServers: registry }, null, 2));
+        writeFileSync(getCodexConfigPath(), [
+            '[mcp_servers.trailing]',
+            "command = 'python'",
+            "args = ['first', 'second',]",
+            '',
+        ].join('\n'));
+        const status = inspectUnifiedMcpRegistrySync();
+        expect(status.codexMissing).toEqual([]);
+        expect(status.codexMismatched).toEqual([]);
+        expect(status.claudeMissing).toEqual([]);
+        expect(status.claudeMismatched).toEqual([]);
+    });
+    it('round-trips all TOML-forbidden control characters with proper escapes (issue #4157)', () => {
+        // Create a registry with a command that contains all control characters that must be escaped:
+        // - \n (U+000A) newline: \n
+        // - \r (U+000D) carriage return: \r
+        // - \t (U+0009) tab: \t (TOML allows tab in basic strings, but we escape for safety)
+        // - \b (U+0008) backspace: \b
+        // - \f (U+000C) form feed: \f
+        // - \x00 (U+0000) NUL: \u0000
+        // - \x1f (U+001F) unit separator (last control char before space): \u001f
+        // - \x7f (U+007F) DEL: \u007f
+        // - quotes and backslashes
+        const testString = 'test\nnewline\rcarriage\ttab\bbackspace\fformfeed\x00null\x1funit\x7fdel"quote\\backslash';
+        const registry = {
+            'control-test': { command: '/bin/sh', args: [testString] },
+        };
+        writeFileSync(getUnifiedMcpRegistryPath(), JSON.stringify(registry, null, 2));
+        writeFileSync(getClaudeMcpConfigPath(), JSON.stringify({ mcpServers: registry }, null, 2));
+        syncUnifiedMcpRegistryTargets({});
+        // Read the rendered TOML
+        const toml = readFileSync(getCodexConfigPath(), 'utf-8');
+        // Verify that the TOML block is present
+        expect(toml).toContain('[mcp_servers.control-test]');
+        // Verify that raw control characters are NOT in the TOML output
+        // (except tab, which is allowed but we escape anyway)
+        for (let i = 0; i <= 0x1f; i++) {
+            if (i !== 0x09 && i !== 0x0a && i !== 0x0d) {
+                // Skip the control characters we handle elsewhere
+                const char = String.fromCharCode(i);
+                expect(toml).not.toContain(char);
+            }
+        }
+        expect(toml).not.toContain(String.fromCharCode(0x7f));
+        // Verify that the proper escapes are present
+        expect(toml).toContain('\\n'); // newline escape
+        expect(toml).toContain('\\r'); // carriage return escape
+        expect(toml).toContain('\\t'); // tab escape
+        expect(toml).toContain('\\b'); // backspace escape
+        expect(toml).toContain('\\f'); // form feed escape
+        expect(toml).toContain('\\u0000'); // NUL escape
+        expect(toml).toContain('\\u001f'); // unit separator escape
+        expect(toml).toContain('\\u007f'); // DEL escape
+        expect(toml).toContain('\\"'); // quote escape
+        expect(toml).toContain('\\\\'); // backslash escape
+        // Verify that the registry is still in sync (no round-trip errors)
+        const status = inspectUnifiedMcpRegistrySync();
+        expect(status.codexMissing).toEqual([]);
+        expect(status.codexMismatched).toEqual([]);
+    });
+    it('round-trips Windows paths with backslash followed by u (not unicode escape) correctly (issue #4157)', () => {
+        // Regression test: C:\users\u0041dir should NOT decode the \u0041 as unicode.
+        // In TOML: the original path is C:\users\u0041dir (literal text, not unicode escape).
+        // Escaped TOML string: "C:\\\\users\\\\u0041dir" (each \ becomes \\\\, and u0041 stays as u0041).
+        // When unescaped, should return to: C:\users\u0041dir
+        const windowsPath = 'C:\\users\\u0041dir';
+        const registry = {
+            'windows-path': { command: windowsPath, args: [] },
+        };
+        writeFileSync(getUnifiedMcpRegistryPath(), JSON.stringify(registry, null, 2));
+        writeFileSync(getClaudeMcpConfigPath(), JSON.stringify({ mcpServers: registry }, null, 2));
+        syncUnifiedMcpRegistryTargets({});
+        const status = inspectUnifiedMcpRegistrySync();
+        expect(status.codexMissing).toEqual([]);
+        expect(status.codexMismatched).toEqual([]);
+    });
+    it('round-trips backslash followed by n (not newline escape) correctly (issue #4157)', () => {
+        // Regression test: a literal backslash followed by the letter 'n' should NOT be decoded as newline.
+        // This can occur in Windows paths or other contexts.
+        // Original: "path\\nfile.txt" (backslash-n, not a newline)
+        // Escaped TOML: "path\\\\nfile.txt" (the \\ becomes \\\\ for the backslash)
+        // When unescaped, should return to: "path\\nfile.txt" (backslash followed by n, not a newline)
+        const backslashN = 'path\\nfile.txt';
+        const registry = {
+            'backslash-n': { command: '/bin/sh', args: [backslashN] },
+        };
+        writeFileSync(getUnifiedMcpRegistryPath(), JSON.stringify(registry, null, 2));
+        writeFileSync(getClaudeMcpConfigPath(), JSON.stringify({ mcpServers: registry }, null, 2));
+        syncUnifiedMcpRegistryTargets({});
+        const toml = readFileSync(getCodexConfigPath(), 'utf-8');
+        // The TOML should contain the escaped form: \\n (backslash escape followed by n)
+        expect(toml).toContain('\\\\n');
+        const status = inspectUnifiedMcpRegistrySync();
+        expect(status.codexMissing).toEqual([]);
+        expect(status.codexMismatched).toEqual([]);
+    });
 });
 //# sourceMappingURL=mcp-registry.test.js.map

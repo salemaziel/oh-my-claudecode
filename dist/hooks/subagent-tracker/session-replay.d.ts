@@ -23,8 +23,22 @@ export interface ReplayEvent {
     task?: string;
     success?: boolean;
     reason?: string;
+    synthetic?: boolean;
+    telemetry_status?: "unmatched_stop";
     parent_mode?: string;
     model?: string;
+    /** Agent-tool description (unnamed-agent address fallback, #3665). */
+    description?: string;
+    /** Agent-tool explicit name (authoritative address). */
+    name?: string;
+    /** Bounded dirty-worktree evidence recorded on abnormal termination (#3663). */
+    dirty_worktree?: {
+        tracked: number;
+        untracked: number;
+        ignored: number;
+        worktree_root: string;
+        truncated: boolean;
+    };
     /** Hook name (e.g., "keyword-detector") */
     hook?: string;
     /** Claude Code event (e.g., "UserPromptSubmit") */
@@ -58,6 +72,9 @@ export interface ReplaySummary {
     agents_spawned: number;
     agents_completed: number;
     agents_failed: number;
+    agents_untracked_stops?: number;
+    /** Number of agent stops that left a dirty worktree behind (#3663). */
+    dirty_worktrees?: number;
     tool_summary: Record<string, {
         count: number;
         total_ms: number;
@@ -98,11 +115,24 @@ export declare function appendReplayEvent(directory: string, sessionId: string, 
 /**
  * Record agent start event
  */
-export declare function recordAgentStart(directory: string, sessionId: string, agentId: string, agentType: string, task?: string, parentMode?: string, model?: string): void;
+export declare function recordAgentStart(directory: string, sessionId: string, agentId: string, agentType: string, task?: string, parentMode?: string, model?: string, description?: string, name?: string): void;
+export interface AgentStopReplayMetadata {
+    synthetic?: boolean;
+    telemetry_status?: "unmatched_stop";
+    reason?: string;
+    /** Bounded dirty-worktree evidence (issue #3663). */
+    dirty_worktree?: {
+        tracked: number;
+        untracked: number;
+        ignored: number;
+        worktree_root: string;
+        truncated: boolean;
+    };
+}
 /**
  * Record agent stop event
  */
-export declare function recordAgentStop(directory: string, sessionId: string, agentId: string, agentType: string, success: boolean, durationMs?: number): void;
+export declare function recordAgentStop(directory: string, sessionId: string, agentId: string, agentType: string, success: boolean, durationMs?: number, metadata?: AgentStopReplayMetadata): void;
 /**
  * Record tool execution event
  */

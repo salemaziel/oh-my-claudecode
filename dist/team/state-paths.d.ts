@@ -20,6 +20,17 @@
  *       {workerName}.json
  */
 export declare function normalizeTaskFileStem(taskId: string): string;
+/**
+ * Resolve the cwd component of the identity binding used by team lifecycle
+ * operations.
+ *
+ * Team state may be reached through a symlink (or through a path containing
+ * `..`).  The lifecycle lock must nevertheless be shared by every spelling of
+ * the same workspace. Non-existent paths retain their lexical, resolved
+ * spelling so startup can reserve a new workspace before the first state
+ * directory is created.
+ */
+export declare function canonicalTeamCwd(cwd: string): string;
 export declare const TeamPaths: {
     readonly root: (teamName: string) => string;
     readonly config: (teamName: string) => string;
@@ -34,10 +45,21 @@ export declare const TeamPaths: {
     readonly ready: (teamName: string, workerName: string) => string;
     readonly overlay: (teamName: string, workerName: string) => string;
     readonly shutdownAck: (teamName: string, workerName: string) => string;
+    readonly workerLaunchAttemptRoot: (teamName: string, workerName: string, attemptId: string) => string;
+    readonly workerLaunchCurrent: (teamName: string, workerName: string) => string;
+    readonly workerLaunchExpected: (teamName: string, workerName: string, attemptId: string) => string;
+    readonly workerLaunchAck: (teamName: string, workerName: string, attemptId: string) => string;
+    readonly workerLaunchStarted: (teamName: string, workerName: string, attemptId: string) => string;
+    readonly workerLaunchTransportOwner: (teamName: string, workerName: string, attemptId: string) => string;
+    readonly workerLaunchBootstrapDescriptor: (teamName: string, workerName: string, attemptId: string) => string;
+    readonly workerLaunchWrapper: (teamName: string, workerName: string, attemptId: string) => string;
+    readonly workerLaunchTransportCleanupComplete: (teamName: string, workerName: string, attemptId: string) => string;
+    readonly workerLaunchDecision: (teamName: string, workerName: string, attemptId: string) => string;
     readonly mailbox: (teamName: string, workerName: string) => string;
     readonly mailboxLockDir: (teamName: string, workerName: string) => string;
     readonly dispatchRequests: (teamName: string) => string;
     readonly dispatchLockDir: (teamName: string) => string;
+    readonly mailboxNotificationLock: (teamName: string, requestId: string) => string;
     readonly workerStatus: (teamName: string, workerName: string) => string;
     readonly workerIdleNotify: (teamName: string) => string;
     readonly workerPrevNotifyState: (teamName: string, workerName: string) => string;
@@ -48,18 +70,91 @@ export declare const TeamPaths: {
     readonly summarySnapshot: (teamName: string) => string;
     readonly phaseState: (teamName: string) => string;
     readonly scalingLock: (teamName: string) => string;
+    readonly configMutationLock: (teamName: string) => string;
     readonly workerIdentity: (teamName: string, workerName: string) => string;
     readonly workerAgentsMd: (teamName: string) => string;
     readonly shutdownRequest: (teamName: string, workerName: string) => string;
+    readonly checkpoints: (teamName: string, taskId: string, claimTokenHash: string) => string;
+    readonly checkpoint: (teamName: string, taskId: string, claimTokenHash: string, sequence: number) => string;
+    readonly checkpointLatest: (teamName: string, taskId: string, claimTokenHash: string) => string;
+    readonly taskRecoverySidecar: (teamName: string, recoveryId: string, taskId: string) => string;
+    readonly taskRecoveryReservation: (teamName: string, taskId: string) => string;
+    readonly ownerEpochs: (teamName: string) => string;
+    readonly ownerEpoch: (teamName: string, epoch: number) => string;
+    readonly recoveryOwnerBootstrapCandidate: (teamName: string, expectedEpoch: number, nonce: string) => string;
+    readonly recoveryIntents: (teamName: string) => string;
+    readonly recoveryIntent: (teamName: string, recoveryId: string) => string;
+    readonly recoveryAttempts: (teamName: string) => string;
+    readonly recoveryAttempt: (teamName: string, recoveryId: string) => string;
+    readonly recoveryActivation: (teamName: string, recoveryId: string, paneAttemptId: string) => string;
+    readonly recoveryReady: (teamName: string, recoveryId: string, paneAttemptId: string) => string;
+    readonly recoveryActivate: (teamName: string, recoveryId: string, paneAttemptId: string) => string;
+    readonly recoveryRun: (teamName: string, recoveryId: string, paneAttemptId: string) => string;
+    readonly recoveryRequestsRoot: () => string;
+    readonly recoveryAdmissionLock: (payloadHash: string) => string;
+    readonly recoveryLifecycleLock: (workspaceHash: string, teamName: string) => string;
+    /**
+     * External team-instance authority.  These paths deliberately live outside
+     * `.omc/state/team/{teamName}` so cleanup can retain authorization after the
+     * state tree is detached or partially removed.
+     */
+    readonly teamInstanceAuthorityRoot: (workspaceHash: string, teamName: string) => string;
+    readonly teamInstanceReservation: (workspaceHash: string, teamName: string) => string;
+    readonly teamInstanceCleanupRoot: (workspaceHash: string, teamName: string, instanceId: string) => string;
+    readonly teamInstanceCleanupReceipt: (workspaceHash: string, teamName: string, instanceId: string) => string;
+    readonly teamInstanceDetachedRoot: (workspaceHash: string, teamName: string, instanceId: string) => string;
+    readonly recoveryRequestPending: (requestId: string) => string;
+    readonly recoveryRequestResult: (requestId: string) => string;
+    readonly recoveryResultByTeam: (workspaceHash: string, teamName: string, recoveryId: string) => string;
+    readonly recoveryFinalIndexLock: (workspaceHash: string, teamName: string, recoveryId: string) => string;
+    readonly scalingRollbackFailure: (teamName: string, recordedAt: number) => string;
+    readonly recoveryPaneRollbackFailure: (teamName: string, recoveryId: string, paneAttemptId: string, recordedAt: number) => string;
+    readonly recoveryAuditIndex: () => string;
 };
 /**
  * Get absolute path for a team state file.
  */
 export declare function absPath(cwd: string, relativePath: string): string;
+/** Canonical OMC storage root, with symlink aliases collapsed when possible. */
+export declare function canonicalTeamOmcRoot(cwd: string): string;
+/**
+ * Canonical absolute path for an OMC-relative state path.  Lifecycle and
+ * detached-instance authority must use this helper so cwd aliases cannot
+ * produce different physical lock/receipt files.
+ */
+export declare function canonicalTeamStatePath(cwd: string, relativePath: string): string;
+/**
+ * Absolute lifecycle lock shared by startup, mutation, shutdown and external
+ * cleanup.  Callers must use this one path rather than deriving a hash from
+ * the caller's uncanonicalized cwd.
+ */
+export declare function teamInstanceLifecycleLockPath(cwd: string, teamName: string): string;
 /**
  * Get absolute root path for a team's state directory.
  */
 export declare function teamStateRoot(cwd: string, teamName: string): string;
+/**
+ * Canonical state storage root used as the ownership key.
+ *
+ * Only the accepted OMC storage anchor is canonicalized. The team suffix is
+ * deliberately appended lexically so a disposable team-root symlink remains
+ * visible to `assertTeamStatePathSafe()` instead of being followed.
+ */
+export declare function canonicalTeamStateRoot(cwd: string, teamName: string): string;
+/** Stable key derived from the canonical `{OMC root}/state/team/{name}` root. */
+export declare function teamWorkspaceHash(cwd: string, teamName: string): string;
+/**
+ * Reject symlink components below the accepted OMC storage anchor.
+ *
+ * `canonicalTeamOmcRoot()` intentionally canonicalizes the storage anchor
+ * itself (a configured storage symlink is an accepted alias), but state and
+ * external authority suffixes remain lexical.  Checking each suffix component
+ * with `lstat` prevents a disposable team root or receipt parent from routing
+ * effects into an unrelated directory.
+ */
+export declare function assertTeamStatePathSafe(cwd: string, path: string): Promise<void>;
+/** Synchronous preflight variant used before acquiring a lifecycle lock. */
+export declare function assertTeamStatePathSafeSync(cwd: string, path: string): void;
 /**
  * Canonical task storage path builder.
  *

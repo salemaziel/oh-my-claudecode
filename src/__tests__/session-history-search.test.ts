@@ -3,14 +3,42 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { homedir, tmpdir } from 'os';
 import { basename, join } from 'path';
 import {
+  __testingCreateMatchRetainer,
+  __testingIsWithinProject,
   encodeProjectPath,
   parseSinceSpec,
   searchSessionHistory,
 } from '../features/session-history-search/index.js';
 
+type SessionHistoryMatch = Awaited<ReturnType<typeof searchSessionHistory>>['results'][number];
+
 function writeTranscript(filePath: string, entries: Array<Record<string, unknown>>): void {
   mkdirSync(join(filePath, '..'), { recursive: true });
   writeFileSync(filePath, entries.map((entry) => JSON.stringify(entry)).join('\n') + '\n', 'utf-8');
+}
+
+function normalizePathForAssert(path: string): string {
+  return path.replace(/\\/g, '/');
+}
+
+function syntheticMatch(id: string, timestamp: string | undefined, sourcePath: string): SessionHistoryMatch {
+  return {
+    sessionId: id,
+    timestamp,
+    sourcePath,
+    sourceType: 'project-transcript',
+    line: 1,
+    excerpt: id,
+  };
+}
+
+function compareExpectedMatches(a: SessionHistoryMatch, b: SessionHistoryMatch): number {
+  const parsedATime = a.timestamp ? Date.parse(a.timestamp) : 0;
+  const parsedBTime = b.timestamp ? Date.parse(b.timestamp) : 0;
+  const aTime = Number.isFinite(parsedATime) ? parsedATime : 0;
+  const bTime = Number.isFinite(parsedBTime) ? parsedBTime : 0;
+  if (aTime !== bTime) return bTime - aTime;
+  return a.sourcePath.localeCompare(b.sourcePath);
 }
 
 describe('session history search', () => {
@@ -77,8 +105,8 @@ describe('session history search', () => {
       process.env.CLAUDE_CONFIG_DIR = originalConfigDir;
     }
     delete process.env.OMC_STATE_DIR;
-    rmSync(tempRoot, { recursive: true, force: true });
-    rmSync(tildeClaudeDir, { recursive: true, force: true });
+    rmSync(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    rmSync(tildeClaudeDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   });
 
   it('searches the current project by default and returns structured snippets', async () => {
@@ -94,6 +122,38 @@ describe('session history search', () => {
     expect(report.results.some((result) => result.sessionId === 'session-current')).toBe(true);
     expect(report.results[0].excerpt.toLowerCase()).toContain('notify-hook');
     expect(report.results[0].sourcePath).toContain('session-current.jsonl');
+  });
+
+  it('searches transcripts stored under the literal subdirectory cwd project dir', async () => {
+    const subdirCwd = join(repoRoot, 'src');
+    const subdirProjectDir = join(claudeDir, 'projects', encodeProjectPath(subdirCwd));
+
+    writeTranscript(join(subdirProjectDir, 'session-subdir.jsonl'), [
+      {
+        sessionId: 'session-subdir',
+        cwd: subdirCwd,
+        type: 'assistant',
+        timestamp: '2026-03-11T10:00:00.000Z',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'subdirectory cwd transcript sentinel' }] },
+      },
+    ]);
+
+    const report = await searchSessionHistory({
+      query: 'subdirectory cwd transcript sentinel',
+      workingDirectory: subdirCwd,
+    });
+
+    expect(report.scope.mode).toBe('current');
+    expect(report.scope.workingDirectory).toBeDefined();
+    const workingDirectory = report.scope.workingDirectory!;
+    expect(normalizePathForAssert(workingDirectory)).toBe(normalizePathForAssert(repoRoot));
+    expect(report.totalMatches).toBe(1);
+    expect(report.results[0]).toBeDefined();
+    const result = report.results[0]!;
+    expect(result.sessionId).toBe('session-subdir');
+    expect(result.projectPath).toBeDefined();
+    const resultProjectPath = result.projectPath!;
+    expect(normalizePathForAssert(resultProjectPath)).toBe(normalizePathForAssert(subdirCwd));
   });
 
   it('supports since and session filters', async () => {
@@ -129,6 +189,86 @@ describe('session history search', () => {
     expect(report.results[0].sessionId).toBe('session-current');
   });
 
+  it('bounds retained matches while counting every match', () => {
+    const limit = 10;
+    const matchCount = 80_000;
+    const retainer = __testingCreateMatchRetainer(limit);
+    let maxRetained = 0;
+
+    for (let index = 0; index < matchCount; index += 1) {
+      retainer.add(syntheticMatch(
+        `session-${index}`,
+        new Date(Date.UTC(2026, 0, 1) + index * 1_000).toISOString(),
+        '/synthetic/session.jsonl',
+      ));
+      maxRetained = Math.max(maxRetained, retainer.retained.length);
+    }
+
+    expect(maxRetained).toBe(limit);
+    expect(retainer.retained).toHaveLength(limit);
+    expect(retainer.totalMatches).toBe(matchCount);
+  });
+
+  it('matches the legacy sorted prefix for ties and cross-file timestamps', () => {
+    const limit = 5;
+    const matches = [
+      syntheticMatch('encounter-0', '2026-03-01T00:00:00.000Z', '/synthetic/z.jsonl'),
+      syntheticMatch('encounter-1', '2026-03-03T00:00:00.000Z', '/synthetic/b.jsonl'),
+      syntheticMatch('encounter-2', '2026-03-03T00:00:00.000Z', '/synthetic/a.jsonl'),
+      syntheticMatch('encounter-3', '2026-03-03T00:00:00.000Z', '/synthetic/a.jsonl'),
+      syntheticMatch('encounter-4', undefined, '/synthetic/c.jsonl'),
+      syntheticMatch('encounter-5', '2026-03-02T00:00:00.000Z', '/synthetic/c.jsonl'),
+      syntheticMatch('encounter-6', '2026-03-01T00:00:00.000Z', '/synthetic/a.jsonl'),
+    ];
+    const expected = [...matches].sort(compareExpectedMatches).slice(0, limit);
+    const retainer = __testingCreateMatchRetainer(limit);
+
+    for (const match of matches) {
+      retainer.add(match);
+    }
+
+    expect(retainer.retained).toEqual(expected);
+    expect(retainer.totalMatches).toBe(matches.length);
+  });
+
+  it('orders invalid timestamps with the existing missing-timestamp fallback', () => {
+    const matches = [
+      syntheticMatch('encounter-0', undefined, '/synthetic/a.jsonl'),
+      syntheticMatch('encounter-1', undefined, '/synthetic/b.jsonl'),
+      syntheticMatch('encounter-2', 'not-a-timestamp', '/synthetic/a.jsonl'),
+      syntheticMatch('encounter-3', undefined, '/synthetic/b.jsonl'),
+      syntheticMatch('encounter-4', undefined, '/synthetic/a.jsonl'),
+      syntheticMatch('encounter-5', undefined, '/synthetic/b.jsonl'),
+      syntheticMatch('encounter-6', undefined, '/synthetic/a.jsonl'),
+      syntheticMatch('encounter-7', undefined, '/synthetic/b.jsonl'),
+    ];
+    const expected = [...matches].sort(compareExpectedMatches).slice(0, 2);
+    const retainer = __testingCreateMatchRetainer(2);
+
+    for (const match of matches) {
+      retainer.add(match);
+    }
+
+    expect(retainer.retained).toEqual(expected);
+    expect(retainer.totalMatches).toBe(matches.length);
+  });
+
+  it('matches Array.slice limit coercion for direct fractional limits', () => {
+    const matches = [
+      syntheticMatch('newest', '2026-03-03T00:00:00.000Z', '/synthetic/a.jsonl'),
+      syntheticMatch('middle', '2026-03-02T00:00:00.000Z', '/synthetic/a.jsonl'),
+      syntheticMatch('oldest', '2026-03-01T00:00:00.000Z', '/synthetic/a.jsonl'),
+    ];
+    const retainer = __testingCreateMatchRetainer(2.9);
+
+    for (const match of matches) {
+      retainer.add(match);
+    }
+
+    expect(retainer.retained).toEqual([...matches].sort(compareExpectedMatches).slice(0, 2.9));
+    expect(retainer.totalMatches).toBe(matches.length);
+  });
+
   it('uses a ~-prefixed CLAUDE_CONFIG_DIR for transcript discovery', async () => {
     process.env.CLAUDE_CONFIG_DIR = `~/${basename(tildeClaudeDir)}`;
 
@@ -161,6 +301,11 @@ describe('session history search', () => {
     expect(encodeProjectPath('C:\\Users\\me\\proj')).toBe('C--Users-me-proj');
     // POSIX paths are unaffected (no colon to replace).
     expect(encodeProjectPath('/home/me/proj')).toBe('-home-me-proj');
+  });
+
+  it('keeps Windows-style subdirectory paths within their project root', () => {
+    expect(__testingIsWithinProject('C:\\Users\\me\\repo\\packages\\api', ['C:\\Users\\me\\repo'])).toBe(true);
+    expect(__testingIsWithinProject('C:\\Users\\me\\repo-other', ['C:\\Users\\me\\repo'])).toBe(false);
   });
 
   it('parses relative and absolute since values', () => {

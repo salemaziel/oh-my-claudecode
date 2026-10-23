@@ -15,6 +15,7 @@ import {
   rmSync,
   existsSync,
   readFileSync,
+  readdirSync,
   symlinkSync,
 } from "fs";
 import { join } from "path";
@@ -33,6 +34,8 @@ import {
 describe("Skill Bridge Module", () => {
   let testProjectRoot: string;
   let originalCwd: string;
+  let originalHome: string | undefined;
+  let originalUserProfile: string | undefined;
 
   beforeEach(() => {
     clearSkillMetadataCache();
@@ -40,12 +43,20 @@ describe("Skill Bridge Module", () => {
     contextCollector.clear("emitted-learner-session");
     originalCwd = process.cwd();
     testProjectRoot = join(tmpdir(), `omc-bridge-test-${Date.now()}`);
+    originalHome = process.env.HOME;
+    originalUserProfile = process.env.USERPROFILE;
+    process.env.HOME = testProjectRoot;
+    process.env.USERPROFILE = testProjectRoot;
     mkdirSync(testProjectRoot, { recursive: true });
     process.chdir(testProjectRoot);
   });
 
   afterEach(() => {
     process.chdir(originalCwd);
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = originalUserProfile;
     contextCollector.clear("emitted-learner-session");
     clearSkillSession("emitted-learner-session");
     if (existsSync(testProjectRoot)) {
@@ -513,6 +524,36 @@ Mixed trigger instructions`,
       expect(state.sessions["persist-test"].injectedPaths).toContain(
         "/path/to/persist.md",
       );
+    });
+
+    it("does not write project-local .omc when OMC_STATE_DIR is set", () => {
+      const centralizedDir = join(tmpdir(), `omc-state-dir-${Date.now()}`);
+      mkdirSync(centralizedDir, { recursive: true });
+      const previousOmcStateDir = process.env.OMC_STATE_DIR;
+      process.env.OMC_STATE_DIR = centralizedDir;
+      try {
+        markSkillsInjected(
+          "omc-state-dir-test",
+          ["/path/to/centralized.md"],
+          testProjectRoot,
+        );
+
+        // State must NOT land in the project-local .omc/
+        expect(existsSync(join(testProjectRoot, ".omc"))).toBe(false);
+
+        // State must land somewhere under the centralized dir
+        const found = readdirSync(centralizedDir, { recursive: true })
+          .map((f) => String(f))
+          .filter((f) => f.endsWith("skill-sessions.json"));
+        expect(found).toHaveLength(1);
+      } finally {
+        if (previousOmcStateDir === undefined) {
+          delete process.env.OMC_STATE_DIR;
+        } else {
+          process.env.OMC_STATE_DIR = previousOmcStateDir;
+        }
+        rmSync(centralizedDir, { recursive: true, force: true });
+      }
     });
 
     it("should not re-inject already injected skills", () => {

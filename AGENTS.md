@@ -164,15 +164,12 @@ Do not ask for confirmation — just read the skill file and follow its instruct
 |-------------|-------|--------|
 | "ralph", "don't stop", "must complete", "keep going" | `$ralph` | Read `~/.agents/skills/ralph/SKILL.md`, execute persistence loop |
 | "autopilot", "build me", "I want a" | `$autopilot` | Read `~/.agents/skills/autopilot/SKILL.md`, execute autonomous pipeline |
-| "ultrawork", "ulw", "parallel" | `$ultrawork` | Read `~/.agents/skills/ultrawork/SKILL.md`, execute parallel agents |
 | "plan this", "plan the", "let's plan" | `$plan` | Read `~/.agents/skills/plan/SKILL.md`, start planning workflow |
 | "interview", "deep interview", "gather requirements", "interview me", "don't assume", "ouroboros" | `$deep-interview` | Read `~/.agents/skills/deep-interview/SKILL.md`, run Ouroboros-inspired Socratic ambiguity-gated interview workflow |
 | "ralplan", "consensus plan" | `$ralplan` | Read `~/.agents/skills/ralplan/SKILL.md`, start consensus planning with RALPLAN-DR structured deliberation (short by default, `--deliberate` for high-risk) |
-| "ecomode", "eco", "budget" | `$ecomode` | Read `~/.agents/skills/ecomode/SKILL.md`, enable token-efficient mode |
 | "cancel", "stop", "abort" | `$cancel` | Read `~/.agents/skills/cancel/SKILL.md`, cancel active modes |
 | "tdd", "test first" | keyword mode | Inject TDD-mode guidance and favor test-first execution with `test-engineer` when appropriate |
 | "cleanup", "deslop", "anti-slop" | `$ai-slop-cleaner` | Read `~/.agents/skills/ai-slop-cleaner/SKILL.md`, plan and clean AI-generated slop with separate writer/reviewer passes |
-| "web-clone", "clone site", "clone website", "copy webpage" | `$web-clone` | Read `~/.agents/skills/web-clone/SKILL.md`, start website cloning pipeline |
 
 Detection rules:
 - Keywords are case-insensitive and match anywhere in the user's message
@@ -194,21 +191,26 @@ Skills are workflow commands. Invoke via `$name` (e.g., `$ralph`) or browse with
 Workflow Skills:
 - `autopilot`: Full autonomous execution from idea to working code
 - `ralph`: Self-referential persistence loop with verification
-- `ultrawork`: Maximum parallelism with parallel agent orchestration
 - `visual-verdict`: Structured visual QA verdict loop for screenshot/reference comparisons
-- `web-clone`: URL-driven website cloning with visual + functional verification
-- `ecomode`: Token-efficient execution using lightweight models
 - `team`: N coordinated agents on shared task list
-- `ultraqa`: QA cycling -- test, verify, fix, repeat
 - `plan`: Strategic planning with optional RALPLAN-DR consensus mode
 - `deep-interview`: Socratic deep interview with Ouroboros-inspired mathematical ambiguity gating before execution
 - `ralplan`: Iterative consensus planning with RALPLAN-DR structured deliberation (planner + architect + critic); supports `--deliberate` for high-risk work
 - `ai-slop-cleaner`: Regression-safe cleanup workflow for duplicate code, dead code, needless abstractions, and boundary violations; supports `--review` for reviewer-only passes
+- `minimal-code-discipline`: YAGNI-ladder writing-time discipline — existence-first, reuse before writing, shortest correct diff, with non-negotiables that are never minimized away
+- `launch`: Shipyard governed delivery pipeline — spec synthesis, vertical-slice tickets with blocking edges, frontier execution with human checkpoints; opt-in
+- `ask-navigator`: Shipyard navigator — charts foggy efforts into decision-ticket maps on the issue tracker, one ticket per session, then hands a mission brief to launch; opt-in
+- `loft`: Shipyard shape-before-steel discipline — answers a design question prose cannot settle with a throwaway artifact (pure logic module or structurally different UI variants); model-invoked; opt-in
+- `harbor`: Shipyard intake gate — sweeps external issues and PRs, verifies every claim, hands the maintainer a signature docket; agent handles facts, human signs dispositions; opt-in
+- `drydock`: Shipyard harness scaffold — 4-pillar shared environment (Context/Rules/Tools/Standards) across 5 surfaces, with --check drift audit; opt-in
+- `refit`: Cross-session environment retrospective — reads OMC instrumentation (trace, friction report, logs, plan notepads) and lands user-approved findings on deterministic checks, steering volumes, tooling, or information surfaces; opt-in
+- `pr`: PR body assembly from OMC's paper trail — smallest-visual summary (credited to show-me), evidence consumed from the verify protocol, reversibility from the ADR test, glossary language
+- `tdd`: Test-first discipline at pre-agreed seams — one test, one implementation, tracer-bullet steps; the test-time sibling of minimal-code-discipline; model-invoked
+- `map`: The yard's skill map — which skill owns which job, in delivery-loop order; routes, never executes
 
 Agent Shortcuts:
 - `analyze` -> debugger: Investigation and root-cause analysis
 - `deepsearch` -> explore: Thorough codebase search
-- `tdd` -> test-engineer: Test-driven development workflow
 - `build-fix` -> debugger: Build error resolution
 - `code-review` -> code-reviewer: Comprehensive code review
 - `security-review` -> security-reviewer: Security audit
@@ -384,10 +386,8 @@ Mode lifecycle requirements:
 Recommended mode fields:
 - `ralph`: `active`, `iteration`, `max_iterations`, `current_phase`, `started_at`, `completed_at`
 - `autopilot`: `active`, `current_phase` (`expansion|planning|execution|qa|validation|complete`), `started_at`, `completed_at`
-- `ultrawork`: `active`, `reinforcement_count`, `started_at`
 - `team`: `active`, `current_phase` (`team-plan|team-prd|team-exec|team-verify|team-fix|complete`), `agent_count`, `team_name`
-- `ecomode`: `active`
-- `ultraqa`: `active`, `current_phase`, `iteration`, `started_at`, `completed_at`
+
 </state_management>
 
 ---

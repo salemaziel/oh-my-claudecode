@@ -50,6 +50,45 @@ function fileUri(filePath: string): string {
   return pathToFileURL(resolve(filePath)).href;
 }
 
+/**
+ * Normalize a URI for use as a diagnostics key.
+ * Handles Windows drive letter encoding (%3A/%3a colon) and case normalization.
+ * Platform-independent: works correctly whether the input comes from Windows or POSIX systems.
+ * Non-file URIs pass through unchanged.
+ */
+function uriKey(uri: string): string {
+  if (!uri.startsWith('file://')) {
+    return uri;
+  }
+
+  // Decode percent-encoded characters to handle %3A/%3a (colon). A malformed
+  // escape must not throw out of the notification handler: keep it verbatim.
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(uri);
+  } catch {
+    decoded = uri;
+  }
+
+  // For Windows paths like file:///c:/Users/... normalize drive letter to uppercase
+  // Match: file:///<single_char>:/ and uppercase the drive letter
+  const match = decoded.match(/^(file:\/\/)(\/[a-zA-Z])(:.*)$/);
+  if (match) {
+    const driveLetter = match[2].charAt(1).toUpperCase();
+    decoded = `${match[1]}/${driveLetter}${match[3]}`;
+  }
+
+  return decoded;
+}
+
+function createCancellationSignal(): { promise: Promise<void>; cancel: () => void } {
+  let cancel!: () => void;
+  const promise = new Promise<void>((resolveCancellation) => {
+    cancel = resolveCancellation;
+  });
+  return { promise, cancel };
+}
+
 // LSP Protocol Types
 export interface Position {
   line: number;
@@ -120,6 +159,9 @@ export interface CodeAction {
 /**
  * JSON-RPC Request/Response types
  */
+/** Inbound server request IDs may be strings or integer numbers. */
+type JsonRpcServerRequestId = number | string;
+
 interface JsonRpcRequest {
   jsonrpc: '2.0';
   id: number;
@@ -132,6 +174,19 @@ interface JsonRpcResponse {
   id: number;
   result?: unknown;
   error?: { code: number; message: string; data?: unknown };
+}
+
+interface JsonRpcServerRequest {
+  jsonrpc: '2.0';
+  id: JsonRpcServerRequestId;
+  method: string;
+  params?: unknown;
+}
+
+interface JsonRpcErrorResponse {
+  jsonrpc: '2.0';
+  id: JsonRpcServerRequestId;
+  error: { code: number; message: string };
 }
 
 interface JsonRpcNotification {
@@ -153,13 +208,23 @@ export class LspClient {
     timeout: NodeJS.Timeout;
   }>();
   private buffer = Buffer.alloc(0);
+  private notificationTail: Promise<void> = Promise.resolve();
+  private notificationGeneration = 0;
+  private notificationWaiterRejectors = new Set<(error: Error) => void>();
   private openDocuments = new Set<string>();
+  private persistentDocuments = new Set<string>();
+  private documentOpenPromises = new Map<string, Promise<void>>();
+  private documentOperationTails = new Map<string, Promise<void>>();
+  private documentQueueCancellation = createCancellationSignal();
   private diagnostics = new Map<string, Diagnostic[]>();
-  private diagnosticWaiters = new Map<string, Array<() => void>>();
+  private diagnosticWaiters = new Map<string, Array<(error?: Error) => void>>();
   private workspaceRoot: string;
   private serverConfig: LspServerConfig;
   private devContainerContext: DevContainerContext | null;
   private initialized = false;
+  private disconnected = false;
+  private connectionGeneration = 0;
+  private terminalError: Error | null = null;
   private _serverCapabilities: Record<string, unknown> | null = null;
   private _supportsPullDiagnostics = false;
 
@@ -176,6 +241,20 @@ export class LspClient {
     if (this.process) {
       return; // Already connected
     }
+    this.disconnected = false;
+    this.terminalError = null;
+    const connectionGeneration = ++this.connectionGeneration;
+    this.documentQueueCancellation.cancel();
+    this.documentQueueCancellation = createCancellationSignal();
+    this.buffer = Buffer.alloc(0);
+    this.openDocuments.clear();
+    this.persistentDocuments.clear();
+    this.documentOpenPromises.clear();
+    this.documentOperationTails.clear();
+    this.diagnostics.clear();
+    this.buffer = Buffer.alloc(0);
+    this.documentOperationTails.clear();
+    this.diagnostics.clear();
 
     const spawnCommand = this.devContainerContext ? 'docker' : this.serverConfig.command;
 
@@ -202,37 +281,69 @@ export class LspClient {
         stdio: ['pipe', 'pipe', 'pipe'],
         shell: !this.devContainerContext && process.platform === 'win32'
       });
+      const child = this.process;
 
-      this.process.stdout?.on('data', (data: Buffer) => {
+      child.stdout?.on('data', (data: Buffer) => {
+        if (this.process !== child || this.connectionGeneration !== connectionGeneration) return;
         this.handleData(data);
       });
 
-      this.process.stderr?.on('data', (data: Buffer) => {
+      child.stderr?.on('data', (data: Buffer) => {
+        if (this.process !== child || this.connectionGeneration !== connectionGeneration) return;
         // Log stderr for debugging but don't fail
         console.error(`LSP stderr: ${data.toString()}`);
       });
 
-      this.process.on('error', (error) => {
+      const stdin = child.stdin;
+      if (stdin && typeof stdin.on === 'function') {
+        stdin.on('error', (error: Error) => {
+          if (this.process !== child || this.connectionGeneration !== connectionGeneration) return;
+          this.handleTransportFailure(error);
+        });
+        stdin.on('close', () => {
+          if (this.process === child && this.connectionGeneration === connectionGeneration && !this.disconnected) {
+            this.handleTransportFailure(new Error('LSP stdin closed'));
+          }
+        });
+      }
+
+      child.on('error', (error) => {
+        if (this.process !== child || this.connectionGeneration !== connectionGeneration) return;
+        this.handleTransportFailure(error);
         reject(new Error(`Failed to start LSP server: ${error.message}`));
       });
 
-      this.process.on('exit', (code) => {
+      child.on('exit', (code) => {
+        if (this.process !== child || this.connectionGeneration !== connectionGeneration) return;
         this.process = null;
-        this.initialized = false;
+        this.handleTransportFailure(new Error(`LSP server exited (code ${code})`));
         if (code !== 0) {
           console.error(`LSP server exited with code ${code}`);
         }
-        // Reject all pending requests to avoid unresolved promises
-        this.rejectPendingRequests(new Error(`LSP server exited (code ${code})`));
       });
 
       // Send initialize request
       this.initialize()
         .then(() => {
+          if (this.process !== child || this.connectionGeneration !== connectionGeneration) {
+            reject(new Error('LSP server was replaced during initialization'));
+            return;
+          }
           this.initialized = true;
           resolve();
         })
-        .catch(reject);
+        .catch(error => {
+          if (this.process === child && this.connectionGeneration === connectionGeneration) {
+            this.forceKill();
+          } else {
+            try {
+              child.kill('SIGKILL');
+            } catch {
+              // Ignore cleanup failures for a retired child.
+            }
+          }
+          reject(error);
+        });
     });
   }
 
@@ -241,6 +352,13 @@ export class LspClient {
    * Used in process exit handlers where async operations are not possible.
    */
   forceKill(): void {
+    const error = new Error('LSP client force-killed');
+    this.connectionGeneration++;
+    this.documentQueueCancellation.cancel();
+    this.terminalError = error;
+    this.cancelPendingNotificationWrites(error);
+    this.rejectPendingRequests(error);
+    this.disconnected = true;
     if (this.process) {
       try {
         this.process.kill('SIGKILL');
@@ -249,41 +367,66 @@ export class LspClient {
       }
       this.process = null;
       this.initialized = false;
-      // Wake diagnostic waiters to prevent resource leaks
-      for (const waiters of this.diagnosticWaiters.values()) {
-        for (const wake of waiters) wake();
-      }
-      this.diagnosticWaiters.clear();
     }
+    this.cancelDiagnosticWaiters(error);
+    this.openDocuments.clear();
+    this.persistentDocuments.clear();
+    this.documentOpenPromises.clear();
+    this.documentOperationTails.clear();
+    this.diagnostics.clear();
+    this.buffer = Buffer.alloc(0);
   }
 
   /**
    * Disconnect from the LSP server
    */
   async disconnect(): Promise<void> {
-    if (!this.process) return;
-
+    const child = this.process;
+    const connectionGeneration = this.connectionGeneration;
     try {
-      // Short timeout for graceful shutdown — don't block forever
-      await this.request('shutdown', null, 3000);
-      this.notify('exit', null);
+      if (child && this.process === child && this.connectionGeneration === connectionGeneration) {
+        // Short timeout for graceful shutdown — don't block forever
+        await this.request('shutdown', null, 3000);
+        if (this.process === child && this.connectionGeneration === connectionGeneration) {
+          await Promise.race([
+            this.notifyWithBackpressure('exit', null),
+            new Promise<void>(resolveTimeout => setTimeout(resolveTimeout, 250))
+          ]);
+        }
+      }
     } catch {
       // Ignore errors during shutdown
     } finally {
-      // Always kill the process regardless of shutdown success
-      if (this.process) {
-        this.process.kill();
-        this.process = null;
+      if (this.process !== child || this.connectionGeneration !== connectionGeneration) {
+        if (child) {
+          try {
+            child.kill();
+          } catch {
+            // Ignore cleanup failures for a retired child.
+          }
+        }
+      } else {
+        const error = new Error('LSP client disconnected');
+        this.connectionGeneration++;
+        this.documentQueueCancellation.cancel();
+        this.terminalError = error;
+        this.cancelPendingNotificationWrites(error);
+        this.disconnected = true;
+        // Always kill the process regardless of shutdown success
+        if (child) {
+          child.kill();
+          this.process = null;
+        }
+        this.initialized = false;
+        this.rejectPendingRequests(new Error('Client disconnected'));
+        this.openDocuments.clear();
+        this.persistentDocuments.clear();
+        this.documentOpenPromises.clear();
+        this.documentOperationTails.clear();
+        this.diagnostics.clear();
+        this.buffer = Buffer.alloc(0);
+        this.cancelDiagnosticWaiters(new Error('LSP client disconnected'));
       }
-      this.initialized = false;
-      this.rejectPendingRequests(new Error('Client disconnected'));
-      this.openDocuments.clear();
-      this.diagnostics.clear();
-      // Wake all diagnostic waiters so their setTimeout closures can be GC'd
-      for (const waiters of this.diagnosticWaiters.values()) {
-        for (const wake of waiters) wake();
-      }
-      this.diagnosticWaiters.clear();
     }
   }
 
@@ -296,6 +439,61 @@ export class LspClient {
       clearTimeout(pending.timeout);
       pending.reject(error);
       this.pendingRequests.delete(id);
+    }
+  }
+
+  private handleTransportFailure(error: Error): void {
+    if (this.disconnected) return;
+    this.connectionGeneration++;
+    this.documentQueueCancellation.cancel();
+    this.disconnected = true;
+    this.terminalError = error;
+    this.cancelPendingNotificationWrites(error);
+    this.rejectPendingRequests(error);
+    this.cancelDiagnosticWaiters(error);
+    if (this.process) {
+      try {
+        this.process.kill('SIGKILL');
+      } catch {
+        // Ignore failures while retiring a broken transport.
+      }
+      this.process = null;
+    }
+    this.initialized = false;
+    this.openDocuments.clear();
+    this.persistentDocuments.clear();
+    this.documentOpenPromises.clear();
+    this.documentOperationTails.clear();
+    this.diagnostics.clear();
+    this.buffer = Buffer.alloc(0);
+  }
+
+  private cancelDiagnosticWaiters(error: Error): void {
+    for (const waiters of this.diagnosticWaiters.values()) {
+      for (const wake of waiters) wake(error);
+    }
+    this.diagnosticWaiters.clear();
+  }
+
+  private throwIfTerminal(): void {
+    if (this.terminalError) {
+      throw this.terminalError;
+    }
+    if (this.disconnected) {
+      throw new Error('LSP client is disconnected');
+    }
+  }
+
+  private isCurrentConnection(child: ChildProcess | null, connectionGeneration: number): boolean {
+    return child !== null
+      && this.process === child
+      && this.connectionGeneration === connectionGeneration
+      && !this.disconnected;
+  }
+
+  private assertCurrentConnection(child: ChildProcess | null, connectionGeneration: number): void {
+    if (!this.isCurrentConnection(child, connectionGeneration)) {
+      throw this.terminalError ?? new Error('LSP connection was replaced');
     }
   }
 
@@ -349,24 +547,52 @@ export class LspClient {
   /**
    * Handle a parsed JSON-RPC message
    */
-  private handleMessage(message: JsonRpcResponse | JsonRpcNotification): void {
-    if ('id' in message && message.id !== undefined) {
+  private handleMessage(message: JsonRpcResponse | JsonRpcNotification | JsonRpcServerRequest): void {
+    const record = message as unknown as Record<string, unknown>;
+    const hasOwnMethod = Object.prototype.hasOwnProperty.call(message, 'method');
+    const hasOwnId = Object.prototype.hasOwnProperty.call(message, 'id');
+
+    if (hasOwnMethod && typeof record.method === 'string') {
+      const id = record.id;
+      if (hasOwnId) {
+        if (typeof id === 'string' || (typeof id === 'number' && Number.isInteger(id))) {
+          this.handleServerRequest(message as JsonRpcServerRequest);
+        }
+        return;
+      }
+
+      this.handleNotification(message as JsonRpcNotification);
+      return;
+    }
+
+    if (!hasOwnMethod && hasOwnId && typeof record.id === 'number') {
       // Response to a request
-      const pending = this.pendingRequests.get(message.id);
+      const response = message as JsonRpcResponse;
+      const pending = this.pendingRequests.get(response.id);
       if (pending) {
         clearTimeout(pending.timeout);
-        this.pendingRequests.delete(message.id);
+        this.pendingRequests.delete(response.id);
 
-        if (message.error) {
-          pending.reject(new Error(message.error.message));
+        if (response.error) {
+          pending.reject(new Error(response.error.message));
         } else {
-          pending.resolve(message.result);
+          pending.resolve(response.result);
         }
       }
-    } else if ('method' in message) {
-      // Notification from server
-      this.handleNotification(message as JsonRpcNotification);
     }
+  }
+
+  /** Reply to unsupported server requests without claiming they succeeded. */
+  private handleServerRequest(request: JsonRpcServerRequest): void {
+    const error = request.method === 'client/registerCapability'
+      ? { code: -32803, message: 'Dynamic capability registration is not supported' }
+      : { code: -32601, message: 'Method not found' };
+    const response: JsonRpcErrorResponse = { jsonrpc: '2.0', id: request.id, error };
+    const content = JSON.stringify(response);
+    const message = `Content-Length: ${Buffer.byteLength(content)}\r\n\r\n${content}`;
+    void this.enqueueOutboundWrite(() => this.writeMessage(message)).catch(() => {
+      // The client teardown path already rejects pending work and closes stdin.
+    });
   }
 
   /**
@@ -375,11 +601,12 @@ export class LspClient {
   private handleNotification(notification: JsonRpcNotification): void {
     if (notification.method === 'textDocument/publishDiagnostics') {
       const params = this.translateIncomingPayload(notification.params) as { uri: string; diagnostics: Diagnostic[] };
-      this.diagnostics.set(params.uri, params.diagnostics);
+      const key = uriKey(params.uri);
+      this.diagnostics.set(key, params.diagnostics);
       // Wake any waiters registered via waitForDiagnostics()
-      const waiters = this.diagnosticWaiters.get(params.uri);
+      const waiters = this.diagnosticWaiters.get(key);
       if (waiters && waiters.length > 0) {
-        this.diagnosticWaiters.delete(params.uri);
+        this.diagnosticWaiters.delete(key);
         for (const wake of waiters) wake();
       }
     }
@@ -419,16 +646,26 @@ export class LspClient {
         timeout: timeoutHandle
       });
 
-      this.process?.stdin?.write(message);
+      void this.enqueueOutboundWrite(() => {
+        if (!this.pendingRequests.has(id)) {
+          throw new Error(`LSP request '${method}' is no longer pending`);
+        }
+        return this.writeMessage(message);
+      }).catch(error => {
+        const pending = this.pendingRequests.get(id);
+        if (!pending) return;
+
+        clearTimeout(pending.timeout);
+        this.pendingRequests.delete(id);
+        pending.reject(error instanceof Error ? error : new Error(String(error)));
+      });
     });
   }
 
   /**
    * Send a notification to the server (no response expected)
    */
-  private notify(method: string, params: unknown): void {
-    if (!this.process?.stdin) return;
-
+  private notify(method: string, params: unknown): boolean {
     const notification: JsonRpcNotification = {
       jsonrpc: '2.0',
       method,
@@ -437,13 +674,88 @@ export class LspClient {
 
     const content = JSON.stringify(notification);
     const message = `Content-Length: ${Buffer.byteLength(content)}\r\n\r\n${content}`;
-    this.process.stdin.write(message);
+    return this.writeMessage(message);
+  }
+
+  private async notifyWithBackpressure(method: string, params: unknown): Promise<void> {
+    return this.enqueueOutboundWrite(() => this.notify(method, params));
+  }
+
+  private async enqueueOutboundWrite(write: () => boolean): Promise<void> {
+    const generation = this.notificationGeneration;
+    const notification = this.notificationTail.then(() => {
+      if (generation !== this.notificationGeneration) {
+        throw new Error('LSP notification cancelled before write');
+      }
+      return this.writeWithBackpressure(write);
+    });
+    this.notificationTail = notification.catch(() => undefined);
+    return notification;
+  }
+
+  private writeMessage(message: string): boolean {
+    if (!this.process?.stdin) {
+      throw new Error('LSP client is not connected');
+    }
+    try {
+      return this.process.stdin.write(message);
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      this.handleTransportFailure(failure);
+      throw failure;
+    }
+  }
+
+  private async writeWithBackpressure(write: () => boolean): Promise<void> {
+    const stdin = this.process?.stdin;
+    if (write() || !stdin) {
+      return;
+    }
+    if (typeof stdin.once !== 'function' || typeof stdin.off !== 'function') {
+      return;
+    }
+
+    await new Promise<void>((resolveDrain, rejectDrain) => {
+      const cleanup = () => {
+        stdin.off('drain', handleDrain);
+        stdin.off('error', handleError);
+        stdin.off('close', handleClose);
+        this.notificationWaiterRejectors.delete(handleCancel);
+      };
+      const handleDrain = () => {
+        cleanup();
+        resolveDrain();
+      };
+      const handleError = (error: Error) => {
+        cleanup();
+        rejectDrain(error);
+      };
+      const handleClose = () => {
+        handleError(new Error('LSP stdin closed before drain'));
+      };
+      const handleCancel = (error: Error) => {
+        handleError(error);
+      };
+      this.notificationWaiterRejectors.add(handleCancel);
+      stdin.once('drain', handleDrain);
+      stdin.once('error', handleError);
+      stdin.once('close', handleClose);
+    });
+  }
+
+  private cancelPendingNotificationWrites(error: Error): void {
+    this.notificationGeneration++;
+    for (const reject of Array.from(this.notificationWaiterRejectors)) {
+      reject(error);
+    }
   }
 
   /**
    * Initialize the LSP connection
    */
   private async initialize(): Promise<void> {
+    const child = this.process;
+    const connectionGeneration = this.connectionGeneration;
     const initResult = await this.request<{ capabilities?: Record<string, unknown> }>('initialize', {
       processId: process.pid,
       rootUri: this.getWorkspaceRootUri(),
@@ -469,10 +781,12 @@ export class LspClient {
       initializationOptions: this.serverConfig.initializationOptions || {}
     }, getLspRequestTimeout(this.serverConfig, 'initialize'));
 
+    this.assertCurrentConnection(child, connectionGeneration);
     this._serverCapabilities = initResult?.capabilities ?? null;
     this._supportsPullDiagnostics = !!this._serverCapabilities?.diagnosticProvider;
 
-    this.notify('initialized', {});
+    await this.notifyWithBackpressure('initialized', {});
+    this.assertCurrentConnection(child, connectionGeneration);
   }
 
   /**
@@ -480,9 +794,34 @@ export class LspClient {
    */
   async openDocument(filePath: string): Promise<void> {
     const hostUri = fileUri(filePath);
-    const uri = this.toServerUri(hostUri);
+    await this.queueDocumentOperation(hostUri, async () => {
+      await this.ensureDocumentOpen(filePath);
+      this.persistentDocuments.add(hostUri);
+    });
+  }
+
+  private async ensureDocumentOpen(filePath: string): Promise<void> {
+    const hostUri = fileUri(filePath);
 
     if (this.openDocuments.has(hostUri)) return;
+
+    const pending = this.documentOpenPromises.get(hostUri);
+    if (pending) return pending;
+
+    const opening = this.performDocumentOpen(filePath, hostUri).finally(() => {
+      if (this.documentOpenPromises.get(hostUri) === opening) {
+        this.documentOpenPromises.delete(hostUri);
+      }
+    });
+    this.documentOpenPromises.set(hostUri, opening);
+    return opening;
+  }
+
+  private async performDocumentOpen(filePath: string, hostUri: string): Promise<void> {
+    this.throwIfTerminal();
+    const child = this.process;
+    const connectionGeneration = this.connectionGeneration;
+    const uri = this.toServerUri(hostUri);
 
     if (!existsSync(filePath)) {
       throw new Error(`File not found: ${filePath}`);
@@ -491,7 +830,11 @@ export class LspClient {
     const content = readFileSync(filePath, 'utf-8');
     const languageId = this.getLanguageId(filePath);
 
-    this.notify('textDocument/didOpen', {
+    // A reopened document needs fresh diagnostics rather than a cached result
+    // from its previous didOpen/didClose lifecycle.
+    this.diagnostics.delete(uriKey(hostUri));
+
+    await this.notifyWithBackpressure('textDocument/didOpen', {
       textDocument: {
         uri,
         languageId,
@@ -500,26 +843,93 @@ export class LspClient {
       }
     });
 
+    this.assertCurrentConnection(child, connectionGeneration);
     this.openDocuments.add(hostUri);
 
     // Wait a bit for the server to process the document
     await new Promise(resolve => setTimeout(resolve, 100));
+    this.assertCurrentConnection(child, connectionGeneration);
+    this.throwIfTerminal();
   }
 
   /**
    * Close a document
    */
-  closeDocument(filePath: string): void {
+  async closeDocument(filePath: string): Promise<void> {
+    const hostUri = fileUri(filePath);
+    await this.queueDocumentOperation(hostUri, async () => {
+      this.persistentDocuments.delete(hostUri);
+      await this.closeTransientDocument(filePath);
+    });
+  }
+
+  private async closeTransientDocument(filePath: string): Promise<void> {
     const hostUri = fileUri(filePath);
     const uri = this.toServerUri(hostUri);
+    const child = this.process;
+    const connectionGeneration = this.connectionGeneration;
 
     if (!this.openDocuments.has(hostUri)) return;
 
-    this.notify('textDocument/didClose', {
-      textDocument: { uri }
-    });
+    try {
+      await this.notifyWithBackpressure('textDocument/didClose', {
+        textDocument: { uri }
+      });
+    } finally {
+      if (this.isCurrentConnection(child, connectionGeneration)) {
+        this.openDocuments.delete(hostUri);
+      }
+    }
+  }
 
-    this.openDocuments.delete(hostUri);
+  /**
+   * Run an operation while a document is open, closing only documents opened
+   * by this operation. Calls for the same document are serialized so one
+   * operation cannot close the document while another is still using it.
+   */
+  async withOpenDocument<T>(filePath: string, operation: () => Promise<T>): Promise<T> {
+    const hostUri = fileUri(filePath);
+    const connectionGeneration = this.connectionGeneration;
+    return this.queueDocumentOperation(hostUri, async () => {
+      try {
+        await this.ensureDocumentOpen(filePath);
+        return await operation();
+      } finally {
+        if (this.connectionGeneration === connectionGeneration && !this.persistentDocuments.has(hostUri)) {
+          await this.closeTransientDocument(filePath);
+        }
+      }
+    });
+  }
+
+  private async queueDocumentOperation<T>(hostUri: string, operation: () => Promise<T>): Promise<T> {
+    const connectionGeneration = this.connectionGeneration;
+    const cancellation = this.documentQueueCancellation.promise;
+    const previous = this.documentOperationTails.get(hostUri) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolveCurrent) => {
+      release = resolveCurrent;
+    });
+    const tail = previous.catch(() => undefined).then(() => current);
+    this.documentOperationTails.set(hostUri, tail);
+
+    const predecessorCompleted = await Promise.race([
+      previous.then(() => true, () => true),
+      cancellation.then(() => false)
+    ]);
+
+    try {
+      if (!predecessorCompleted || this.connectionGeneration !== connectionGeneration) {
+        throw this.terminalError ?? new Error('LSP connection was replaced');
+      }
+      this.throwIfTerminal();
+      return await operation();
+    } finally {
+      release();
+      if (this.documentOperationTails.get(hostUri) === tail) {
+        this.documentOperationTails.delete(hostUri);
+      }
+    }
   }
 
   /**
@@ -642,7 +1052,7 @@ export class LspClient {
    */
   getDiagnostics(filePath: string): Diagnostic[] {
     const uri = fileUri(filePath);
-    return this.diagnostics.get(uri) || [];
+    return this.diagnostics.get(uriKey(uri)) || [];
   }
 
   /**
@@ -650,6 +1060,10 @@ export class LspClient {
    */
   get supportsPullDiagnostics(): boolean {
     return this._supportsPullDiagnostics;
+  }
+
+  get isUsable(): boolean {
+    return !this.disconnected;
   }
 
   /**
@@ -679,32 +1093,54 @@ export class LspClient {
    */
   waitForDiagnostics(filePath: string, timeoutMs = 2000): Promise<void> {
     const uri = fileUri(filePath);
+    const key = uriKey(uri);
+    try {
+      this.throwIfTerminal();
+    } catch (error) {
+      return Promise.reject(error);
+    }
 
     // If diagnostics are already present, resolve immediately.
-    if (this.diagnostics.has(uri)) {
+    if (this.diagnostics.has(key)) {
       return Promise.resolve();
     }
 
-    return new Promise<void>((resolve) => {
+    return new Promise<void>((resolve, reject) => {
       let resolved = false;
+      const removeWaiter = (waiter: (error?: Error) => void) => {
+        const waiters = this.diagnosticWaiters.get(key);
+        if (!waiters) return;
+
+        const remaining = waiters.filter(candidate => candidate !== waiter);
+        if (remaining.length === 0) {
+          this.diagnosticWaiters.delete(key);
+        } else {
+          this.diagnosticWaiters.set(key, remaining);
+        }
+      };
+      const waiter = (error?: Error) => {
+        if (!resolved) {
+          resolved = true;
+          clearTimeout(timer);
+          if (error) {
+            reject(error);
+          } else {
+            resolve();
+          }
+        }
+      };
       const timer = setTimeout(() => {
         if (!resolved) {
           resolved = true;
-          this.diagnosticWaiters.delete(uri);
+          removeWaiter(waiter);
           resolve();
         }
       }, timeoutMs);
 
       // Store the resolver so handleNotification can wake it up.
-      const existing = this.diagnosticWaiters.get(uri) || [];
-      existing.push(() => {
-        if (!resolved) {
-          resolved = true;
-          clearTimeout(timer);
-          resolve();
-        }
-      });
-      this.diagnosticWaiters.set(uri, existing);
+      const existing = this.diagnosticWaiters.get(key) || [];
+      existing.push(waiter);
+      this.diagnosticWaiters.set(key, existing);
     });
   }
 
@@ -818,6 +1254,9 @@ export const IDLE_CHECK_INTERVAL_MS = readPositiveIntEnv('OMC_LSP_IDLE_CHECK_INT
  */
 export class LspClientManager {
   private clients = new Map<string, LspClient>();
+  private pendingClients = new Map<string, { client: LspClient; promise: Promise<LspClient> }>();
+  private clientGeneration = 0;
+  private disconnecting: Promise<void> | null = null;
   private lastUsed = new Map<string, number>();
   private inFlightCount = new Map<string, number>();
   private idleDeadlines = new Map<string, ReturnType<typeof setTimeout>>();
@@ -850,7 +1289,16 @@ export class LspClientManager {
           // Ignore errors during cleanup
         }
       }
+      for (const { client } of this.pendingClients.values()) {
+        try {
+          client.forceKill();
+        } catch {
+          // Ignore errors during cleanup
+        }
+      }
+      this.clientGeneration++;
       this.clients.clear();
+      this.pendingClients.clear();
       this.lastUsed.clear();
       this.inFlightCount.clear();
     };
@@ -869,30 +1317,21 @@ export class LspClientManager {
    * Get or create a client for a file
    */
   async getClientForFile(filePath: string): Promise<LspClient | null> {
-    const serverConfig = getServerForFile(filePath);
+    const workspaceRoot = this.findWorkspaceRoot(filePath);
+    const serverConfig = getServerForFile(filePath, workspaceRoot);
     if (!serverConfig) {
       return null;
     }
 
-    // Find workspace root
-    const workspaceRoot = this.findWorkspaceRoot(filePath);
     const devContainerContext = resolveDevContainerContext(workspaceRoot);
     const key = `${workspaceRoot}:${serverConfig.command}:${devContainerContext?.containerId ?? 'host'}`;
 
-    let client = this.clients.get(key);
-    if (!client) {
-      client = new LspClient(workspaceRoot, serverConfig, devContainerContext);
-      try {
-        await client.connect();
-        this.clients.set(key, client);
-      } catch (error) {
-        throw error;
+    while (true) {
+      const client = await this.acquireClient(key, workspaceRoot, serverConfig, devContainerContext);
+      if (this.clients.get(key) === client && client.isUsable && !this.disconnecting) {
+        return client;
       }
     }
-
-    this.touchClient(key);
-
-    return client;
   }
 
   /**
@@ -901,41 +1340,127 @@ export class LspClientManager {
    * The lastUsed timestamp is refreshed on both entry and exit.
    */
   async runWithClientLease<T>(filePath: string, fn: (client: LspClient) => Promise<T>): Promise<T> {
-    const serverConfig = getServerForFile(filePath);
+    const workspaceRoot = this.findWorkspaceRoot(filePath);
+    const serverConfig = getServerForFile(filePath, workspaceRoot);
     if (!serverConfig) {
       throw new Error(`No language server available for: ${filePath}`);
     }
 
-    const workspaceRoot = this.findWorkspaceRoot(filePath);
     const devContainerContext = resolveDevContainerContext(workspaceRoot);
     const key = `${workspaceRoot}:${serverConfig.command}:${devContainerContext?.containerId ?? 'host'}`;
 
-    let client = this.clients.get(key);
-    if (!client) {
-      client = new LspClient(workspaceRoot, serverConfig, devContainerContext);
-      try {
-        await client.connect();
-        this.clients.set(key, client);
-      } catch (error) {
-        throw error;
-      }
-    }
-
-    // Touch timestamp and increment in-flight counter
-    this.touchClient(key);
-    this.inFlightCount.set(key, (this.inFlightCount.get(key) || 0) + 1);
+    const client = await this.acquireClientLease(key, workspaceRoot, serverConfig, devContainerContext);
 
     try {
       return await fn(client);
     } finally {
-      // Decrement in-flight counter and refresh timestamp
-      const count = (this.inFlightCount.get(key) || 1) - 1;
-      if (count <= 0) {
-        this.inFlightCount.delete(key);
-      } else {
-        this.inFlightCount.set(key, count);
+      // A replaced or detached client must not mutate the replacement's lease count.
+      if (this.clients.get(key) === client) {
+        const count = (this.inFlightCount.get(key) || 1) - 1;
+        if (count <= 0) {
+          this.inFlightCount.delete(key);
+        } else {
+          this.inFlightCount.set(key, count);
+        }
+        this.touchClient(key);
       }
-      this.touchClient(key);
+    }
+  }
+
+  private async getOrCreateClient(
+    key: string,
+    workspaceRoot: string,
+    serverConfig: LspServerConfig,
+    devContainerContext: DevContainerContext | null
+  ): Promise<LspClient> {
+    const existing = this.clients.get(key);
+    if (existing?.isUsable) {
+      return existing;
+    }
+    if (existing) {
+      existing.forceKill();
+      this.clients.delete(key);
+      this.clearIdleDeadline(key);
+      this.lastUsed.delete(key);
+      this.inFlightCount.delete(key);
+    }
+
+    let pending = this.pendingClients.get(key);
+    if (!pending) {
+      const client = new LspClient(workspaceRoot, serverConfig, devContainerContext);
+      const generation = this.clientGeneration;
+      const promise = client.connect().then(() => {
+        if (generation !== this.clientGeneration) {
+          client.forceKill();
+          throw new Error('LSP client manager shut down during connection');
+        }
+        this.clients.set(key, client);
+        return client;
+      }).finally(() => {
+        if (this.pendingClients.get(key)?.client === client) {
+          this.pendingClients.delete(key);
+        }
+      });
+      pending = { client, promise };
+      this.pendingClients.set(key, pending);
+    }
+
+    return pending.promise;
+  }
+
+  private async acquireClient(
+    key: string,
+    workspaceRoot: string,
+    serverConfig: LspServerConfig,
+    devContainerContext: DevContainerContext | null
+  ): Promise<LspClient> {
+    while (true) {
+      const teardown = this.disconnecting;
+      if (teardown) {
+        await teardown;
+      }
+
+      const generation = this.clientGeneration;
+      this.startIdleCheck();
+      const existing = this.clients.get(key);
+      if (existing?.isUsable) {
+        this.touchClient(key);
+        return existing;
+      }
+      const client = await this.getOrCreateClient(key, workspaceRoot, serverConfig, devContainerContext);
+      if (generation === this.clientGeneration && !this.disconnecting && client.isUsable) {
+        this.touchClient(key);
+        return client;
+      }
+    }
+  }
+
+  private async acquireClientLease(
+    key: string,
+    workspaceRoot: string,
+    serverConfig: LspServerConfig,
+    devContainerContext: DevContainerContext | null
+  ): Promise<LspClient> {
+    while (true) {
+      const teardown = this.disconnecting;
+      if (teardown) {
+        await teardown;
+      }
+
+      const generation = this.clientGeneration;
+      this.startIdleCheck();
+      const existing = this.clients.get(key);
+      if (existing?.isUsable) {
+        this.touchClient(key);
+        this.inFlightCount.set(key, (this.inFlightCount.get(key) || 0) + 1);
+        return existing;
+      }
+      const client = await this.getOrCreateClient(key, workspaceRoot, serverConfig, devContainerContext);
+      if (generation === this.clientGeneration && !this.disconnecting && client.isUsable) {
+        this.touchClient(key);
+        this.inFlightCount.set(key, (this.inFlightCount.get(key) || 0) + 1);
+        return client;
+      }
     }
   }
 
@@ -1065,6 +1590,23 @@ export class LspClientManager {
    * Maps are always cleared regardless of individual disconnect failures.
    */
   async disconnectAll(): Promise<void> {
+    if (this.disconnecting) {
+      return this.disconnecting;
+    }
+
+    const teardown = Promise.resolve().then(() => this.performDisconnectAll());
+    this.disconnecting = teardown;
+    try {
+      await teardown;
+    } finally {
+      if (this.disconnecting === teardown) {
+        this.disconnecting = null;
+      }
+    }
+  }
+
+  private async performDisconnectAll(): Promise<void> {
+    this.clientGeneration++;
     if (this.idleTimer) {
       clearInterval(this.idleTimer);
       this.idleTimer = null;
@@ -1075,7 +1617,19 @@ export class LspClientManager {
     }
     this.idleDeadlines.clear();
 
+    for (const { client } of this.pendingClients.values()) {
+      try {
+        client.forceKill();
+      } catch {
+        // Ignore errors while stopping clients that are still connecting
+      }
+    }
+    this.pendingClients.clear();
+
     const entries = Array.from(this.clients.entries());
+    this.clients.clear();
+    this.lastUsed.clear();
+    this.inFlightCount.clear();
     const results = await Promise.allSettled(
       entries.map(([, client]) => client.disconnect())
     );
@@ -1089,10 +1643,8 @@ export class LspClientManager {
       }
     }
 
-    // Always clear maps regardless of individual failures
-    this.clients.clear();
-    this.lastUsed.clear();
-    this.inFlightCount.clear();
+    // Pending clients from the prior generation cannot publish.
+    this.pendingClients.clear();
   }
 
   /** Expose in-flight count for testing */

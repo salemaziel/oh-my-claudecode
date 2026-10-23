@@ -61,6 +61,75 @@ describe('Task System Support', () => {
     });
   });
 
+  describe('task list identity resolution (issue #3732)', () => {
+    const ORIGINAL_OVERRIDE = process.env.CLAUDE_CODE_TASK_LIST_ID;
+
+    afterEach(() => {
+      if (ORIGINAL_OVERRIDE === undefined) {
+        delete process.env.CLAUDE_CODE_TASK_LIST_ID;
+      } else {
+        process.env.CLAUDE_CODE_TASK_LIST_ID = ORIGINAL_OVERRIDE;
+      }
+    });
+
+    it('should resolve the task directory from CLAUDE_CODE_TASK_LIST_ID when set', () => {
+      process.env.CLAUDE_CODE_TASK_LIST_ID = 'my-team-tasks';
+      const result = getTaskDirectory('session-123');
+      // Reads the store Claude Code actually writes under the override, not
+      // the session dir — otherwise successful writes look like they vanished.
+      expect(result).toBe(path.join(mockHomedir, '.claude', 'tasks', 'my-team-tasks'));
+    });
+
+    it('should fall back to the session id directory when the override is absent', () => {
+      delete process.env.CLAUDE_CODE_TASK_LIST_ID;
+      const result = getTaskDirectory('session-123');
+      expect(result).toBe(path.join(mockHomedir, '.claude', 'tasks', 'session-123'));
+    });
+
+    it('should reject a path-traversal override and fall back to the session id', () => {
+      process.env.CLAUDE_CODE_TASK_LIST_ID = '../evil';
+      const result = getTaskDirectory('session-123');
+      expect(result).toBe(path.join(mockHomedir, '.claude', 'tasks', 'session-123'));
+    });
+
+    it('should reject an empty override and fall back to the session id', () => {
+      process.env.CLAUDE_CODE_TASK_LIST_ID = '   ';
+      const result = getTaskDirectory('session-123');
+      expect(result).toBe(path.join(mockHomedir, '.claude', 'tasks', 'session-123'));
+    });
+
+    it('checkIncompleteTasks reads tasks written under the task-list override', () => {
+      process.env.CLAUDE_CODE_TASK_LIST_ID = 'my-team-tasks';
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      vi.mocked(fs.readdirSync).mockReturnValue(['1.json'] as any);
+      vi.mocked(fs.readFileSync).mockReturnValue(
+        JSON.stringify({ id: '1', subject: 'Task 1', status: 'pending' })
+      );
+
+      const result = checkIncompleteTasks('session-123');
+      expect(result.count).toBe(1);
+      // The read must have targeted the override dir, not the session dir.
+      expect(vi.mocked(fs.readdirSync).mock.calls[0][0]).toBe(
+        path.join(mockHomedir, '.claude', 'tasks', 'my-team-tasks')
+      );
+    });
+
+    it('checkIncompleteTasks returns zero when only a foreign store exists', () => {
+      delete process.env.CLAUDE_CODE_TASK_LIST_ID;
+      vi.mocked(fs.existsSync).mockImplementation(
+        (p: any) => typeof p === 'string' && p.includes('my-team-tasks')
+      );
+      vi.mocked(fs.readdirSync).mockReturnValue(['1.json'] as any);
+      vi.mocked(fs.readFileSync).mockReturnValue(
+        JSON.stringify({ id: '1', subject: 'Task 1', status: 'pending' })
+      );
+
+      // Tasks exist only under the team store; session dir is absent.
+      const result = checkIncompleteTasks('session-123');
+      expect(result.count).toBe(0);
+    });
+  });
+
   describe('isValidTask', () => {
     it('should return true for valid Task object', () => {
       const validTask = {
@@ -152,6 +221,28 @@ describe('Task System Support', () => {
     it('should return false for completed task', () => {
       const task: Task = { id: '1', subject: 'Test', status: 'completed' };
       expect(isTaskIncomplete(task)).toBe(false);
+    });
+
+    it('does not treat owned session-flow stages as unfinished work', () => {
+      for (const status of ['pending', 'in_progress'] as const) {
+        const task: Task = {
+          id: status,
+          subject: '[S1] Current stage',
+          description: 'session-flow: managed stage\nEvidence: user request',
+          status,
+        };
+        expect(isTaskIncomplete(task)).toBe(false);
+      }
+    });
+
+    it('keeps unowned stage-like Tasks in the incomplete set', () => {
+      const task: Task = {
+        id: 'work',
+        subject: '[S1] User task',
+        description: 'Finish the actual work',
+        status: 'pending',
+      };
+      expect(isTaskIncomplete(task)).toBe(true);
     });
   });
 
@@ -277,6 +368,36 @@ describe('Task System Support', () => {
       expect(result.count).toBe(2);
       expect(result.total).toBe(3);
       expect(result.tasks).toHaveLength(2);
+    });
+
+    it('ignores owned session-flow records in the continuation hook but preserves real work', async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      vi.mocked(fs.readdirSync).mockReturnValue(['flow.json', 'current.json', 'work.json'] as any);
+      vi.mocked(fs.readFileSync).mockImplementation((filePath: any) => {
+        if (filePath.includes('flow.json')) {
+          return JSON.stringify({
+            id: 'flow',
+            subject: '[S1] Completed stage',
+            description: 'session-flow: managed stage\nEvidence: tool result',
+            status: 'pending',
+          });
+        }
+        if (filePath.includes('current.json')) {
+          return JSON.stringify({
+            id: 'current',
+            subject: '[S2] Current stage',
+            description: 'session-flow: managed stage\nEvidence: current turn',
+            status: 'in_progress',
+          });
+        }
+        return JSON.stringify({ id: 'work', subject: 'Write tests', status: 'pending' });
+      });
+
+      const result = await checkIncompleteTodos('session123');
+      expect(result.source).toBe('task');
+      expect(result.total).toBe(3);
+      expect(result.count).toBe(1);
+      expect(result.todos.map((task) => task.content)).toEqual(['Write tests']);
     });
 
     it('should return zero when all tasks complete', () => {

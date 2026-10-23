@@ -4,6 +4,8 @@ import { validateTeamName } from './team-name.js';
 import { normalizeToCcAlias } from '../features/delegation-enforcer.js';
 import { isBedrock, isVertexAI, isProviderSpecificModelId } from '../config/models.js';
 import { isExternalLLMDisabled } from '../lib/security-config.js';
+import type { WorkerLaunchDescriptor } from './types.js';
+import type { ExternalModelsDefaults } from '../shared/types.js';
 
 export type CliAgentType = 'claude' | 'codex' | 'gemini' | 'cursor' | 'grok' | 'antigravity';
 
@@ -11,7 +13,7 @@ export interface CliAgentContract {
   agentType: CliAgentType;
   binary: string;
   installInstructions: string;
-  buildLaunchArgs(model?: string, extraFlags?: string[]): string[];
+  buildLaunchArgs(model?: string, reasoningEffort?: string, extraFlags?: string[]): string[];
   parseOutput(rawOutput: string): string;
   /** Whether this agent supports a prompt/headless mode that bypasses TUI input */
   supportsPromptMode?: boolean;
@@ -23,6 +25,7 @@ export interface WorkerLaunchConfig {
   teamName: string;
   workerName: string;
   model?: string;
+  reasoningEffort?: string;
   cwd: string;
   extraFlags?: string[];
   /**
@@ -185,7 +188,7 @@ const CONTRACTS: Record<CliAgentType, CliAgentContract> = {
     agentType: 'claude',
     binary: 'claude',
     installInstructions: 'Install Claude CLI: https://claude.ai/download',
-    buildLaunchArgs(model?: string, extraFlags: string[] = []): string[] {
+    buildLaunchArgs(model?: string, reasoningEffort?: string, extraFlags: string[] = []): string[] {
       const args = ['--dangerously-skip-permissions'];
       if (shouldUseClaudeBareMode() && !extraFlags.includes('--bare')) {
         args.push('--bare');
@@ -193,10 +196,13 @@ const CONTRACTS: Record<CliAgentType, CliAgentContract> = {
       if (model) {
         // Provider-specific model IDs (Bedrock, Vertex) must be passed as-is.
         // Normalizing them to aliases like "sonnet" causes Claude Code to expand
-        // them to Anthropic API names (claude-sonnet-4-6) which are invalid on
+        // them to Anthropic API names (claude-sonnet-5) which are invalid on
         // these providers. (issue #1695)
         const resolved = isProviderSpecificModelId(model) ? model : normalizeToCcAlias(model);
         args.push('--model', resolved);
+      }
+      if (reasoningEffort) {
+        args.push('--effort', reasoningEffort);
       }
       return [...args, ...extraFlags];
     },
@@ -212,9 +218,12 @@ const CONTRACTS: Record<CliAgentType, CliAgentContract> = {
     // or positional prompt mode here; runtime dispatch writes inbox.md and nudges
     // the live Codex TUI with `codex` as the worker process.
     supportsPromptMode: false,
-    buildLaunchArgs(model?: string, extraFlags: string[] = []): string[] {
+    buildLaunchArgs(model?: string, reasoningEffort?: string, extraFlags: string[] = []): string[] {
       const args = ['--dangerously-bypass-approvals-and-sandbox'];
       if (model) args.push('--model', model);
+      if (reasoningEffort) {
+        args.push('-c', `model_reasoning_effort="${reasoningEffort}"`);
+      }
       return [...args, ...extraFlags];
     },
     parseOutput(rawOutput: string): string {
@@ -242,7 +251,7 @@ const CONTRACTS: Record<CliAgentType, CliAgentContract> = {
     installInstructions: 'Install Gemini CLI: npm install -g @google/gemini-cli',
     supportsPromptMode: true,
     promptModeFlag: '-p',
-    buildLaunchArgs(model?: string, extraFlags: string[] = []): string[] {
+    buildLaunchArgs(model?: string, reasoningEffort?: string, extraFlags: string[] = []): string[] {
       const args = ['--approval-mode', 'yolo'];
       if (model) args.push('--model', model);
       return [...args, ...extraFlags];
@@ -257,7 +266,7 @@ const CONTRACTS: Record<CliAgentType, CliAgentContract> = {
     installInstructions: 'Install Grok Build: https://build.grok.com',
     supportsPromptMode: true,
     promptModeFlag: '-p',
-    buildLaunchArgs(model?: string, extraFlags: string[] = []): string[] {
+    buildLaunchArgs(model?: string, reasoningEffort?: string, extraFlags: string[] = []): string[] {
       const args = ['--always-approve'];
       if (model) args.push('--model', model);
       return [...args, ...extraFlags];
@@ -272,7 +281,7 @@ const CONTRACTS: Record<CliAgentType, CliAgentContract> = {
     installInstructions: 'Install the Antigravity CLI (agy) per the official instructions at https://antigravity.google, then verify with `agy --version`.',
     supportsPromptMode: true,
     promptModeFlag: '-p',
-    buildLaunchArgs(model?: string, extraFlags: string[] = []): string[] {
+    buildLaunchArgs(model?: string, reasoningEffort?: string, extraFlags: string[] = []): string[] {
       // agy's `-p`/`--print` is appended by getPromptModeArgs as `-p <instruction>`,
       // where the prompt is the VALUE of `-p` (not a boolean). All other flags
       // MUST precede that `-p`, so buildLaunchArgs returns only the leading flags
@@ -280,6 +289,9 @@ const CONTRACTS: Record<CliAgentType, CliAgentContract> = {
       // so no trust-confirm send-keys is needed (unlike gemini). Verified agy 1.0.10.
       const args = ['--dangerously-skip-permissions'];
       if (model) args.push('--model', model);
+      if (reasoningEffort) {
+        args.push('--effort', reasoningEffort);
+      }
       return [...args, ...extraFlags];
     },
     parseOutput(rawOutput: string): string {
@@ -290,15 +302,23 @@ const CONTRACTS: Record<CliAgentType, CliAgentContract> = {
     agentType: 'cursor',
     binary: 'cursor-agent',
     installInstructions: 'Install Cursor Agent CLI: see https://docs.cursor.com/cli',
-    // cursor-agent runs as an interactive REPL — no exit-on-complete prompt mode.
-    // Keep supportsPromptMode false so the verdict-file contract path
-    // (CONTRACT_ROLES + shouldInjectContract) skips this provider; cursor
-    // workers participate as executors only.
+    // Team workers must be persistent interactive panes, so the one-shot
+    // `-p/--print` path is deliberately unused here (same stance as codex).
     supportsPromptMode: false,
-    buildLaunchArgs(_model?: string, extraFlags: string[] = []): string[] {
-      // Minimal flags — cursor-agent owns its own session/auth state.
-      // The model is selected interactively inside cursor-agent itself.
-      return [...extraFlags];
+    buildLaunchArgs(model?: string, reasoningEffort?: string, extraFlags: string[] = []): string[] {
+      // `--force` suppresses per-command approval prompts and `--trust` accepts
+      // the workspace, which together are cursor-agent's equivalent of the
+      // approval bypass every other provider already passes. Without them a
+      // worker pane opened on a directory cursor has not seen before stops at
+      // "Workspace Trust Required" and exits; team worktrees are freshly
+      // created per worker, so they always hit that path. `omc ask cursor`
+      // already launches with `--force --trust` for the same reason.
+      const args = ['--force', '--trust'];
+      const extra = extraFlags.filter(flag => !['--force', '-f', '--yolo', '--trust'].includes(flag));
+      // `--model <id>` is a documented global option; ids come from
+      // `cursor-agent --list-models` (e.g. cursor-grok-4.6-high, composer-2.5).
+      if (model) args.push('--model', model);
+      return [...args, ...extra];
     },
     parseOutput(rawOutput: string): string {
       return rawOutput.trim();
@@ -387,7 +407,7 @@ export function resolveValidatedBinaryPath(agentType: CliAgentType): string {
 }
 
 export function buildLaunchArgs(agentType: CliAgentType, config: WorkerLaunchConfig): string[] {
-  return getContract(agentType).buildLaunchArgs(config.model, config.extraFlags);
+  return getContract(agentType).buildLaunchArgs(config.model, config.reasoningEffort, config.extraFlags);
 }
 
 export function buildWorkerArgv(agentType: CliAgentType, config: WorkerLaunchConfig): string[] {
@@ -403,6 +423,49 @@ export function buildWorkerArgv(agentType: CliAgentType, config: WorkerLaunchCon
   return [binary, ...args];
 }
 
+export function validateWorkerLaunchDescriptor(value: unknown): WorkerLaunchDescriptor {
+  const descriptor = value as Partial<WorkerLaunchDescriptor> | null;
+  if (!descriptor || descriptor.schema_version !== 1
+    || typeof descriptor.provider !== 'string'
+    || !Object.prototype.hasOwnProperty.call(descriptor, 'model')
+    || (descriptor.model !== null && (typeof descriptor.model !== 'string' || descriptor.model.length === 0))
+    || typeof descriptor.binary !== 'string' || descriptor.binary.length === 0 || descriptor.binary.includes('\0')
+    || !(isAbsolute(descriptor.binary) || win32Path.isAbsolute(descriptor.binary))
+    || !Array.isArray(descriptor.args) || descriptor.args.some(arg => typeof arg !== 'string' || arg.includes('\0'))) {
+    throw new Error('Invalid worker launch descriptor');
+  }
+  getContract(descriptor.provider as CliAgentType);
+  const args = descriptor.provider === 'cursor'
+    ? [
+        '--force',
+        '--trust',
+        ...descriptor.args.filter(flag => !['--force', '-f', '--yolo', '--trust'].includes(flag)),
+      ]
+    : [...descriptor.args];
+  return {
+    schema_version: 1,
+    provider: descriptor.provider as CliAgentType,
+    model: descriptor.model,
+    binary: descriptor.binary,
+    args,
+  };
+}
+
+export function buildValidatedWorkerLaunchDescriptor(
+  agentType: CliAgentType,
+  config: WorkerLaunchConfig,
+  appendedArgs: readonly string[] = [],
+): WorkerLaunchDescriptor {
+  const [binary, ...args] = buildWorkerArgv(agentType, config);
+  return validateWorkerLaunchDescriptor({
+    schema_version: 1,
+    provider: agentType,
+    model: config.model ?? null,
+    binary,
+    args: [...args, ...appendedArgs],
+  });
+}
+
 export function buildWorkerCommand(agentType: CliAgentType, config: WorkerLaunchConfig): string {
   return buildWorkerArgv(agentType, config)
     .map((part) => `'${part.replace(/'/g, `'\"'\"'`)}'`)
@@ -410,6 +473,7 @@ export function buildWorkerCommand(agentType: CliAgentType, config: WorkerLaunch
 }
 
 const WORKER_MODEL_ENV_ALLOWLIST = [
+  'OMC_STATE_DIR',
   'ANTHROPIC_MODEL',
   'CLAUDE_MODEL',
   'ANTHROPIC_BASE_URL',
@@ -434,11 +498,17 @@ const WORKER_MODEL_ENV_ALLOWLIST = [
   'OMC_ANTIGRAVITY_DEFAULT_MODEL',
 ] as const;
 
+const CLAUDE_WORKER_ENV_ALLOWLIST = [
+  'CLAUDE_CONFIG_DIR',
+  'CLAUDE_CODE_EFFORT_LEVEL',
+] as const;
+
 export function getWorkerEnv(
   teamName: string,
   workerName: string,
   agentType: CliAgentType,
   env: NodeJS.ProcessEnv = process.env,
+  role?: string,
 ): Record<string, string> {
   validateTeamName(teamName);
   const workerEnv: Record<string, string> = {
@@ -446,11 +516,23 @@ export function getWorkerEnv(
     OMC_TEAM_NAME: teamName,
     OMC_WORKER_AGENT_TYPE: agentType,
   };
+  if (role) {
+    workerEnv.OMC_TEAM_ROLE = role;
+  }
 
   for (const key of WORKER_MODEL_ENV_ALLOWLIST) {
     const value = env[key];
     if (typeof value === 'string' && value.length > 0) {
       workerEnv[key] = value;
+    }
+  }
+
+  if (agentType === 'claude') {
+    for (const key of CLAUDE_WORKER_ENV_ALLOWLIST) {
+      const value = env[key];
+      if (typeof value === 'string' && value.length > 0) {
+        workerEnv[key] = value;
+      }
     }
   }
 
@@ -474,7 +556,7 @@ export function isPromptModeAgent(agentType: CliAgentType): boolean {
  *
  * When running on a non-standard provider (Bedrock, Vertex), workers need
  * the provider-specific model ID passed explicitly via --model. Without it,
- * Claude Code falls back to its built-in default (claude-sonnet-4-6) which
+ * Claude Code falls back to its built-in default (claude-sonnet-5) which
  * is invalid on these providers.
  *
  * Resolution order:
@@ -500,27 +582,95 @@ export function resolveClaudeWorkerModel(
   }
 
   // Direct model env vars — highest priority
-  const directModel = env.ANTHROPIC_MODEL || env.CLAUDE_MODEL || '';
+  const directModel = [env.ANTHROPIC_MODEL, env.CLAUDE_MODEL]
+    .map(value => value?.trim())
+    .find(Boolean) ?? '';
   if (directModel) {
     return directModel;
   }
 
   // Fallback: Bedrock tier-specific env vars (default to sonnet tier)
-  const bedrockModel =
-    env.CLAUDE_CODE_BEDROCK_SONNET_MODEL ||
-    env.ANTHROPIC_DEFAULT_SONNET_MODEL ||
-    '';
+  const bedrockModel = [env.CLAUDE_CODE_BEDROCK_SONNET_MODEL, env.ANTHROPIC_DEFAULT_SONNET_MODEL]
+    .map(value => value?.trim())
+    .find(Boolean) ?? '';
   if (bedrockModel) {
     return bedrockModel;
   }
 
   // OMC tier env vars
-  const omcModel = env.OMC_MODEL_MEDIUM || '';
+  const omcModel = env.OMC_MODEL_MEDIUM?.trim() ?? '';
   if (omcModel) {
     return omcModel;
   }
 
   return undefined;
+}
+
+/**
+ * Resolve the default model for any team worker provider from the process
+ * environment. Explicit routing/configured models are applied by callers
+ * before this fallback; this helper only owns provider-specific env precedence.
+ */
+export function resolveDefaultWorkerModel(
+  agentType: CliAgentType,
+  env: NodeJS.ProcessEnv = process.env,
+  defaults?: ExternalModelsDefaults,
+): string | undefined {
+  if (agentType === 'claude') return resolveClaudeWorkerModel(env);
+  const providerConfigKeys: Record<Exclude<CliAgentType, 'claude'>, keyof ExternalModelsDefaults> = {
+    codex: 'codexModel',
+    gemini: 'geminiModel',
+    antigravity: 'antigravityModel',
+    grok: 'grokModel',
+    cursor: 'cursorModel',
+  };
+  const configuredValue = defaults?.[providerConfigKeys[agentType]];
+  const configured = typeof configuredValue === 'string' ? configuredValue.trim() : undefined;
+  if (configured) return configured;
+
+  const providerName = agentType.toUpperCase();
+  const envKeys = [
+    `OMC_EXTERNAL_MODELS_DEFAULT_${providerName}_MODEL`,
+    `OMC_${providerName}_DEFAULT_MODEL`,
+  ];
+  for (const key of envKeys) {
+    const value = env[key]?.trim();
+    if (value) return value;
+  }
+  return undefined;
+}
+
+/** Keep persisted provider defaults to trimmed, non-sensitive model names. */
+export function normalizeExternalModelsDefaults(defaults?: ExternalModelsDefaults): ExternalModelsDefaults | undefined {
+  if (!defaults || typeof defaults !== 'object') return undefined;
+  const normalized: ExternalModelsDefaults = {};
+  for (const key of ['codexModel', 'geminiModel', 'grokModel', 'antigravityModel', 'cursorModel'] as const) {
+    const value = defaults[key];
+    if (typeof value === 'string' && value.trim()) normalized[key] = value.trim();
+  }
+  if (defaults.provider === 'codex' || defaults.provider === 'gemini' || defaults.provider === 'antigravity') {
+    normalized.provider = defaults.provider;
+  }
+  return Object.keys(normalized).length > 0 ? normalized : undefined;
+}
+
+/** Capture the effective provider defaults at team creation for env-removal parity. */
+export function resolveExternalModelsDefaults(
+  defaults?: ExternalModelsDefaults,
+  env: NodeJS.ProcessEnv = process.env,
+): ExternalModelsDefaults {
+  const normalized = normalizeExternalModelsDefaults(defaults) ?? {};
+  for (const [provider, key] of [
+    ['CODEX', 'codexModel'], ['GEMINI', 'geminiModel'], ['GROK', 'grokModel'],
+    ['CURSOR', 'cursorModel'], ['ANTIGRAVITY', 'antigravityModel'],
+  ] as const) {
+    if (normalized[key]) continue;
+    const value = [env[`OMC_EXTERNAL_MODELS_DEFAULT_${provider}_MODEL`], env[`OMC_${provider}_DEFAULT_MODEL`]]
+      .map(candidate => candidate?.trim())
+      .find(Boolean);
+    if (value) normalized[key] = value;
+  }
+  return normalized;
 }
 
 /**
@@ -530,17 +680,15 @@ export function resolveClaudeWorkerModel(
 /**
  * Whether a CLI agent's headless/prompt mode is supported on the given platform.
  * Antigravity (`agy`) `-p`/`--print` takes the prompt as an argv value and cannot
- * read it from stdin; on Windows that argv path is unreliable and `agy` has known
- * upstream Windows `-p` limitations. This centralizes the same platform support
- * decision the advisor (`scripts/run-provider-advisor.js`) enforces for `omc ask`.
+ * read it from stdin. The upstream bug (google-antigravity/antigravity-cli#76) was
+ * fixed in agy 1.0.15/1.1.1, enabling headless mode on Windows as of agy 1.3.0+.
+ * The team path spawns agy without a shell to avoid cmd.exe parsing issues.
  */
 export function isHeadlessSupportedOnPlatform(
   agentType: CliAgentType,
-  platform: NodeJS.Platform = process.platform,
+  _platform: NodeJS.Platform = process.platform,
 ): boolean {
-  if (agentType === 'antigravity' && platform === 'win32') {
-    return false;
-  }
+  // All prompt-mode agents support headless on all platforms (agy 1.3.0+)
   return true;
 }
 

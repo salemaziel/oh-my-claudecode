@@ -6,7 +6,9 @@
  * Intercepts Stop events to automatically delegate recently modified source files
  * to the code-simplifier agent for cleanup and simplification.
  *
- * Opt-in via ~/.omc/config.json: { "codeSimplifier": { "enabled": true } }
+ * Opt-in via the global OMC config.json: { "codeSimplifier": { "enabled": true } }
+ * ($OMC_HOME/config.json, else ${XDG_CONFIG_HOME:-~/.config}/omc/config.json on
+ * Linux/Unix, with legacy ~/.omc/config.json as the fallback)
  * Default: disabled (must explicitly opt in)
  */
 
@@ -19,13 +21,25 @@ import {
 } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { readStdin } from './lib/stdin.mjs';
 import { resolveOmcStateRoot } from './lib/state-root.mjs';
+import { BOUNDED_GIT_TIMEOUT_MS } from './lib/bounded-git-timeout.mjs';
+import { recordJevShadow } from './lib/jev-shadow.mjs';
 
 const DEFAULT_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.py', '.go', '.rs'];
 const DEFAULT_MAX_FILES = 10;
 const MARKER_FILENAME = 'code-simplifier-triggered.marker';
+const SIMPLIFIER_TRIGGER_QUESTIONS = {
+  simplification_worthy: {
+    type: 'noul',
+    instructions: 'Is this change simplification-worthy enough to inject the simplifier delegation?',
+    criteria: {
+      true: 'The change would benefit from a simplification pass (duplication, speculative flexibility, over-abstraction)',
+      false: 'Change is already minimal or not code',
+    },
+  },
+};
 
 function readJsonFile(filePath) {
   try {
@@ -36,8 +50,28 @@ function readJsonFile(filePath) {
   }
 }
 
+// Mirrors src/utils/paths.ts:getGlobalOmcConfigCandidates('config.json'):
+// OMC_HOME alone when set; otherwise the XDG config root on Linux/Unix, then
+// the legacy ~/.omc fallback. The first file that exists wins.
+function getGlobalOmcConfigCandidates() {
+  const explicitRoot = process.env.OMC_HOME?.trim();
+  if (explicitRoot) return [join(explicitRoot, 'config.json')];
+
+  const home = process.platform === 'win32'
+    ? process.env.USERPROFILE || process.env.HOME || homedir()
+    : process.env.HOME || homedir();
+  const legacy = join(home, '.omc', 'config.json');
+  if (process.platform === 'win32' || process.platform === 'darwin') return [legacy];
+
+  const configHome = process.env.XDG_CONFIG_HOME || join(homedir(), '.config');
+  return [...new Set([join(configHome, 'omc', 'config.json'), legacy])];
+}
+
 function readOmcConfig() {
-  return readJsonFile(join(homedir(), '.omc', 'config.json'));
+  for (const configPath of getGlobalOmcConfigCandidates()) {
+    if (existsSync(configPath)) return readJsonFile(configPath);
+  }
+  return null;
 }
 
 function isEnabled(config) {
@@ -46,11 +80,12 @@ function isEnabled(config) {
 
 function getModifiedFiles(cwd, extensions, maxFiles) {
   try {
-    const output = execSync('git diff HEAD --name-only', {
+    const output = execFileSync('git', ['diff', 'HEAD', '--name-only'], {
       cwd,
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 5000,
+      timeout: BOUNDED_GIT_TIMEOUT_MS,
+      windowsHide: true,
     });
 
     return output
@@ -118,6 +153,14 @@ async function main() {
       process.stdout.write(JSON.stringify({ continue: true }) + '\n');
       return;
     }
+
+    recordJevShadow({
+      point: 'simplifier-trigger',
+      state: { cwd, files, source: 'code-simplifier-stop' },
+      questions: SIMPLIFIER_TRIGGER_QUESTIONS,
+      heuristic: true,
+      permissionMode: data.permission_mode,
+    });
 
     // Write trigger marker to prevent re-triggering within this turn cycle
     try {

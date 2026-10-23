@@ -20,6 +20,7 @@
  */
 
 import { spawn } from 'child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { getClaudeConfigDir } from '../utils/config-dir.js';
@@ -34,6 +35,8 @@ const CACHE_TTL_MS = 30_000;
 const DEFAULT_TIMEOUT_MS = 800;
 
 interface CustomProviderCache {
+  /** Hash of the command and effective period filter; no command text persisted. */
+  identity: string;
   /** Unix timestamp (ms) of the last successful execution */
   timestamp: number;
   /** Buckets from the last successful execution */
@@ -59,12 +62,12 @@ function readCache(): CustomProviderCache | null {
   }
 }
 
-function writeCache(buckets: CustomBucket[]): void {
+function writeCache(buckets: CustomBucket[], identity: string): void {
   try {
     const p = getCachePath();
     const dir = dirname(p);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    const cache: CustomProviderCache = { timestamp: Date.now(), buckets };
+    const cache: CustomProviderCache = { timestamp: Date.now(), buckets, identity };
     writeFileSync(p, JSON.stringify(cache, null, 2));
   } catch {
     // Silent failure — cache is best-effort
@@ -81,13 +84,33 @@ function isCacheValid(cache: CustomProviderCache): boolean {
  * Sends SIGTERM when the timeout fires, then SIGKILL after 200 ms if still
  * alive. The returned promise rejects on non-zero exit or timeout.
  */
-function spawnWithTimeout(cmd: string | string[], timeoutMs: number): Promise<string> {
+export function spawnWithTimeout(cmd: string | string[], timeoutMs: number): Promise<string> {
   return new Promise((resolve, reject) => {
     const [executable, ...args] = Array.isArray(cmd)
       ? cmd
       : (['sh', '-c', cmd] as string[]);
 
-    const child = spawn(executable, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(executable, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32',
+    });
+
+    const killTree = (signal: NodeJS.Signals): void => {
+      if (child.pid === undefined) return;
+      try {
+        if (process.platform === 'win32') {
+          child.kill(signal);
+        } else {
+          process.kill(-child.pid, signal);
+        }
+      } catch {
+        // The process group may already have exited.
+      }
+    };
+
+    // Consume diagnostics without retaining them so a full stderr pipe cannot
+    // block the command before it writes its JSON result to stdout.
+    child.stderr.on('data', () => {});
 
     let stdout = '';
     child.stdout.on('data', (chunk: Buffer) => {
@@ -95,21 +118,19 @@ function spawnWithTimeout(cmd: string | string[], timeoutMs: number): Promise<st
     });
 
     let timedOut = false;
+    let escalationTimer: ReturnType<typeof setTimeout> | undefined;
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill('SIGTERM');
-      setTimeout(() => {
-        try {
-          child.kill('SIGKILL');
-        } catch {
-          // already exited
-        }
-      }, 200);
+      killTree('SIGTERM');
+      child.stdout.destroy();
+      child.stderr.destroy();
+      escalationTimer = setTimeout(() => killTree('SIGKILL'), 200);
       reject(new Error(`Custom rate limit command timed out after ${timeoutMs}ms`));
     }, timeoutMs);
 
     child.on('close', (code) => {
       clearTimeout(timer);
+      if (!timedOut && escalationTimer) clearTimeout(escalationTimer);
       if (!timedOut) {
         if (code === 0) {
           resolve(stdout);
@@ -182,7 +203,12 @@ function parseOutput(raw: string, periods?: string[]): CustomBucket[] | null {
 export async function executeCustomProvider(
   config: RateLimitsProviderConfig,
 ): Promise<CustomProviderResult> {
-  const cache = readCache();
+  // Period order and duplicates do not affect the existing membership filter.
+  const identity = createHash('sha256').update(JSON.stringify({
+    command: config.command, periods: [...new Set(config.periods ?? [])].sort(),
+  })).digest('hex');
+  const storedCache = readCache();
+  const cache = storedCache?.identity === identity ? storedCache : null;
 
   // Return fresh cache
   if (cache && isCacheValid(cache)) {
@@ -203,7 +229,7 @@ export async function executeCustomProvider(
       return { buckets: [], stale: false, error: 'invalid output' };
     }
 
-    writeCache(buckets);
+    writeCache(buckets, identity);
     return { buckets, stale: false };
   } catch (err) {
     if (process.env.OMC_DEBUG) {

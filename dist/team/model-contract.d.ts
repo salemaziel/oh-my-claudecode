@@ -1,9 +1,11 @@
+import type { WorkerLaunchDescriptor } from './types.js';
+import type { ExternalModelsDefaults } from '../shared/types.js';
 export type CliAgentType = 'claude' | 'codex' | 'gemini' | 'cursor' | 'grok' | 'antigravity';
 export interface CliAgentContract {
     agentType: CliAgentType;
     binary: string;
     installInstructions: string;
-    buildLaunchArgs(model?: string, extraFlags?: string[]): string[];
+    buildLaunchArgs(model?: string, reasoningEffort?: string, extraFlags?: string[]): string[];
     parseOutput(rawOutput: string): string;
     /** Whether this agent supports a prompt/headless mode that bypasses TUI input */
     supportsPromptMode?: boolean;
@@ -14,6 +16,7 @@ export interface WorkerLaunchConfig {
     teamName: string;
     workerName: string;
     model?: string;
+    reasoningEffort?: string;
     cwd: string;
     extraFlags?: string[];
     /**
@@ -64,8 +67,10 @@ export declare function validateCliAvailable(agentType: CliAgentType): void;
 export declare function resolveValidatedBinaryPath(agentType: CliAgentType): string;
 export declare function buildLaunchArgs(agentType: CliAgentType, config: WorkerLaunchConfig): string[];
 export declare function buildWorkerArgv(agentType: CliAgentType, config: WorkerLaunchConfig): string[];
+export declare function validateWorkerLaunchDescriptor(value: unknown): WorkerLaunchDescriptor;
+export declare function buildValidatedWorkerLaunchDescriptor(agentType: CliAgentType, config: WorkerLaunchConfig, appendedArgs?: readonly string[]): WorkerLaunchDescriptor;
 export declare function buildWorkerCommand(agentType: CliAgentType, config: WorkerLaunchConfig): string;
-export declare function getWorkerEnv(teamName: string, workerName: string, agentType: CliAgentType, env?: NodeJS.ProcessEnv): Record<string, string>;
+export declare function getWorkerEnv(teamName: string, workerName: string, agentType: CliAgentType, env?: NodeJS.ProcessEnv, role?: string): Record<string, string>;
 export declare function parseCliOutput(agentType: CliAgentType, rawOutput: string): string;
 /**
  * Check if an agent type supports prompt/headless mode (bypasses TUI).
@@ -76,7 +81,7 @@ export declare function isPromptModeAgent(agentType: CliAgentType): boolean;
  *
  * When running on a non-standard provider (Bedrock, Vertex), workers need
  * the provider-specific model ID passed explicitly via --model. Without it,
- * Claude Code falls back to its built-in default (claude-sonnet-4-6) which
+ * Claude Code falls back to its built-in default (claude-sonnet-5) which
  * is invalid on these providers.
  *
  * Resolution order:
@@ -89,17 +94,27 @@ export declare function isPromptModeAgent(agentType: CliAgentType): boolean;
  */
 export declare function resolveClaudeWorkerModel(env?: NodeJS.ProcessEnv): string | undefined;
 /**
+ * Resolve the default model for any team worker provider from the process
+ * environment. Explicit routing/configured models are applied by callers
+ * before this fallback; this helper only owns provider-specific env precedence.
+ */
+export declare function resolveDefaultWorkerModel(agentType: CliAgentType, env?: NodeJS.ProcessEnv, defaults?: ExternalModelsDefaults): string | undefined;
+/** Keep persisted provider defaults to trimmed, non-sensitive model names. */
+export declare function normalizeExternalModelsDefaults(defaults?: ExternalModelsDefaults): ExternalModelsDefaults | undefined;
+/** Capture the effective provider defaults at team creation for env-removal parity. */
+export declare function resolveExternalModelsDefaults(defaults?: ExternalModelsDefaults, env?: NodeJS.ProcessEnv): ExternalModelsDefaults;
+/**
  * Get the extra CLI args needed to pass an instruction in prompt mode.
  * Returns empty array if the agent does not support prompt mode.
  */
 /**
  * Whether a CLI agent's headless/prompt mode is supported on the given platform.
  * Antigravity (`agy`) `-p`/`--print` takes the prompt as an argv value and cannot
- * read it from stdin; on Windows that argv path is unreliable and `agy` has known
- * upstream Windows `-p` limitations. This centralizes the same platform support
- * decision the advisor (`scripts/run-provider-advisor.js`) enforces for `omc ask`.
+ * read it from stdin. The upstream bug (google-antigravity/antigravity-cli#76) was
+ * fixed in agy 1.0.15/1.1.1, enabling headless mode on Windows as of agy 1.3.0+.
+ * The team path spawns agy without a shell to avoid cmd.exe parsing issues.
  */
-export declare function isHeadlessSupportedOnPlatform(agentType: CliAgentType, platform?: NodeJS.Platform): boolean;
+export declare function isHeadlessSupportedOnPlatform(agentType: CliAgentType, _platform?: NodeJS.Platform): boolean;
 /** Throw a clear, actionable error if the agent's headless mode is unsupported here. */
 export declare function assertHeadlessSupported(agentType: CliAgentType): void;
 export declare function getPromptModeArgs(agentType: CliAgentType, instruction: string): string[];

@@ -16,6 +16,8 @@ await mkdir('bridge', { recursive: true });
 // Preamble: resolve global npm modules so externalized native packages
 // (like @ast-grep/napi) can be found when running from plugin cache
 const banner = `
+const importMetaUrl = require("url").pathToFileURL(__filename);
+
 // Resolve global npm modules for native package imports
 try {
   var _cp = require('child_process');
@@ -34,11 +36,15 @@ const watchMode = process.argv.includes('--watch');
 const buildConfig = {
   entryPoints: ['src/team/bridge-entry.ts'],
   bundle: true,
+  preserveSymlinks: true,
   platform: 'node',
   target: 'node18',
   format: 'cjs',
   outfile,
   banner: { js: banner },
+  define: {
+    'import.meta.url': 'importMetaUrl',
+  },
   // Externalize Node.js built-ins and native modules
   external: [
     'fs', 'path', 'os', 'util', 'stream', 'events',
@@ -54,8 +60,8 @@ const buildConfig = {
 if (watchMode) {
   const ctx = await esbuild.context(buildConfig);
   await ctx.watch();
-  console.log(`Watching ${outfile}...`);
+  console.error(`Watching ${outfile}...`);
 } else {
   await esbuild.build(buildConfig);
-  console.log(`Built ${outfile}`);
+  console.error(`Built ${outfile}`);
 }

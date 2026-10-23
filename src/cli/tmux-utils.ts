@@ -45,22 +45,35 @@ interface TmuxCommandInvocation {
 }
 
 function isUnixLikeOnWindows(): boolean {
-  return process.platform === 'win32' &&
-    !!(process.env.MSYSTEM || process.env.MINGW_PREFIX);
+  if (process.platform !== 'win32') return false;
+  // MSYSTEM is the discriminator exported by MSYS2 shells. SYSTEM is a
+  // Windows system variable and must not make a real POSIX tmux look native.
+  return Boolean(process.env.MSYSTEM?.trim() || process.env.MINGW_PREFIX?.trim());
 }
 
 export function isNativeWindowsShell(): boolean {
   return process.platform === 'win32' && !isUnixLikeOnWindows();
 }
 
-function quoteForCmd(arg: string): string {
+export function quoteForCmd(arg: string): string {
+  assertSafeCmdValue(arg);
   if (arg.length === 0) return '""';
   if (!/[\s"%^&|<>()]/.test(arg)) return arg;
   return `"${arg.replace(/(["%])/g, '$1$1')}"`;
 }
 
-function escapeForCmdSet(value: string): string {
-  return value.replace(/"/g, '""');
+export function escapeForCmdSet(value: string): string {
+  assertSafeCmdValue(value);
+  // The set command is embedded in a command string which is then wrapped in
+  // a second cmd /c invocation. Percent signs therefore need one escaping
+  // layer here, in addition to quoteForCmd's outer layer.
+  return value.replace(/%/g, '%%').replace(/"/g, '""');
+}
+
+function assertSafeCmdValue(value: string): void {
+  if (/[\0\r\n]/.test(value)) {
+    throw new Error('Native Windows tmux command values cannot contain NUL, CR, or LF characters');
+  }
 }
 
 function resolveTmuxInvocation(args: string[]): TmuxCommandInvocation {
@@ -204,10 +217,19 @@ export function isTmuxAvailable(): boolean {
  */
 export function isClaudeAvailable(): boolean {
   try {
-    execFileSync('claude', ['--version'], {
-      stdio: 'ignore',
-      shell: process.platform === 'win32',
-    });
+    if (process.platform === 'win32') {
+      const comspec = process.env.COMSPEC || 'cmd.exe';
+      const commandLine = ['claude', '--version'].map(quoteForCmd).join(' ');
+      const result = spawnSync(comspec, ['/d', '/s', '/c', commandLine], {
+        stdio: 'ignore',
+        windowsVerbatimArguments: true,
+      });
+      return result.status === 0;
+    } else {
+      execFileSync('claude', ['--version'], {
+        stdio: 'ignore',
+      });
+    }
     return true;
   } catch {
     return false;
@@ -265,6 +287,7 @@ export function buildTmuxSessionName(cwd: string): string {
       cwd,
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
     }).trim();
     if (branch) {
       branchToken = sanitizeTmuxToken(branch);

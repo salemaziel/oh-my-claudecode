@@ -6,7 +6,9 @@
  * Intercepts Stop events to automatically delegate recently modified source files
  * to the code-simplifier agent for cleanup and simplification.
  *
- * Opt-in via ~/.omc/config.json: { "codeSimplifier": { "enabled": true } }
+ * Opt-in via the global OMC config.json: { "codeSimplifier": { "enabled": true } }
+ * ($OMC_HOME/config.json, else ${XDG_CONFIG_HOME:-~/.config}/omc/config.json on
+ * Linux/Unix, with legacy ~/.omc/config.json as the fallback)
  * Default: disabled (must explicitly opt in)
  */
 
@@ -19,7 +21,7 @@ import {
 } from 'fs';
 import { join, dirname } from 'path';
 import { homedir } from 'os';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { fileURLToPath, pathToFileURL } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -29,6 +31,9 @@ const { readStdin } = await import(
   pathToFileURL(join(__dirname, 'lib', 'stdin.mjs')).href
 );
 const { resolveOmcStateRoot } = await import(pathToFileURL(join(__dirname, 'lib', 'state-root.mjs')).href);
+const { BOUNDED_GIT_TIMEOUT_MS } = await import(
+  pathToFileURL(join(__dirname, 'lib', 'bounded-git-timeout.mjs')).href
+);
 
 const DEFAULT_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.py', '.go', '.rs'];
 const DEFAULT_MAX_FILES = 10;
@@ -43,8 +48,28 @@ function readJsonFile(filePath) {
   }
 }
 
+// Mirrors src/utils/paths.ts:getGlobalOmcConfigCandidates('config.json'):
+// OMC_HOME alone when set; otherwise the XDG config root on Linux/Unix, then
+// the legacy ~/.omc fallback. The first file that exists wins.
+function getGlobalOmcConfigCandidates() {
+  const explicitRoot = process.env.OMC_HOME?.trim();
+  if (explicitRoot) return [join(explicitRoot, 'config.json')];
+
+  const home = process.platform === 'win32'
+    ? process.env.USERPROFILE || process.env.HOME || homedir()
+    : process.env.HOME || homedir();
+  const legacy = join(home, '.omc', 'config.json');
+  if (process.platform === 'win32' || process.platform === 'darwin') return [legacy];
+
+  const configHome = process.env.XDG_CONFIG_HOME || join(homedir(), '.config');
+  return [...new Set([join(configHome, 'omc', 'config.json'), legacy])];
+}
+
 function readOmcConfig() {
-  return readJsonFile(join(homedir(), '.omc', 'config.json'));
+  for (const configPath of getGlobalOmcConfigCandidates()) {
+    if (existsSync(configPath)) return readJsonFile(configPath);
+  }
+  return null;
 }
 
 function isEnabled(config) {
@@ -53,11 +78,12 @@ function isEnabled(config) {
 
 function getModifiedFiles(cwd, extensions, maxFiles) {
   try {
-    const output = execSync('git diff HEAD --name-only', {
+    const output = execFileSync('git', ['diff', 'HEAD', '--name-only'], {
       cwd,
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 5000,
+      timeout: BOUNDED_GIT_TIMEOUT_MS,
+      windowsHide: true,
     });
 
     return output

@@ -4,9 +4,9 @@
  * Parse stdin JSON from Claude Code statusline interface.
  * Based on claude-hud reference implementation.
  */
-import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from 'fs';
-import { dirname, join } from 'path';
-import { getSessionStateDir, getWorktreeRoot, listSessionIds, resolveOmcPath, } from '../lib/worktree-paths.js';
+import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync, utimesSync } from 'fs';
+import { dirname } from 'path';
+import { getWorktreeRoot, listSessionIds, resolveSessionStatePaths, } from '../lib/worktree-paths.js';
 const TRANSIENT_CONTEXT_PERCENT_TOLERANCE = 3;
 // ============================================================================
 // Stdin Cache (for --watch mode)
@@ -17,6 +17,8 @@ const TRANSIENT_CONTEXT_PERCENT_TOLERANCE = 3;
  * is a legacy / compatibility alias for the same value.
  */
 const SESSION_ID_ENV_VARS = ['CLAUDE_SESSION_ID', 'CLAUDECODE_SESSION_ID'];
+const HUD_STDIN_CACHE_STATE_NAME = 'hud-stdin-cache';
+const HUD_STDIN_CACHE_FILE_NAME = 'hud-stdin-cache.json';
 /**
  * Normalize an env value to a session-id candidate.
  * Empty / whitespace-only strings are treated as "not set" so a defined
@@ -29,50 +31,91 @@ function normalizeCandidate(value) {
     return trimmed.length > 0 ? trimmed : null;
 }
 /**
- * Resolve the stdin cache path.
+ * Resolve the stdin cache paths.
  *
  * Walks the session-id env vars in priority order, and for each candidate
- * tries to resolve a session-scoped path via the shared validated helper
- * `getSessionStateDir` (which calls `validateSessionId`). A candidate
+ * tries to resolve a session-scoped path via the canonical
+ * `resolveSessionStatePaths` helper. A candidate
  * that fails validation (path traversal, disallowed chars, overlong) is
  * skipped so the next candidate still gets a chance — a non-empty-but-
- * invalid primary does not silently bypass a valid secondary. Only when
- * no candidate yields a valid session path do we fall back to the legacy
- * flat path.
+ * invalid primary does not silently bypass a valid secondary.
+ *
+ * When env vars are absent, falls back to stdin.session_id if available,
+ * then finally to the legacy flat path. This prevents concurrent sessions
+ * without env vars from clobbering the same flat cache file.
  *
  * The file name remains `hud-stdin-cache.json` so that the existing
  * session-end cleanup pattern (`/^hud-stdin-cache\.json$/`) still matches
  * and no migration is required for existing environments.
  */
-function getStdinCachePath() {
-    const root = getWorktreeRoot() || process.cwd();
+function getStdinCachePaths(stdin, root = getWorktreeRoot() || process.cwd()) {
     for (const envVar of SESSION_ID_ENV_VARS) {
         const candidate = normalizeCandidate(process.env[envVar]);
         if (!candidate)
             continue;
         try {
-            return join(getSessionStateDir(candidate, root), 'hud-stdin-cache.json');
+            return resolveSessionStatePaths(HUD_STDIN_CACHE_STATE_NAME, candidate, root, {
+                fileName: HUD_STDIN_CACHE_FILE_NAME,
+            });
         }
         catch {
             // Invalid session id — try the next candidate.
         }
     }
-    // Legacy flat path must also resolve through the shared OMC-root helper so
-    // `OMC_STATE_DIR`-backed deployments land on the same directory as writers.
-    return resolveOmcPath('state/hud-stdin-cache.json', root);
+    // Fallback to stdin.session_id when env vars are absent, preventing
+    // concurrent sessions without env context from writing to the same flat path.
+    const stdinSessionId = stdin ? normalizeCandidate(stdin.session_id) : null;
+    if (stdinSessionId) {
+        try {
+            return resolveSessionStatePaths(HUD_STDIN_CACHE_STATE_NAME, stdinSessionId, root, {
+                fileName: HUD_STDIN_CACHE_FILE_NAME,
+            });
+        }
+        catch {
+            // Invalid session id in stdin — fall through to legacy flat path.
+        }
+    }
+    return resolveSessionStatePaths(HUD_STDIN_CACHE_STATE_NAME, undefined, root, {
+        fileName: HUD_STDIN_CACHE_FILE_NAME,
+    });
 }
 /**
  * Persist the last successful stdin read to disk.
  * Used by --watch mode to recover data when stdin is a TTY.
+ *
+ * Uses stdin.session_id as a fallback session identifier when env vars are
+ * absent, so concurrent sessions without env context do not overwrite each
+ * other's cache. Unchanged payloads refresh mtime because env-less readers use
+ * recency to identify the most recently active session.
  */
 export function writeStdinCache(stdin) {
     try {
-        const cachePath = getStdinCachePath();
+        const cachePath = getStdinCachePaths(stdin).effectiveWrite;
         const cacheDir = dirname(cachePath);
         if (!existsSync(cacheDir)) {
             mkdirSync(cacheDir, { recursive: true });
         }
-        writeFileSync(cachePath, JSON.stringify(stdin));
+        const newContent = JSON.stringify(stdin);
+        if (existsSync(cachePath)) {
+            try {
+                const existingContent = readFileSync(cachePath, 'utf-8');
+                if (existingContent === newContent) {
+                    // Keep the activity signal current without rewriting identical JSON.
+                    const now = new Date();
+                    try {
+                        utimesSync(cachePath, now, now);
+                        return;
+                    }
+                    catch {
+                        // Fall through to a content write if the timestamp cannot be refreshed.
+                    }
+                }
+            }
+            catch {
+                // If we can't read the existing file, fall through and write anyway.
+            }
+        }
+        writeFileSync(cachePath, newContent);
     }
     catch {
         // Best-effort; ignore failures
@@ -85,49 +128,52 @@ export function writeStdinCache(stdin) {
  * path is authoritative. Otherwise — e.g. `omc hud --watch` running as a
  * detached CLI/tmux process that never inherited the parent's session
  * env — we still need a way to surface the active session's cache; we
- * fall back first to the legacy flat path, and then to the most recently
- * updated `state/sessions/{id}/hud-stdin-cache.json` so the watch pane
- * does not stay stuck on an empty/starting view.
+ * prefer the most recently updated valid `state/sessions/{id}/hud-stdin-cache.json`
+ * and then fall back to the legacy flat path so the watch pane does not stay
+ * stuck on an empty/starting view.
  *
  * Returns null if no cache exists or it is unreadable.
  */
 export function readStdinCache() {
     const root = getWorktreeRoot() || process.cwd();
-    const scopedPath = getStdinCachePath();
+    const paths = getStdinCachePaths(undefined, root);
     const tryRead = (p) => {
         try {
             if (!existsSync(p))
                 return null;
-            return JSON.parse(readFileSync(p, 'utf-8'));
+            return parseCachedStdin(readFileSync(p, 'utf-8'));
         }
         catch {
             return null;
         }
     };
-    const scoped = tryRead(scopedPath);
-    if (scoped)
-        return scoped;
-    // If the scoped path already *is* the legacy flat path (no session id
-    // was available), there's no further lookup to try.
-    const legacyPath = resolveOmcPath('state/hud-stdin-cache.json', root);
-    if (scopedPath !== legacyPath) {
-        return null;
+    if (paths.sessionScoped) {
+        return tryRead(paths.sessionScoped);
     }
-    // Env-less reader: pick the most recent session-scoped cache as a
-    // best-effort surface of "the active session's HUD".
-    return readMostRecentSessionCache(root);
+    // Env-less reader: compare the legacy and session-scoped caches by mtime and
+    // return the newest valid entry. This lets a current session cache outrank a
+    // stale legacy snapshot without allowing an older session cache to hide a
+    // newer flat cache written by a statusline process without session context.
+    return readMostRecentCache(root, paths.legacy);
+}
+/** Parse only object-shaped cache entries; malformed values are not cache hits. */
+function parseCachedStdin(raw) {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
+        return null;
+    return parsed;
 }
 /**
- * Scan `state/sessions/{id}/hud-stdin-cache.json` and return the contents
- * of the most recently modified one. Only used as a fallback when no
- * session id is available in the environment (e.g. a tmux-hosted
- * `omc hud --watch` reader that did not inherit `CLAUDE_SESSION_ID`).
+ * Scan the legacy and session-scoped cache paths and return the contents of
+ * the most recently modified valid one. Only used when no session id is
+ * available in the environment (e.g. a tmux-hosted `omc hud --watch` reader
+ * that did not inherit `CLAUDE_SESSION_ID`). Malformed newest entries are
+ * skipped so they do not hide an older valid cache.
  *
- * Uses the same OMC-root helpers as the writers (`listSessionIds` /
- * `getSessionStateDir`) so this fallback honors `OMC_STATE_DIR` and any
- * other centralized-state configuration.
+ * Uses the same canonical session-path resolver as the writer so this
+ * fallback honors `OMC_STATE_DIR` and centralized-state configuration.
  */
-function readMostRecentSessionCache(root) {
+function readMostRecentCache(root, legacyPath) {
     let sessionIds;
     try {
         sessionIds = listSessionIds(root);
@@ -135,12 +181,21 @@ function readMostRecentSessionCache(root) {
     catch {
         return null;
     }
-    let bestPath = null;
-    let bestMtime = -Infinity;
+    const candidates = [];
+    try {
+        const st = statSync(legacyPath);
+        if (st.isFile())
+            candidates.push({ path: legacyPath, mtimeMs: st.mtimeMs });
+    }
+    catch {
+        // The legacy cache is optional.
+    }
     for (const sid of sessionIds) {
         let candidate;
         try {
-            candidate = join(getSessionStateDir(sid, root), 'hud-stdin-cache.json');
+            candidate = resolveSessionStatePaths(HUD_STDIN_CACHE_STATE_NAME, sid, root, {
+                fileName: HUD_STDIN_CACHE_FILE_NAME,
+            }).sessionScoped;
         }
         catch {
             continue;
@@ -149,23 +204,24 @@ function readMostRecentSessionCache(root) {
             const st = statSync(candidate);
             if (!st.isFile())
                 continue;
-            if (st.mtimeMs > bestMtime) {
-                bestMtime = st.mtimeMs;
-                bestPath = candidate;
-            }
+            candidates.push({ path: candidate, mtimeMs: st.mtimeMs });
         }
         catch {
             // Skip unreadable entries
         }
     }
-    if (!bestPath)
-        return null;
-    try {
-        return JSON.parse(readFileSync(bestPath, 'utf-8'));
+    candidates.sort((a, b) => b.mtimeMs - a.mtimeMs || a.path.localeCompare(b.path));
+    for (const candidate of candidates) {
+        try {
+            const parsed = parseCachedStdin(readFileSync(candidate.path, 'utf-8'));
+            if (parsed)
+                return parsed;
+        }
+        catch {
+            // A corrupt newest cache must not hide an older valid session cache.
+        }
     }
-    catch {
-        return null;
-    }
+    return null;
 }
 // ============================================================================
 // Stdin Reader
@@ -329,12 +385,16 @@ export function getRateLimitsFromStdin(stdin) {
     if (fiveHour == null && sevenDay == null) {
         return null;
     }
-    return {
-        fiveHourPercent: clampPercent(fiveHour),
-        weeklyPercent: sevenDay == null ? undefined : clampPercent(sevenDay),
-        fiveHourResetsAt: parseResetDate(stdin.rate_limits?.five_hour?.resets_at),
-        weeklyResetsAt: parseResetDate(stdin.rate_limits?.seven_day?.resets_at),
-    };
+    const result = {};
+    if (fiveHour != null) {
+        result.fiveHourPercent = clampPercent(fiveHour);
+        result.fiveHourResetsAt = parseResetDate(stdin.rate_limits?.five_hour?.resets_at);
+    }
+    if (sevenDay != null) {
+        result.weeklyPercent = clampPercent(sevenDay);
+        result.weeklyResetsAt = parseResetDate(stdin.rate_limits?.seven_day?.resets_at);
+    }
+    return result;
 }
 /**
  * Get model display name from stdin.
@@ -345,6 +405,9 @@ export function getRateLimitsFromStdin(stdin) {
 export function getModelId(stdin) {
     const modelId = stdin.model?.id?.trim();
     return modelId || null;
+}
+export function getEffortLevel(stdin) {
+    return stdin.effort?.level?.trim() || null;
 }
 export function getModelName(stdin) {
     const displayName = stdin.model?.display_name?.trim();

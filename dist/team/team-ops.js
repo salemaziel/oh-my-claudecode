@@ -8,15 +8,18 @@
  *
  * Modeled after oh-my-codex/src/team/team-ops.ts.
  */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { appendFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { appendFile, lstat, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { TeamPaths, absPath } from './state-paths.js';
-import { normalizeTeamManifest } from './governance.js';
+import { normalizeTeamManifest, resolveMaxWorkers } from './governance.js';
 import { normalizeTeamGovernance } from './governance.js';
-import { isTerminalTeamTaskStatus, canTransitionTeamTaskStatus, } from './contracts.js';
-import { claimTask as claimTaskImpl, transitionTaskStatus as transitionTaskStatusImpl, releaseTaskClaim as releaseTaskClaimImpl, listTasks as listTasksImpl, } from './state/tasks.js';
+import { isValidPersistedMaxWorkers, migrateTeamConfigRevision, readRevisionedTeamConfig, saveTeamConfigAtRevision } from './monitor.js';
+import { withProcessIdentityFileLock } from './process-identity-lock.js';
+import { isTerminalTeamTaskStatus, canTransitionTeamTaskStatus, TASK_ID_SAFE_PATTERN, TEAM_TASK_STATUSES, } from './contracts.js';
+import { adoptRecoveryReservations as adoptRecoveryReservationsImpl, claimTask as claimTaskImpl, requeueRecoveredTask as requeueRecoveredTaskImpl, transitionTaskStatus as transitionTaskStatusImpl, releaseTaskClaim as releaseTaskClaimImpl, listTasks as listTasksImpl, createTaskRecord, validateTaskDependencies, } from './state/tasks.js';
+import { publishTaskRecoveryCheckpoint as publishTaskRecoveryCheckpointImpl, readTaskRecoveryCheckpoint, selectTaskRecoveryCheckpoint, } from './task-recovery-checkpoint.js';
 import { canonicalizeTeamConfigWorkers } from './worker-canonicalization.js';
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -26,7 +29,10 @@ function teamDir(teamName, cwd) {
 }
 function normalizeTaskId(taskId) {
     const raw = String(taskId).trim();
-    return raw.startsWith('task-') ? raw.slice('task-'.length) : raw;
+    const normalized = raw.startsWith('task-') ? raw.slice('task-'.length) : raw;
+    if (!TASK_ID_SAFE_PATTERN.test(normalized))
+        throw new Error(`invalid_task_id:${taskId}`);
+    return normalized;
 }
 function canonicalTaskFilePath(teamName, taskId, cwd) {
     const normalizedTaskId = normalizeTaskId(taskId);
@@ -42,11 +48,16 @@ function taskFileCandidates(teamName, taskId, cwd) {
     return canonical === legacy ? [canonical] : [canonical, legacy];
 }
 async function writeAtomic(path, data) {
-    const tmp = `${path}.${process.pid}.tmp`;
+    const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
     await mkdir(dirname(path), { recursive: true });
-    await writeFile(tmp, data, 'utf8');
-    const { rename } = await import('node:fs/promises');
-    await rename(tmp, path);
+    try {
+        await writeFile(tmp, data, 'utf8');
+        const { rename } = await import('node:fs/promises');
+        await rename(tmp, path);
+    }
+    finally {
+        await rm(tmp, { force: true }).catch(() => undefined);
+    }
 }
 async function readJsonSafe(path) {
     try {
@@ -59,59 +70,157 @@ async function readJsonSafe(path) {
         return null;
     }
 }
+async function readPersistedJson(path) {
+    let raw;
+    try {
+        raw = await readFile(path, 'utf8');
+    }
+    catch (error) {
+        return error.code === 'ENOENT'
+            ? { kind: 'missing' }
+            : { kind: 'invalid', cause: 'unreadable', error };
+    }
+    try {
+        return { kind: 'value', value: JSON.parse(raw) };
+    }
+    catch (error) {
+        return { kind: 'invalid', cause: 'json', error };
+    }
+}
+async function readTaskPersistedJson(path) {
+    let fileStat;
+    try {
+        fileStat = await lstat(path);
+    }
+    catch (error) {
+        return error.code === 'ENOENT'
+            ? { kind: 'missing' }
+            : { kind: 'invalid', cause: 'unreadable', error };
+    }
+    if (fileStat.isSymbolicLink() || !fileStat.isFile()) {
+        return { kind: 'invalid', cause: 'unreadable' };
+    }
+    return readPersistedJson(path);
+}
+function persistedStateError(path, cause) {
+    return new Error(`invalid_persisted_state:${cause}:${path}`);
+}
 function normalizeTask(task) {
-    return { ...task, version: task.version ?? 1 };
+    const normalized = { ...task, version: task.version ?? 1 };
+    if (normalized.owner === null)
+        delete normalized.owner;
+    if (normalized.result === null)
+        delete normalized.result;
+    if (normalized.error === null)
+        delete normalized.error;
+    return normalized;
+}
+function isPlainRecord(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value)
+        && Object.getPrototypeOf(value) === Object.prototype;
+}
+function isNonEmptyText(value) {
+    return typeof value === 'string' && value.trim() !== '';
+}
+function isPositiveSafeInteger(value) {
+    return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
+function isTaskRecoveryReservation(value) {
+    if (!isPlainRecord(value))
+        return false;
+    return isNonEmptyText(value.recovery_id)
+        && isNonEmptyText(value.request_id)
+        && isPositiveSafeInteger(value.continuation_sequence)
+        && isNonEmptyText(value.checkpoint_path)
+        && isNonEmptyText(value.checkpoint_hash)
+        && isNonEmptyText(value.replacement_worker)
+        && isPositiveSafeInteger(value.replacement_generation)
+        && isNonEmptyText(value.adoption_token_hash)
+        && typeof value.reserved_at === 'string'
+        && Number.isFinite(Date.parse(value.reserved_at));
+}
+function isTaskRecoveryAdoption(value) {
+    if (!isPlainRecord(value))
+        return false;
+    return isNonEmptyText(value.recovery_id)
+        && isNonEmptyText(value.request_id)
+        && isPositiveSafeInteger(value.continuation_sequence)
+        && isNonEmptyText(value.checkpoint_path)
+        && isNonEmptyText(value.checkpoint_hash)
+        && isNonEmptyText(value.replacement_worker)
+        && isPositiveSafeInteger(value.replacement_generation)
+        && typeof value.adopted_at === 'string'
+        && Number.isFinite(Date.parse(value.adopted_at));
 }
 function isTeamTask(value) {
-    if (!value || typeof value !== 'object')
+    if (!isPlainRecord(value))
         return false;
     const v = value;
-    return typeof v.id === 'string' && typeof v.subject === 'string' && typeof v.status === 'string';
-}
-// Simple file-based lock (best-effort, non-blocking)
-async function withLock(lockDir, fn) {
-    const STALE_MS = 30_000;
-    await mkdir(dirname(lockDir), { recursive: true });
+    if (typeof v.id !== 'string' || !TASK_ID_SAFE_PATTERN.test(v.id)
+        || typeof v.subject !== 'string' || typeof v.description !== 'string'
+        || typeof v.created_at !== 'string' || !Number.isFinite(Date.parse(v.created_at))
+        || typeof v.status !== 'string' || !TEAM_TASK_STATUSES.includes(v.status)) {
+        return false;
+    }
+    if (v.version !== undefined && (!Number.isSafeInteger(v.version) || v.version < 1))
+        return false;
+    if (v.owner !== undefined && v.owner !== null && (typeof v.owner !== 'string' || v.owner.trim() === ''))
+        return false;
     try {
-        await mkdir(lockDir, { recursive: false });
+        validateTaskDependencies(v, 'invalid_task_dependencies');
     }
-    catch (err) {
-        if (err.code === 'EEXIST') {
-            // Check staleness
-            try {
-                const { stat } = await import('node:fs/promises');
-                const s = await stat(lockDir);
-                if (Date.now() - s.mtimeMs > STALE_MS) {
-                    await rm(lockDir, { recursive: true, force: true });
-                    try {
-                        await mkdir(lockDir, { recursive: false });
-                    }
-                    catch {
-                        return { ok: false };
-                    }
-                }
-                else {
-                    return { ok: false };
-                }
-            }
-            catch {
-                return { ok: false };
-            }
-        }
-        else {
-            throw err;
+    catch {
+        return false;
+    }
+    if (v.completed_at !== undefined && (typeof v.completed_at !== 'string' || !Number.isFinite(Date.parse(v.completed_at))))
+        return false;
+    if (v.result !== undefined && v.result !== null && typeof v.result !== 'string')
+        return false;
+    if (v.error !== undefined && v.error !== null && typeof v.error !== 'string')
+        return false;
+    if (v.metadata !== undefined && !isPlainRecord(v.metadata))
+        return false;
+    if (v.recovery_reservation !== undefined && !isTaskRecoveryReservation(v.recovery_reservation))
+        return false;
+    if (v.recovery_adoption !== undefined && !isTaskRecoveryAdoption(v.recovery_adoption))
+        return false;
+    const claim = v.claim;
+    if (claim !== undefined) {
+        if (!isPlainRecord(claim)
+            || typeof claim.owner !== 'string' || claim.owner.trim() === ''
+            || typeof claim.token !== 'string' || claim.token.trim() === ''
+            || typeof claim.leased_until !== 'string' || !Number.isFinite(Date.parse(claim.leased_until))
+            || (claim.launch_attempt_id !== undefined && typeof claim.launch_attempt_id !== 'string')) {
+            return false;
         }
     }
+    return true;
+}
+/**
+ * Validate and canonicalize a task record at a persistence boundary.
+ *
+ * The runtime and public task APIs must share this guard so malformed task
+ * fields cannot be published while nullable wire fields are normalized.
+ */
+export function normalizeTaskRecord(value) {
+    if (!isTeamTask(value))
+        throw new Error('invalid_task_schema');
+    return normalizeTask(value);
+}
+// Process-identity lock: live holders are never stolen by elapsed time alone.
+async function withLock(lockPath, fn) {
     try {
-        const result = await fn();
-        return { ok: true, value: result };
+        const value = await withProcessIdentityFileLock(lockPath, fn, 100);
+        return { ok: true, value };
     }
-    finally {
-        await rm(lockDir, { recursive: true, force: true }).catch(() => { });
+    catch (error) {
+        if (error instanceof Error && error.message === 'process_identity_lock_timeout')
+            return { ok: false };
+        throw error;
     }
 }
-async function withTaskClaimLock(teamName, taskId, cwd, fn) {
-    const lockDir = join(teamDir(teamName, cwd), 'tasks', `.lock-${taskId}`);
+export async function withTaskClaimLock(teamName, taskId, cwd, fn) {
+    const lockDir = join(teamDir(teamName, cwd), 'tasks', `.lock-${normalizeTaskId(taskId)}`);
     return withLock(lockDir, fn);
 }
 async function withMailboxLock(teamName, workerName, cwd, fn) {
@@ -134,6 +243,8 @@ async function withMailboxLock(teamName, workerName, cwd, fn) {
 function configFromManifest(manifest) {
     return {
         name: manifest.name,
+        ...(manifest.instance_id ? { instance_id: manifest.instance_id } : {}),
+        ...(manifest.tmux_server_identity ? { tmux_server_identity: manifest.tmux_server_identity } : {}),
         task: manifest.task,
         agent_type: 'claude',
         policy: manifest.policy,
@@ -154,11 +265,17 @@ function configFromManifest(manifest) {
         resize_hook_name: manifest.resize_hook_name,
         resize_hook_target: manifest.resize_hook_target,
         next_worker_index: manifest.next_worker_index,
+        resolved_routing: manifest.resolved_routing,
+        resolved_routing_roles: manifest.resolved_routing_roles,
+        external_models_defaults: manifest.external_models_defaults,
     };
 }
 function mergeTeamConfigSources(config, manifest) {
     if (!config && !manifest)
         return null;
+    if (config && typeof config.state_revision === 'number' && Number.isSafeInteger(config.state_revision)) {
+        return canonicalizeTeamConfigWorkers(config);
+    }
     if (!manifest)
         return config ? canonicalizeTeamConfigWorkers(config) : null;
     if (!config)
@@ -169,23 +286,47 @@ function mergeTeamConfigSources(config, manifest) {
         workers: [...(config.workers ?? []), ...(manifest.workers ?? [])],
         worker_count: Math.max(config.worker_count ?? 0, manifest.worker_count ?? 0),
         next_task_id: Math.max(config.next_task_id ?? 1, manifest.next_task_id ?? 1),
-        max_workers: Math.max(config.max_workers ?? 0, 20),
+        max_workers: resolveMaxWorkers(config.max_workers),
     });
 }
 export async function teamReadConfig(teamName, cwd) {
+    const configPath = absPath(cwd, TeamPaths.config(teamName));
+    const manifestPath = absPath(cwd, TeamPaths.manifest(teamName));
     const [manifest, config] = await Promise.all([
         teamReadManifest(teamName, cwd),
-        readJsonSafe(absPath(cwd, TeamPaths.config(teamName))),
+        readJsonSafe(configPath),
     ]);
+    if (!config && existsSync(configPath))
+        throw new Error('invalid_persisted_state');
+    if (config && !isValidPersistedMaxWorkers(config.max_workers))
+        throw new Error('invalid_persisted_state');
+    // Preserve raw V1 agentTypes provenance before any worker canonicalization.
+    // Canonicalization must not erase the only signal used to route legacy cleanup.
+    if (config && Array.isArray(config.agentTypes)) {
+        const agentTypes = config.agentTypes;
+        // Do not inject empty workers that would reclassify this as V2.
+        const { workers: _drop, ...rest } = config;
+        // Preserve agentTypes provenance; only keep workers if the raw file already had them.
+        const rawWorkers = config.workers;
+        return {
+            ...rest,
+            agentTypes,
+            workers: Array.isArray(rawWorkers) ? rawWorkers : [],
+        };
+    }
+    if (config && typeof config.state_revision === 'number' && Number.isSafeInteger(config.state_revision)) {
+        return canonicalizeTeamConfigWorkers(config);
+    }
+    if (!manifest && existsSync(manifestPath))
+        throw new Error('invalid_persisted_state');
     return mergeTeamConfigSources(config, manifest);
 }
 export async function teamReadManifest(teamName, cwd) {
     const manifestPath = absPath(cwd, TeamPaths.manifest(teamName));
     const manifest = await readJsonSafe(manifestPath);
+    if (!manifest && existsSync(manifestPath))
+        throw new Error('invalid_persisted_state');
     return manifest ? normalizeTeamManifest(manifest) : null;
-}
-export async function teamCleanup(teamName, cwd) {
-    await rm(teamDir(teamName, cwd), { recursive: true, force: true });
 }
 // ---------------------------------------------------------------------------
 // Worker operations
@@ -216,31 +357,70 @@ export async function teamWriteWorkerInbox(teamName, workerName, prompt, cwd) {
 // Task operations
 // ---------------------------------------------------------------------------
 export async function teamCreateTask(teamName, task, cwd) {
+    // Reject malformed dependency fields before entering the config/task
+    // transaction. The assigned task id is checked again below for self-links.
+    const requestedDependencies = {
+        depends_on: task.depends_on,
+        blocked_by: task.blocked_by,
+    };
+    validateTaskDependencies(requestedDependencies, 'invalid_task_dependencies');
+    const preflightConfig = await teamReadConfig(teamName, cwd);
+    if (preflightConfig?.next_task_id !== undefined) {
+        validateTaskDependencies({
+            ...requestedDependencies,
+            id: String(preflightConfig.next_task_id),
+        }, 'invalid_task_dependencies');
+    }
     const lockDir = join(teamDir(teamName, cwd), '.lock-create-task');
     const timeoutMs = 5_000;
     const deadline = Date.now() + timeoutMs;
     let delayMs = 20;
     while (Date.now() < deadline) {
         const result = await withLock(lockDir, async () => {
-            const cfg = await teamReadConfig(teamName, cwd);
-            if (!cfg)
+            const revisioned = await migrateTeamConfigRevision(teamName, cwd);
+            if (!revisioned)
                 throw new Error(`Team ${teamName} not found`);
-            const nextId = String(cfg.next_task_id ?? 1);
-            const created = {
-                ...task,
+            if (revisioned.config.lifecycle_state === 'shutting_down' || revisioned.config.lifecycle_state === 'stopped') {
+                throw new Error('team_mutation_busy');
+            }
+            const nextId = String(revisioned.config.next_task_id ?? 1);
+            validateTaskDependencies({
                 id: nextId,
-                status: task.status ?? 'pending',
-                depends_on: task.depends_on ?? task.blocked_by ?? [],
-                version: 1,
-                created_at: new Date().toISOString(),
-            };
-            const taskPath = absPath(cwd, TeamPaths.tasks(teamName));
-            await mkdir(taskPath, { recursive: true });
-            await writeAtomic(join(taskPath, `task-${nextId}.json`), JSON.stringify(created, null, 2));
-            // Advance counter
-            cfg.next_task_id = Number(nextId) + 1;
-            await writeAtomic(absPath(cwd, TeamPaths.config(teamName)), JSON.stringify(cfg, null, 2));
-            return created;
+                ...requestedDependencies,
+            }, 'invalid_task_dependencies');
+            const created = createTaskRecord(nextId, task);
+            const normalized = normalizeTaskRecord(created);
+            const serializedTask = JSON.stringify(normalized, null, 2);
+            const createdTaskPath = canonicalTaskFilePath(teamName, nextId, cwd);
+            const taskLock = await withTaskClaimLock(teamName, nextId, cwd, async () => {
+                await mkdir(dirname(createdTaskPath), { recursive: true });
+                await writeAtomic(createdTaskPath, serializedTask);
+                const nextConfig = {
+                    ...revisioned.config,
+                    next_task_id: Number(nextId) + 1,
+                    state_revision: revisioned.stateRevision + 1,
+                };
+                try {
+                    if (!await saveTeamConfigAtRevision(nextConfig, revisioned.stateRevision, cwd)) {
+                        throw new Error('stale_state_revision');
+                    }
+                }
+                catch (error) {
+                    // A manifest projection can fail after config.json commits. Preserve a task
+                    // that the authoritative counter/revision already admits.
+                    const persisted = await readRevisionedTeamConfig(teamName, cwd).catch(() => null);
+                    const configCommitted = persisted?.stateRevision === nextConfig.state_revision
+                        && persisted?.config.next_task_id === nextConfig.next_task_id;
+                    if (!configCommitted && await readFile(createdTaskPath, 'utf8').catch(() => null) === serializedTask) {
+                        await rm(createdTaskPath, { force: true });
+                    }
+                    throw error;
+                }
+                return normalized;
+            });
+            if (!taskLock.ok)
+                throw new Error(`Failed to acquire task claim lock for task ${nextId}`);
+            return taskLock.value;
         });
         if (result.ok)
             return result.value;
@@ -250,11 +430,17 @@ export async function teamCreateTask(teamName, task, cwd) {
     throw new Error(`Failed to acquire task creation lock for team ${teamName} after ${timeoutMs}ms`);
 }
 export async function teamReadTask(teamName, taskId, cwd) {
-    for (const candidate of taskFileCandidates(teamName, taskId, cwd)) {
-        const task = await readJsonSafe(candidate);
-        if (!task || !isTeamTask(task))
+    const normalizedId = normalizeTaskId(taskId);
+    for (const candidate of taskFileCandidates(teamName, normalizedId, cwd)) {
+        const state = await readTaskPersistedJson(candidate);
+        if (state.kind === 'missing')
             continue;
-        return normalizeTask(task);
+        if (state.kind === 'invalid')
+            throw persistedStateError(candidate, state.cause);
+        if (!isTeamTask(state.value) || state.value.id !== normalizedId) {
+            throw persistedStateError(candidate, 'schema');
+        }
+        return normalizeTask(state.value);
     }
     return null;
 }
@@ -263,6 +449,7 @@ export async function teamListTasks(teamName, cwd) {
         teamDir: (tn, c) => teamDir(tn, c),
         isTeamTask,
         normalizeTask,
+        stateError: persistedStateError,
     });
 }
 export async function teamUpdateTask(teamName, taskId, updates, cwd) {
@@ -274,16 +461,37 @@ export async function teamUpdateTask(teamName, taskId, updates, cwd) {
             const existing = await teamReadTask(teamName, taskId, cwd);
             if (!existing)
                 return null;
+            const hasDependsOn = Object.prototype.hasOwnProperty.call(updates, 'depends_on');
+            const hasBlockedBy = Object.prototype.hasOwnProperty.call(updates, 'blocked_by');
+            if ((hasDependsOn && updates.depends_on === undefined)
+                || (hasBlockedBy && updates.blocked_by === undefined)) {
+                throw new Error('invalid_task_dependencies');
+            }
+            let dependencyUpdates = {};
+            if (hasDependsOn || hasBlockedBy) {
+                const dependencyIds = validateTaskDependencies({
+                    id: existing.id,
+                    ...(hasDependsOn ? { depends_on: updates.depends_on } : {}),
+                    ...(hasBlockedBy ? { blocked_by: updates.blocked_by } : {}),
+                }, 'invalid_task_dependencies');
+                dependencyUpdates = {
+                    depends_on: [...dependencyIds],
+                    blocked_by: [...dependencyIds],
+                };
+            }
             const merged = {
                 ...normalizeTask(existing),
                 ...updates,
+                ...dependencyUpdates,
                 id: existing.id,
                 created_at: existing.created_at,
                 version: Math.max(1, existing.version ?? 1) + 1,
             };
+            validateTaskDependencies(merged, 'invalid_task_dependencies');
+            const normalized = normalizeTaskRecord(merged);
             const p = canonicalTaskFilePath(teamName, taskId, cwd);
-            await writeAtomic(p, JSON.stringify(merged, null, 2));
-            return merged;
+            await writeAtomic(p, JSON.stringify(normalized, null, 2));
+            return normalized;
         });
         if (result.ok)
             return result.value;
@@ -293,8 +501,8 @@ export async function teamUpdateTask(teamName, taskId, updates, cwd) {
     throw new Error(`Failed to acquire task update lock for task ${taskId} in team ${teamName} after ${timeoutMs}ms`);
 }
 export async function teamClaimTask(teamName, taskId, workerName, expectedVersion, cwd) {
-    const manifest = await teamReadManifest(teamName, cwd);
-    const governance = normalizeTeamGovernance(manifest?.governance, manifest?.policy);
+    const config = await teamReadConfig(teamName, cwd);
+    const governance = normalizeTeamGovernance(config?.governance, config?.policy);
     if (governance.plan_approval_required) {
         const task = await teamReadTask(teamName, taskId, cwd);
         if (task?.requires_code_change) {
@@ -331,6 +539,7 @@ export async function teamClaimTask(teamName, taskId, workerName, expectedVersio
         isTerminalTaskStatus: isTerminalTeamTaskStatus,
         taskFilePath: (tn, tid, c) => canonicalTaskFilePath(tn, tid, c),
         writeAtomic,
+        launchAttemptId: process.env.OMC_WORKER_LAUNCH_ATTEMPT_ID,
     });
 }
 export async function teamTransitionTaskStatus(teamName, taskId, from, to, claimToken, cwd, terminalData) {
@@ -346,8 +555,7 @@ export async function teamTransitionTaskStatus(teamName, taskId, from, to, claim
         taskFilePath: (tn, tid, c) => canonicalTaskFilePath(tn, tid, c),
         writeAtomic,
         appendTeamEvent: teamAppendEvent,
-        readMonitorSnapshot: teamReadMonitorSnapshot,
-        writeMonitorSnapshot: teamWriteMonitorSnapshot,
+        markTaskCompleted: teamMarkTaskCompleted,
     });
 }
 export async function teamReleaseTaskClaim(teamName, taskId, claimToken, workerName, cwd) {
@@ -362,6 +570,42 @@ export async function teamReleaseTaskClaim(teamName, taskId, claimToken, workerN
         taskFilePath: (tn, tid, c) => canonicalTaskFilePath(tn, tid, c),
         writeAtomic,
     });
+}
+function recoveryTransitionDeps(teamName, cwd, launchAttemptId) {
+    return {
+        teamName, cwd, readTask: teamReadTask,
+        readTeamConfig: teamReadConfig,
+        withTaskClaimLock, normalizeTask, isTerminalTaskStatus: isTerminalTeamTaskStatus,
+        taskFilePath: (tn, tid, c) => canonicalTaskFilePath(tn, tid, c), writeAtomic,
+        ...(launchAttemptId ? { launchAttemptId } : {}),
+        readRecoverySidecar: async (tn, recoveryId, tid, c) => {
+            const path = absPath(c, TeamPaths.taskRecoverySidecar(tn, recoveryId, tid));
+            if (!existsSync(path))
+                return null;
+            try {
+                return JSON.parse(await readFile(path, 'utf8'));
+            }
+            catch {
+                return 'malformed';
+            }
+        },
+        writeRecoverySidecar: (tn, recoveryId, tid, sidecar, c) => writeAtomic(absPath(c, TeamPaths.taskRecoverySidecar(tn, recoveryId, tid)), JSON.stringify(sidecar, null, 2)),
+        selectRecoveryCheckpoint: selectTaskRecoveryCheckpoint, readRecoveryCheckpoint: readTaskRecoveryCheckpoint,
+        verifyAdoptionToken: (token, hash) => createHash('sha256').update(token).digest('hex') === hash,
+    };
+}
+export async function teamPublishTaskRecoveryCheckpoint(input, cwd) {
+    return publishTaskRecoveryCheckpointImpl(input, cwd, { readTask: async (tn, tid, c) => {
+            const task = await teamReadTask(tn, tid, c);
+            return task ? normalizeTask(task) : null;
+        }, withTaskLock: withTaskClaimLock });
+}
+export async function teamRequeueRecoveredTask(teamName, cwd, input) {
+    return requeueRecoveredTaskImpl(input, recoveryTransitionDeps(teamName, cwd));
+}
+/** Runtime-owner-only continuation adoption; call before provider launch. */
+export async function teamAdoptRecoveryReservations(teamName, cwd, taskIds, workerName, proof, launchAttemptId) {
+    return adoptRecoveryReservationsImpl(taskIds, workerName, proof, recoveryTransitionDeps(teamName, cwd, launchAttemptId));
 }
 // ---------------------------------------------------------------------------
 // Messaging
@@ -432,6 +676,106 @@ async function readMailbox(teamName, workerName, cwd) {
         return { worker: workerName, messages: mailbox.messages };
     }
     return readLegacyMailboxJsonl(teamName, workerName, cwd);
+}
+function isStrictCanonicalMailboxRecord(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value)
+        && Object.getPrototypeOf(value) === Object.prototype;
+}
+function isStrictCanonicalMailboxText(value) {
+    return typeof value === 'string' && value.trim() !== '' && value === value.trim();
+}
+function isStrictCanonicalMailboxTimestamp(value) {
+    return isStrictCanonicalMailboxText(value) && Number.isFinite(Date.parse(value));
+}
+function materializeStrictCanonicalMailboxMessage(raw) {
+    const message = {
+        message_id: raw.message_id,
+        from_worker: raw.from_worker,
+        to_worker: raw.to_worker,
+        body: raw.body,
+        created_at: raw.created_at,
+    };
+    if ('notified_at' in raw)
+        message.notified_at = raw.notified_at;
+    if ('delivered_at' in raw)
+        message.delivered_at = raw.delivered_at;
+    return message;
+}
+function validateStrictCanonicalMailboxMessage(raw, messageIndex) {
+    if (!isStrictCanonicalMailboxRecord(raw))
+        return { kind: 'malformed_message', messageIndex, field: '$' };
+    if (!isStrictCanonicalMailboxText(raw.message_id))
+        return { kind: 'malformed_message', messageIndex, field: 'message_id' };
+    if (!isStrictCanonicalMailboxText(raw.from_worker))
+        return { kind: 'malformed_message', messageIndex, field: 'from_worker' };
+    if (!isStrictCanonicalMailboxText(raw.to_worker))
+        return { kind: 'malformed_message', messageIndex, field: 'to_worker' };
+    if (!isStrictCanonicalMailboxText(raw.body))
+        return { kind: 'malformed_message', messageIndex, field: 'body' };
+    if (!isStrictCanonicalMailboxTimestamp(raw.created_at))
+        return { kind: 'malformed_message', messageIndex, field: 'created_at' };
+    if ('notified_at' in raw && !isStrictCanonicalMailboxTimestamp(raw.notified_at)) {
+        return { kind: 'malformed_message', messageIndex, field: 'notified_at' };
+    }
+    if ('delivered_at' in raw && !isStrictCanonicalMailboxTimestamp(raw.delivered_at)) {
+        return { kind: 'malformed_message', messageIndex, field: 'delivered_at' };
+    }
+    return materializeStrictCanonicalMailboxMessage(raw);
+}
+/**
+ * Reads one exact message from the canonical JSON mailbox without using the
+ * compatibility JSONL fallback. It validates every canonical record first so
+ * a corrupt or ambiguous mailbox cannot authorize a pane notification.
+ */
+export async function teamReadCanonicalMailboxMessageStrict(teamName, workerName, messageId, cwd) {
+    const path = absPath(cwd, TeamPaths.mailbox(teamName, workerName));
+    let parsed;
+    try {
+        parsed = JSON.parse(await readFile(path, 'utf8'));
+    }
+    catch (error) {
+        const code = error.code;
+        return code === 'ENOENT'
+            ? { kind: 'store_missing' }
+            : { kind: 'malformed_store', cause: 'json' };
+    }
+    if (!isStrictCanonicalMailboxRecord(parsed))
+        return { kind: 'malformed_store', cause: 'non_object' };
+    if (parsed.worker !== workerName)
+        return { kind: 'wrong_owner' };
+    if (!Array.isArray(parsed.messages))
+        return { kind: 'malformed_store', cause: 'messages_non_array' };
+    const messages = [];
+    for (let messageIndex = 0; messageIndex < parsed.messages.length; messageIndex += 1) {
+        const validated = validateStrictCanonicalMailboxMessage(parsed.messages[messageIndex], messageIndex);
+        if (!('message_id' in validated))
+            return validated;
+        messages.push(validated);
+    }
+    const indexesByMessageId = new Map();
+    for (const [messageIndex, message] of messages.entries()) {
+        const indexes = indexesByMessageId.get(message.message_id) ?? [];
+        indexes.push(messageIndex);
+        indexesByMessageId.set(message.message_id, indexes);
+    }
+    const requestedIndexes = indexesByMessageId.get(messageId) ?? [];
+    if (requestedIndexes.length > 1) {
+        return { kind: 'duplicate_message_id', messageId, messageIndexes: requestedIndexes };
+    }
+    const duplicate = [...indexesByMessageId.entries()].find(([, indexes]) => indexes.length > 1);
+    if (duplicate)
+        return { kind: 'duplicate_message_id', messageId: duplicate[0], messageIndexes: duplicate[1] };
+    if (requestedIndexes.length === 0)
+        return { kind: 'message_missing' };
+    const messageIndex = requestedIndexes[0];
+    const message = messages[messageIndex];
+    if (message.to_worker !== workerName)
+        return { kind: 'recipient_mismatch', messageIndex };
+    if (message.notified_at)
+        return { kind: 'replay_suppressed', message: { ...message }, marker: 'notified_at' };
+    if (message.delivered_at)
+        return { kind: 'replay_suppressed', message: { ...message }, marker: 'delivered_at' };
+    return { kind: 'valid', message: { ...message } };
 }
 async function writeMailbox(teamName, workerName, mailbox, cwd) {
     const p = absPath(cwd, TeamPaths.mailbox(teamName, workerName));
@@ -622,13 +966,128 @@ export async function teamReadShutdownAck(teamName, workerName, cwd, minUpdatedA
 // ---------------------------------------------------------------------------
 // Monitor snapshot
 // ---------------------------------------------------------------------------
+function isMonitorSnapshotState(value) {
+    if (!isPlainRecord(value))
+        return false;
+    const recordValuesAre = (field, predicate) => {
+        const map = value[field];
+        return map === undefined
+            || (isPlainRecord(map) && Object.values(map).every(predicate));
+    };
+    const mapFields = [
+        'taskStatusById',
+        'workerAliveByName',
+        'workerStateByName',
+        'workerTurnCountByName',
+        'workerTaskIdByName',
+        'mailboxNotifiedByMessageId',
+        'completedEventTaskIds',
+    ];
+    if (!isPlainRecord(value.completedEventTaskIds))
+        return false;
+    if (!mapFields.every((field) => value[field] === undefined || isPlainRecord(value[field])))
+        return false;
+    if (value.workerLivenessByName !== undefined && !isPlainRecord(value.workerLivenessByName))
+        return false;
+    if (!recordValuesAre('taskStatusById', (entry) => typeof entry === 'string')
+        || !recordValuesAre('workerAliveByName', (entry) => typeof entry === 'boolean')
+        || !recordValuesAre('workerLivenessByName', (entry) => entry === 'alive' || entry === 'dead' || entry === 'unknown')
+        || !recordValuesAre('workerStateByName', (entry) => typeof entry === 'string')
+        || !recordValuesAre('workerTurnCountByName', (entry) => typeof entry === 'number' && Number.isFinite(entry))
+        || !recordValuesAre('workerTaskIdByName', (entry) => typeof entry === 'string')
+        || !recordValuesAre('mailboxNotifiedByMessageId', (entry) => typeof entry === 'string')
+        || !recordValuesAre('completedEventTaskIds', (entry) => typeof entry === 'boolean')) {
+        return false;
+    }
+    if (value.monitorTimings !== undefined) {
+        if (!isPlainRecord(value.monitorTimings)
+            || typeof value.monitorTimings.list_tasks_ms !== 'number'
+            || typeof value.monitorTimings.worker_scan_ms !== 'number'
+            || typeof value.monitorTimings.mailbox_delivery_ms !== 'number'
+            || typeof value.monitorTimings.total_ms !== 'number'
+            || typeof value.monitorTimings.updated_at !== 'string') {
+            return false;
+        }
+    }
+    return true;
+}
 export async function teamReadMonitorSnapshot(teamName, cwd) {
     const p = absPath(cwd, TeamPaths.monitorSnapshot(teamName));
-    return readJsonSafe(p);
+    const state = await readPersistedJson(p);
+    if (state.kind === 'missing')
+        return null;
+    // The monitor snapshot is a rebuildable cache. Task files remain
+    // authoritative, so malformed or unreadable cache state is treated as
+    // absent and can be replaced by the next successful writer.
+    if (state.kind === 'invalid' || !isMonitorSnapshotState(state.value))
+        return null;
+    return {
+        taskStatusById: state.value.taskStatusById ?? {},
+        workerAliveByName: state.value.workerAliveByName ?? {},
+        workerLivenessByName: state.value.workerLivenessByName ?? {},
+        workerStateByName: state.value.workerStateByName ?? {},
+        workerTurnCountByName: state.value.workerTurnCountByName ?? {},
+        workerTaskIdByName: state.value.workerTaskIdByName ?? {},
+        mailboxNotifiedByMessageId: state.value.mailboxNotifiedByMessageId ?? {},
+        completedEventTaskIds: state.value.completedEventTaskIds,
+        ...(state.value.monitorTimings ? { monitorTimings: state.value.monitorTimings } : {}),
+    };
 }
 export async function teamWriteMonitorSnapshot(teamName, snapshot, cwd) {
     const p = absPath(cwd, TeamPaths.monitorSnapshot(teamName));
-    await writeAtomic(p, JSON.stringify(snapshot, null, 2));
+    if (!isMonitorSnapshotState(snapshot))
+        throw persistedStateError(p, 'schema');
+    const lockPath = join(teamDir(teamName, cwd), '.monitor-snapshot.lock');
+    await withProcessIdentityFileLock(lockPath, async () => {
+        const currentState = await readPersistedJson(p);
+        // A stale/corrupt cache must not make task state unusable. Replace it
+        // with the caller's current projection while preserving any valid
+        // completion markers that survived from the previous cache.
+        const current = currentState.kind === 'value' && isMonitorSnapshotState(currentState.value)
+            ? currentState.value
+            : null;
+        const completedEventTaskIds = { ...snapshot.completedEventTaskIds };
+        for (const [taskId, completed] of Object.entries(current?.completedEventTaskIds ?? {})) {
+            if (completed)
+                completedEventTaskIds[taskId] = true;
+        }
+        await writeAtomic(p, JSON.stringify({ ...snapshot, completedEventTaskIds }, null, 2));
+    }, 5_000);
+}
+/**
+ * Persist only the completion marker for a task. The latest monitor snapshot
+ * is read while holding the snapshot lock, so an older completion operation
+ * cannot overwrite fresh monitor-owned fields.
+ */
+export async function teamMarkTaskCompleted(teamName, taskId, cwd) {
+    const normalizedTaskId = normalizeTaskId(taskId);
+    const p = absPath(cwd, TeamPaths.monitorSnapshot(teamName));
+    const lockPath = join(teamDir(teamName, cwd), '.monitor-snapshot.lock');
+    await withProcessIdentityFileLock(lockPath, async () => {
+        const state = await readPersistedJson(p);
+        const current = state.kind === 'value' && isMonitorSnapshotState(state.value)
+            ? state.value
+            : null;
+        const next = current
+            ? {
+                ...current,
+                completedEventTaskIds: {
+                    ...current.completedEventTaskIds,
+                    [normalizedTaskId]: true,
+                },
+            }
+            : {
+                taskStatusById: {},
+                workerAliveByName: {},
+                workerLivenessByName: {},
+                workerStateByName: {},
+                workerTurnCountByName: {},
+                workerTaskIdByName: {},
+                mailboxNotifiedByMessageId: {},
+                completedEventTaskIds: { [normalizedTaskId]: true },
+            };
+        await writeAtomic(p, JSON.stringify(next, null, 2));
+    }, 5_000);
 }
 // Atomic write re-export for other modules
 export { writeAtomic };

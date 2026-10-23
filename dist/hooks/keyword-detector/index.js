@@ -13,8 +13,7 @@ import { classifyTaskSize, isHeavyMode, } from '../task-size-detector/index.js';
 const KEYWORD_PATTERNS = {
     cancel: /\b(cancelomc|stopomc)\b/i,
     ralph: /\b(ralph)\b(?!-)|(랄프)(?!로렌)|(ラルフ)(?!・?ローレン)/i,
-    autopilot: /\b(autopilot|auto[\s-]?pilot|fullsend|full\s+auto)\b|(오토파일럿)|(オートパイロット)/i,
-    ultrawork: /\b(ultrawork|ulw)\b|(울트라워크)|(ウルトラワーク)/i,
+    autopilot: /\b(autopilot|auto[\s-]?pilot|fullsend|full\s+auto)\b|\b(?:build|create|make)\s+me\s+(?:an?\s+)?(?:app|feature|project|tool|plugin|website|api|server|cli|script|system|service|dashboard|bot|extension)\b|\bi\s+want\s+an?\s+(?:app|feature|project|tool|plugin|website|api|server|cli|script|system|service|dashboard|bot|extension)\b|(오토파일럿)|(オートパイロット)/i,
     // Team keyword detection disabled — team mode is now explicit-only via /team skill.
     // This prevents infinite spawning when Claude workers receive prompts containing "team".
     team: /(?!x)x/, // never-match placeholder (type system requires the key)
@@ -26,7 +25,6 @@ const KEYWORD_PATTERNS = {
     deepsearch: /\b(deepsearch)\b|\bsearch\s+the\s+codebase\b|\bfind\s+in\s+(the\s+)?codebase\b|(딥\s?서치)|(ディープ\s?サーチ)/i,
     analyze: /\b(deep[\s-]?analyze|deepanalyze)\b|(딥\s?분석)|(ディープ\s?アナライズ)/i,
     'deep-interview': /\b(deep[\s-]interview|ouroboros)\b|(딥인터뷰)|(ディープインタビュー)/i,
-    ccg: /\b(ccg|claude-codex-gemini)\b|(씨씨지)|(シーシージー)/i,
     codex: /\b(ask|use|delegate\s+to)\s+(codex|gpt)\b/i,
     gemini: /\b(ask|use|delegate\s+to)\s+gemini\b/i,
     cursor: /\b(ask|use|delegate\s+to)\s+cursor\b/i,
@@ -53,24 +51,29 @@ const KEYWORD_SKIP_PREDICATES = {
     'deep-interview': (text) => OUROBOROS_BRAND_AT_START.test(text),
 };
 /**
- * Priority order for keyword detection
+ * Priority order for keyword detection. Exported so the shadow judgment
+ * points (jev-shadow.ts) can derive their criteria from the same constants
+ * the detector emits.
  */
-const KEYWORD_PRIORITY = [
-    'cancel', 'ralph', 'autopilot', 'team', 'ultrawork',
-    'ccg', 'ralplan', 'tdd', 'code-review', 'security-review',
+export const KEYWORD_PRIORITY = [
+    'cancel', 'ralph', 'autopilot', 'team',
+    'ralplan', 'tdd', 'code-review', 'security-review',
     'ultrathink', 'deepsearch', 'analyze', 'deep-interview', 'codex', 'gemini', 'cursor', 'antigravity'
 ];
+const RETIRED_WORKFLOW_SLASH_PATTERN = /^\s*\/(?:oh-my-claudecode:|omc:)?(?:ultrawork|ulw|uw|울트라워크|ウルトラワーク|ccg|claude-codex-gemini|씨씨지|シーシージー)(?=\s|$|[?!.,;:])/i;
+export function isRetiredWorkflowSlashInvocation(text) {
+    return RETIRED_WORKFLOW_SLASH_PATTERN.test(text);
+}
 /**
  * Canonical workflow skills detected via explicit slash invocation.
- * Mirrors `CANONICAL_WORKFLOW_SKILLS` in `skill-state/index.ts`. Listed here
- * (rather than imported) to keep the keyword-detector free of cross-module
- * dependencies on skill-state.
+ * This is intentionally narrower than the state compatibility registry:
+ * removed-not-aliased workflows may retain legacy state readers, but must not
+ * be parsed as active slash routes.
  */
 const CANONICAL_WORKFLOW_SLASH_SKILLS = [
     'autopilot',
     'ralph',
     'team',
-    'ultrawork',
     'ultraqa',
     'deep-interview',
     'ralplan',
@@ -79,15 +82,14 @@ const CANONICAL_WORKFLOW_SLASH_SKILLS = [
 /**
  * Map workflow slash skills to keyword types so explicit slash invocations
  * surface alongside ordinary keyword detection. Skills with no dedicated
- * KeywordType (`ultraqa`, `self-improve`) are intentionally absent — the
- * bridge handles their seeding via the parser result instead of through the
- * keyword-priority loop.
+ * KeywordType (`self-improve`) is intentionally absent — the bridge handles
+ * their seeding via the parser result instead of through the keyword-priority
+ * loop.
  */
 const SLASH_SKILL_TO_KEYWORD_TYPE = {
     autopilot: 'autopilot',
     ralph: 'ralph',
     team: 'team',
-    ultrawork: 'ultrawork',
     'deep-interview': 'deep-interview',
     ralplan: 'ralplan',
 };
@@ -279,8 +281,8 @@ export function sanitizeForKeywordDetection(text) {
     let result = stripPastedCommandPayloads(text);
     // Remove HTML/markdown comments first so keywords inside comments cannot trigger modes
     result = result.replace(/<!--[\s\S]*?-->/g, '');
-    // Remove XML tag blocks (opening + content + closing; tag names must match)
-    result = result.replace(/<(\w[\w-]*)[\s>][\s\S]*?<\/\1>/g, '');
+    // Keep optional closing-tag attributes on one line and stop at adjacent tags.
+    result = result.replace(/<(\w[\w-]*)[\s>][\s\S]*?<\/\1(?:[ \t][^<>\r\n]*)?>/g, '');
     // Remove self-closing XML tags
     result = result.replace(/<\w[\w-]*(?:\s[^>]*)?\s*\/>/g, '');
     // Remove URLs
@@ -301,6 +303,7 @@ const INFORMATIONAL_INTENT_PATTERNS = [
     /(?:뭐야|뭔데|무엇(?:이야|인가요)?|어떻게|설명(?!서\s*(?:작성|만들|생성|추가|업데이트|수정|편집|쓰))|사용법|알려\s?줘|알려줄래|소개해?\s?줘|소개\s*부탁|설명해\s?줘|뭐가\s*달라|어떤\s*기능|기능\s*(?:알려|설명|뭐)|방법\s*(?:알려|설명|뭐))/u,
     /(?:とは|って何|使い方|説明|(?:について|に関して|違い)[^\n]{0,24}(?:教えて|説明|知りたい)|(?:どう|何が|どこが)違う)/u,
     /(?:什么是|怎(?:么|樣)用|如何使用|解释|說明|说明)/u,
+    /(?:ทำไม|อะไร|ยังไง|อย่างไร|คืออะไร|หมายถึง|แปลว่า|อธิบาย|มั้ย|ไหม|เหรอ|หรอ|หรือไม่|หรือเปล่า|ใช่ไหม|ถูกมั้ย|เกี่ยวกับ|เหมือน)/u,
 ];
 const INFORMATIONAL_CONTEXT_WINDOW = 80;
 const QUOTED_SPAN_PATTERN = /"[^"\n]{1,400}"|'[^'\n]{1,400}'|“[^”\n]{1,400}”|‘[^’\n]{1,400}’/g;
@@ -308,6 +311,7 @@ const REFERENCE_META_PATTERNS = [
     /\b(?:vs\.?|versus|compared\s+to|comparison|compare|article|blog\s+post|documentation|docs?|reference)\b/i,
     /(?:비교|차이|설명|정리|문서|자료|가이드|이\s*(?:글|비교|문서)는|블로그)/u,
     /\b(?:this\s+(?:article|comparison|guide|documentation|doc)|quoted|quote(?:d)?)\b/i,
+    /(?:เปรียบเทียบ|ต่างกัน|ความต่าง|เอกสาร|บทความ|ไกด์|คู่มือ|เกี่ยวกับ|เหมือน)/u,
 ];
 const REFERENCE_EXPLANATION_PATTERNS = [
     /(?:^|\n)\s*(?:결론|특징|예시|요약|장점|단점|설명)\s*[:：]/u,
@@ -318,8 +322,9 @@ const REFERENCE_EXPLANATION_PATTERNS = [
 const QUESTION_FOLLOWUP_PATTERNS = [
     /\b(?:how\s+many|how\s+much|why|what\s+happened|what\s+went\s+wrong|token\s+budget|cost|pricing)\b/i,
     /(?:왜|얼마|몇\s*번|몇번|토큰|가격|비용|질문)/u,
+    /(?:ทำไม|อะไร|ยังไง|อย่างไร|เท่าไหร่|กี่|มั้ย|ไหม|เหรอ|หรอ|หรือไม่|หรือเปล่า|ใช่ไหม|ถูกมั้ย)/u,
 ];
-const MODE_REFERENCE_PATTERN = /\b(?:ralph|autopilot|auto[\s-]?pilot|ultrawork|ulw|ralplan|ultrathink|deepsearch|deep[\s-]?analyze|deepanalyze|deep[\s-]interview|ouroboros|ccg|claude-codex-gemini|deerflow)\b/gi;
+const MODE_REFERENCE_PATTERN = /\b(?:ralph|autopilot|auto[\s-]?pilot|ralplan|ultrathink|deepsearch|deep[\s-]?analyze|deepanalyze|deep[\s-]interview|ouroboros|deerflow)\b/gi;
 function escapeRegExp(value) {
     return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -340,6 +345,27 @@ function isWithinQuotedSpan(text, position) {
         }
     }
     return false;
+}
+/**
+ * Bounds of the specific quoted span containing `position`, or null if none.
+ * Used to scope the execution-directive check for the quote exemption to
+ * this keyword's own quote — not the generic ±80-char context window, which
+ * can otherwise pick up an unrelated genuine command elsewhere in the same
+ * message (e.g. a second keyword issued as a real directive) and wrongly
+ * neutralize the exemption for a keyword that is purely quoted as an
+ * example.
+ */
+function findQuotedSpanBounds(text, position) {
+    for (const match of text.matchAll(QUOTED_SPAN_PATTERN)) {
+        if (match.index === undefined)
+            continue;
+        const start = match.index;
+        const end = start + match[0].length;
+        if (position >= start && position < end) {
+            return { start, end };
+        }
+    }
+    return null;
 }
 function stripQuotedSpans(text) {
     return text.replace(QUOTED_SPAN_PATTERN, ' ');
@@ -382,6 +408,20 @@ function hasDirectInvocationPrefix(text, position) {
     const prefix = text.slice(0, position);
     return /^\s*(?:[$/!]\s*|force:\s*|oh-my-(?:claudecode|codex):\s*)?$/i.test(prefix);
 }
+function hasConversationalInvocationNearKeyword(text, position, _keywordLength, _keywordText) {
+    if (isWithinQuotedSpan(text, position)) {
+        return false;
+    }
+    const start = Math.max(0, position - INFORMATIONAL_CONTEXT_WINDOW);
+    const prefix = stripQuotedSpans(text.slice(start, position));
+    const conversationalInvocationPatterns = [
+        /\bplease\s+$/i,
+        /\blet['’]?s\s+$/i,
+        /\bi\s+(?:want|need|would\s+like)\s+(?:a|an)\s+$/i,
+        /\b(?:can|could|would|will)\s+you\s+$/i,
+    ];
+    return conversationalInvocationPatterns.some((pattern) => pattern.test(prefix));
+}
 function hasExplicitInvocationContext(text, position, keywordLength, keywordText) {
     if (hasDirectInvocationPrefix(text, position)) {
         return true;
@@ -392,17 +432,7 @@ function hasExplicitInvocationContext(text, position, keywordLength, keywordText
     if (hasActivationIntentNearKeyword(context, keywordText)) {
         return true;
     }
-    const escaped = escapeRegExp(keywordText.trim());
-    if (!escaped) {
-        return false;
-    }
-    const conversationalInvocationPatterns = [
-        new RegExp(`\\bplease\\s+${escaped}\\b`, 'i'),
-        new RegExp(`\\blet['’]?s\\s+${escaped}\\b`, 'i'),
-        new RegExp(`\\bi\\s+(?:want|need|would\\s+like)\\s+(?:a|an)\\s+${escaped}\\b`, 'i'),
-        new RegExp(`\\b(?:can|could|would|will)\\s+you\\s+${escaped}\\b`, 'i'),
-    ];
-    return conversationalInvocationPatterns.some((pattern) => pattern.test(context));
+    return hasConversationalInvocationNearKeyword(text, position, keywordLength, keywordText);
 }
 function hasDiagnosticIntentNearKeyword(context, keyword) {
     const escaped = escapeRegExp(keyword.trim());
@@ -418,15 +448,12 @@ function hasDiagnosticIntentNearKeyword(context, keyword) {
     ];
     return patterns.some((pattern) => pattern.test(context));
 }
-function isRalphUltraworkMetaOrBanterContext(context, keywordText) {
+function isRalphMetaOrBanterContext(context, keywordText) {
     const normalizedKeyword = keywordText.toLowerCase().replace(/\s+/g, '');
-    if (!['ralph', '랄프', 'ラルフ', 'ultrawork', 'ulw', 'uw', '울트라워크', 'ウルトラワーク'].includes(normalizedKeyword)) {
+    if (!['ralph', '랄프', 'ラルフ'].includes(normalizedKeyword)) {
         return false;
     }
-    const currentKeywordAliases = normalizedKeyword === 'ralph' || normalizedKeyword === '랄프' || normalizedKeyword === 'ラルフ'
-        ? ['랄프', 'ラルフ']
-        : ['울트라워크', 'ウルトラワーク'];
-    const currentKeywordPattern = currentKeywordAliases.join('|');
+    const currentKeywordPattern = ['ralph', '랄프', 'ラルフ'].join('|');
     const imperativeVerbPattern = '켜|켜줘|실행|시작|돌려|돌려줘|써|써줘|사용해|진행해';
     const koreanImperativePatterns = [
         new RegExp(`(?:${currentKeywordPattern})[^?？\n]{0,16}(?:${imperativeVerbPattern})`, 'u'),
@@ -438,11 +465,22 @@ function isRalphUltraworkMetaOrBanterContext(context, keywordText) {
     const metaOrBanterPatterns = [
         /[?？].{0,12}(?:ㅋ{1,}|ㅎ{1,}|lol|lmao)/iu,
         /(?:ㅋ{1,}|ㅎ{1,}|lol|lmao).{0,40}[?？]/iu,
-        /(?:ralph|랄프|ultrawork|ulw|uw|울트라워크).{0,40}(?:라도|줘야\s*해|쥐어\s*줘야\s*해|해야\s*해).{0,20}[?？]/iu,
+        /(?:ralph|랄프|ラルフ).{0,40}(?:라도|줘야\s*해|쥐어\s*줘야\s*해|해야\s*해).{0,20}[?？]/iu,
         /(?:관계|관련|연관|차이|비교).{0,40}(?:뭐|무엇|어떻게|설명|알려|궁금|인가|야|냐|니|까|[?？])/u,
         /(?:뭐|무엇|어떻게|설명|알려|궁금).{0,40}(?:관계|관련|연관|차이|비교)/u,
     ];
     return metaOrBanterPatterns.some((pattern) => pattern.test(context));
+}
+function isAutopilotCreationAlias(keywordText) {
+    const normalized = keywordText.toLowerCase().trim();
+    return /^(?:build|create|make)\s+me\b/.test(normalized) || /^i\s+want\s+an?(?:\s+(?:app|feature|project|tool|plugin|website|api|server|cli|script|system|service|dashboard|bot|extension))?\s*$/.test(normalized);
+}
+function hasActionableCommandAfterSeparator(text, position, keywordLength) {
+    const suffix = text.slice(position + keywordLength).match(/^\s*[:：]\s*([^\n]{0,80})/u)?.[1] ?? '';
+    if (/\?|？|\b(?:what(?:'s|\s+is)|how\s+(?:to|do\s+i)\s+use|explain|describe|tell\s+me\s+about)\b/iu.test(suffix)) {
+        return false;
+    }
+    return /\b(?:fix|debug|investigate|resolve|handle|patch|address|implement|build|create|make|run|start|enable|activate|invoke|trigger|launch)\b|(?:ทำ|ทํา|สร้าง|แก้|เปิด|รัน|เรียก|เริ่ม)/iu.test(suffix);
 }
 function isInformationalKeywordContext(text, position, keywordLength, keywordText) {
     const start = Math.max(0, position - INFORMATIONAL_CONTEXT_WINDOW);
@@ -454,9 +492,57 @@ function isInformationalKeywordContext(text, position, keywordLength, keywordTex
     const line = text.slice(lineBounds.start, lineBounds.end);
     const questionOutsideQuotes = stripQuotedSpans(text);
     const keywordInsideQuotes = isWithinQuotedSpan(text, position);
+    const hasExecutionDirective = /\b(?:fix|debug|investigate|resolve|handle|patch|address|implement|build)\b/i.test(context);
+    const hasCommandSeparatorInvocation = hasDirectInvocationPrefix(text, position) && /^\s*[:：]/.test(text.slice(position + keywordLength));
+    const hasActionableCommandSeparatorInvocation = hasCommandSeparatorInvocation && hasActionableCommandAfterSeparator(text, position, keywordLength);
+    // A keyword occurrence inside a quoted span is usually reported/example
+    // text, not a command directed at the assistant — e.g. an example sentence
+    // like `"use autopilot"` inside a paragraph discussing that exact phrasing.
+    // But a quoted keyword paired with a nearby execution directive OR
+    // activation verb (e.g. `"ralph" fix the auth bug`, or `run "ralph" on
+    // this issue`) is still a genuine request stylistically wrapped in quotes,
+    // so the exemption only applies when neither is present — checked before
+    // any other activation-intent logic so quoting wins for reported speech
+    // but not for real commands.
+    //
+    // This check is scoped to text immediately OUTSIDE this keyword's own
+    // quoted span (±28 chars before/after the span's bounds), not the generic
+    // ±80-char context window used elsewhere in this function, and NOT the
+    // quote's own interior. Three failure modes this avoids:
+    // - Scoping to the wide window: an unrelated genuine command elsewhere in
+    //   the same message (e.g. a second keyword issued as a real directive)
+    //   could sit inside it and wrongly neutralize the exemption for a keyword
+    //   that is purely quoted as an example.
+    // - Scoping to (or including) the quote's own interior: a directive or
+    //   activation word used INSIDE the quoted text itself — extremely common
+    //   in narrated examples and bug reports, e.g. `"please fix autopilot"
+    //   they said` or `"...told it to use autopilot..."` — would make the
+    //   quote self-report as command-bearing and defeat the exemption for
+    //   exactly the reported-speech case it exists to catch.
+    // - Checking only execution-directive verbs (fix/debug/...) and not
+    //   activation verbs (use/run/start/...): genuine commands stylistically
+    //   quoting just the mode name, e.g. `run "ralph" on this issue` or
+    //   `use "autopilot" on this task`, would be wrongly suppressed even
+    //   though they activated before this exemption existed.
+    if (keywordInsideQuotes) {
+        const span = findQuotedSpanBounds(text, position);
+        const hasGenuineCommandNearQuote = span
+            ? /\b(?:fix|debug|investigate|resolve|handle|patch|address|implement|build|use|run|start|enable|activate|invoke|trigger|launch)\b/i.test(text.slice(Math.max(0, span.start - 28), span.start) +
+                ' ' +
+                text.slice(span.end, Math.min(text.length, span.end + 28)))
+            : hasExecutionDirective;
+        if (!hasGenuineCommandNearQuote) {
+            return true;
+        }
+    }
     if (keywordText) {
         const hasActivationIntent = hasActivationIntentNearKeyword(context, keywordText);
-        const hasExecutionDirective = /\b(?:fix|debug|investigate|resolve|handle|patch|address|implement|build)\b/i.test(context);
+        if (hasActionableCommandSeparatorInvocation) {
+            return false;
+        }
+        if (isAutopilotCreationAlias(keywordText)) {
+            return false;
+        }
         // Explicit command + execution intent should remain actionable even if the
         // surrounding message also contains a help question.
         if (hasActivationIntent && hasExecutionDirective) {
@@ -470,7 +556,10 @@ function isInformationalKeywordContext(text, position, keywordLength, keywordTex
         if (hasActivationIntent) {
             return false;
         }
-        if (isRalphUltraworkMetaOrBanterContext(context, keywordText)) {
+        if (hasConversationalInvocationNearKeyword(text, position, keywordLength, keywordText)) {
+            return false;
+        }
+        if (isRalphMetaOrBanterContext(context, keywordText)) {
             return true;
         }
         if (hasDiagnosticIntentNearKeyword(context, keywordText)) {
@@ -541,6 +630,9 @@ export function extractPromptText(parts) {
  */
 export function detectKeywordsWithType(text, _agentName) {
     const detected = [];
+    if (isRetiredWorkflowSlashInvocation(text)) {
+        return detected;
+    }
     // Check for an explicit canonical workflow slash invocation BEFORE sanitization.
     // The general sanitizer strips bare `/word` tokens as file paths, so bare
     // commands like `/ralph fix auth` would otherwise never match. This must be
@@ -614,19 +706,19 @@ export function getAllKeywords(text) {
 }
 /**
  * Get all keywords with task-size-based filtering applied.
- * For small tasks, heavy orchestration modes (ralph/autopilot/team/ultrawork etc.)
+ * For small tasks, heavy orchestration modes (ralph/autopilot/team etc.)
  * are suppressed to avoid over-orchestration.
  *
  * This is the recommended function to use in the bridge hook for keyword detection.
  */
 export function getAllKeywordsWithSizeCheck(text, options = {}) {
-    const { enabled = true, smallWordLimit = 50, largeWordLimit = 200, suppressHeavyModesForSmallTasks = true, } = options;
+    const { enabled = true, smallWordLimit = 50, largeWordLimit = 200, suppressHeavyModesForSmallTasks = true, jevTaskSizeResult, } = options;
     const keywords = getAllKeywords(text);
     if (!enabled || !suppressHeavyModesForSmallTasks || keywords.length === 0) {
-        return { keywords, taskSizeResult: null, suppressedKeywords: [] };
+        return { keywords, taskSizeResult: jevTaskSizeResult ?? null, suppressedKeywords: [] };
     }
     const thresholds = { smallWordLimit, largeWordLimit };
-    const taskSizeResult = classifyTaskSize(text, thresholds);
+    const taskSizeResult = jevTaskSizeResult ?? classifyTaskSize(text, thresholds);
     // Only suppress heavy modes for small tasks
     if (taskSizeResult.size !== 'small') {
         return { keywords, taskSizeResult, suppressedKeywords: [] };
@@ -668,7 +760,6 @@ export const EXECUTION_GATE_KEYWORDS = new Set([
     'ralph',
     'autopilot',
     'team',
-    'ultrawork',
 ]);
 /**
  * Escape hatch prefixes that bypass the ralplan gate.
@@ -731,7 +822,7 @@ export function isUnderspecifiedForExecution(text) {
         return false;
     // Strip mode keywords for effective word counting
     const stripped = trimmed
-        .replace(/\b(?:ralph|autopilot|team|ultrawork|ulw)\b/gi, '')
+        .replace(/\b(?:ralph|autopilot|team)\b/gi, '')
         .trim();
     const effectiveWords = stripped.split(/\s+/).filter(w => w.length > 0).length;
     // Short prompts without well-specified signals are underspecified

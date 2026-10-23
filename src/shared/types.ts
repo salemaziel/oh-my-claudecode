@@ -2,7 +2,7 @@
  * Shared types for Oh-My-ClaudeCode
  */
 
-export type ModelType = "sonnet" | "opus" | "haiku" | "inherit";
+export type ModelType = "sonnet" | "opus" | "haiku" | "fable" | "inherit";
 
 export interface AgentConfig {
   name: string;
@@ -25,6 +25,15 @@ export type AutopilotTeamAgentType =
   | "grok"
   | "cursor"
   | "antigravity";
+
+/** Built-in stages admitted by version 1 named autopilot workflows. */
+export type AutopilotWorkflowStage = "ralplan" | "execution" | "ralph" | "qa";
+
+/** Closed, versioned named autopilot workflow profile. */
+export interface AutopilotWorkflowProfileV1 {
+  version: 1;
+  stages: AutopilotWorkflowStage[];
+}
 
 export interface AutopilotConfigBlock {
   /** Maximum total iterations across all phases. */
@@ -49,6 +58,8 @@ export interface AutopilotConfigBlock {
   verification?: { engine: "ralph"; maxIterations: number } | false;
   /** Whether to run QA build/lint/test cycling. */
   qa?: boolean;
+  /** Named, fixed-stage workflow profiles. Project profiles replace user profiles of the same name. */
+  workflows?: Record<string, AutopilotWorkflowProfileV1>;
   /** Team execution options used when execution is 'team'. */
   team?: {
     /** Preferred CLI worker types for executor-style implementation tasks. */
@@ -102,6 +113,12 @@ export interface PluginConfig {
     onError?: "warn" | "silent" | "fail";
   };
 
+  // UserPromptSubmit keyword-detector opt-outs
+  keywordDetector?: {
+    // Skill keywords to stop auto-routing (e.g. "wiki"); "cancel" is never disabled.
+    disabled?: string[];
+  };
+
   // Permission settings
   permissions?: {
     allowBash?: boolean;
@@ -112,7 +129,6 @@ export interface PluginConfig {
 
   // Magic keyword customization
   magicKeywords?: {
-    ultrawork?: string[];
     search?: string[];
     analyze?: string[];
     ultrathink?: string[];
@@ -161,9 +177,9 @@ export interface PluginConfig {
      *   (useful on non-Anthropic backends without the nuclear forceInherit)
      * - `{ haiku: 'sonnet' }` — promote all haiku agents to sonnet tier
      *
-     * Env: OMC_MODEL_ALIAS_HAIKU, OMC_MODEL_ALIAS_SONNET, OMC_MODEL_ALIAS_OPUS
+     * Env: OMC_MODEL_ALIAS_HAIKU, OMC_MODEL_ALIAS_SONNET, OMC_MODEL_ALIAS_OPUS, OMC_MODEL_ALIAS_FABLE
      */
-    modelAliases?: Partial<Record<"haiku" | "sonnet" | "opus", ModelType>>;
+    modelAliases?: Partial<Record<"haiku" | "sonnet" | "opus" | "fable", ModelType>>;
     /** Keywords that force escalation to higher tier */
     escalationKeywords?: string[];
     /** Keywords that suggest lower tier */
@@ -338,6 +354,7 @@ export interface ExternalModelsDefaults {
   geminiModel?: string;
   grokModel?: string;
   antigravityModel?: string;
+  cursorModel?: string;
 }
 
 /**
@@ -458,9 +475,6 @@ export const CANONICAL_TEAM_ROLES = [
 
 export type CanonicalTeamRole = typeof CANONICAL_TEAM_ROLES[number];
 
-/** Cursor team workers are currently supported only for executor-style tasks. */
-export const CURSOR_EXECUTOR_TEAM_ROLES = ["executor"] as const;
-
 /** Provider for /team role routing. */
 export type TeamRoleProvider = 'claude' | 'codex' | 'gemini' | 'grok' | 'cursor' | 'antigravity';
 
@@ -499,6 +513,8 @@ export interface TeamRoleAssignmentSpec {
   /** Tier name ('HIGH' | 'MEDIUM' | 'LOW') or explicit model ID. */
   model?: TeamRoleTier | string;
   agent?: KnownAgentName;
+  /** Reasoning effort level per provider. Codex: low|medium|high|xhigh|max|ultra; Claude: low|medium|high|xhigh|max; Antigravity: low|medium|high|max. Not allowed on orchestrator. */
+  reasoningEffort?: string;
 }
 
 /** Orchestrator is pinned to claude; only `model` is user-configurable. */
@@ -532,4 +548,5 @@ export interface RoleAssignment {
   /** Resolved model ID (tier names expanded to explicit model strings). */
   model: string;
   agent: KnownAgentName;
+  reasoningEffort?: string;
 }

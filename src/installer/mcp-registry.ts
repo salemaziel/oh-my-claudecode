@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { dirname, join } from 'path';
+import { isDeepStrictEqual } from 'util';
 
 import { getClaudeConfigDir } from '../utils/config-dir.js';
 import {
@@ -298,6 +299,45 @@ function entriesEqual(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function codexEntriesEqual(
+  codexEntry: UnifiedMcpRegistryEntry,
+  registryEntry: UnifiedMcpRegistryEntry,
+  typeFieldPresent: boolean,
+): boolean {
+  if (typeFieldPresent && codexEntry.type === undefined) {
+    return false;
+  }
+
+  const comparableCodexEntry = { ...codexEntry };
+  const comparableRegistryEntry = { ...registryEntry };
+  if (typeFieldPresent) {
+    comparableCodexEntry.type = normalizeCodexMcpType(codexEntry.type);
+    comparableRegistryEntry.type = normalizeCodexMcpType(
+      registryEntry.type ?? inferCodexMcpTransportType(registryEntry),
+    );
+  } else {
+    const inferredType = inferCodexMcpTransportType(codexEntry);
+    if (
+      registryEntry.type !== undefined
+      && normalizeCodexMcpType(registryEntry.type) !== inferredType
+    ) {
+      return false;
+    }
+    delete comparableRegistryEntry.type;
+  }
+  return isDeepStrictEqual(comparableCodexEntry, comparableRegistryEntry);
+}
+
+function normalizeCodexMcpType(type: string | undefined): string | undefined {
+  return type === 'streamable-http' ? 'http' : type;
+}
+
+function inferCodexMcpTransportType(entry: UnifiedMcpRegistryEntry): string | undefined {
+  if (entry.command && !entry.url) return 'stdio';
+  if (entry.url && !entry.command) return 'http';
+  return undefined;
+}
+
 export function applyRegistryToClaudeSettings(
   settings: Record<string, unknown>,
 ): { settings: Record<string, unknown>; changed: boolean } {
@@ -342,39 +382,313 @@ function syncClaudeMcpConfig(
 }
 
 function escapeTomlString(value: string): string {
-  return value
-    .replace(/\\/g, '\\\\')
-    .replace(/"/g, '\\"');
+  // TOML basic strings (double-quoted) forbid all control chars U+0000-U+001F except tab (U+0009),
+  // and also forbid U+007F (DEL).
+  // Escape order: backslash first to avoid re-escaping.
+  let result = value.replace(/\\/g, '\\\\');
+  
+  // Escape other special characters and control codes
+  result = result.replace(/["\n\r\t\b\f\0-\x07\x0b\x0e-\x1f\x7f]/g, (char) => {
+    switch (char) {
+      case '"':
+        return '\\"';
+      case '\n':
+        return '\\n';
+      case '\r':
+        return '\\r';
+      case '\t':
+        return '\\t';
+      case '\b':
+        return '\\b';
+      case '\f':
+        return '\\f';
+      default: {
+        // All other control chars: escape as \uXXXX
+        const code = char.charCodeAt(0);
+        return `\\u${code.toString(16).padStart(4, '0')}`;
+      }
+    }
+  });
+  
+  return result;
 }
 
 function unescapeTomlString(value: string): string {
-  return value
-    .replace(/\\"/g, '"')
-    .replace(/\\\\/g, '\\');
+  // Handle escape sequences in a single pass to avoid round-trip bugs:
+  // - \uXXXX and \UXXXXXXXX (Unicode escapes)
+  // - \" (quote), \\ (backslash), \n (newline), \r (carriage return), \t (tab), \b (backspace), \f (form feed)
+  // Single pass prevents issues like C:\\users\\u0041dir being incorrectly decoded.
+  return value.replace(/\\(U[0-9a-fA-F]{8}|u[0-9a-fA-F]{4}|["\\nrtbf])/g, (_, escaped: string) => {
+    if (escaped[0] === 'U') {
+      const codePoint = parseInt(escaped.slice(1), 16);
+      return codePoint <= 0x10ffff && !(codePoint >= 0xd800 && codePoint <= 0xdfff)
+        ? String.fromCodePoint(codePoint)
+        : `\\${escaped}`;
+    }
+    if (escaped[0] === 'u') {
+      // \uXXXX: decode unicode escape
+      return String.fromCharCode(parseInt(escaped.slice(1), 16));
+    }
+    // Single-character escapes
+    switch (escaped) {
+      case 'n':
+        return '\n';
+      case 'r':
+        return '\r';
+      case 't':
+        return '\t';
+      case 'b':
+        return '\b';
+      case 'f':
+        return '\f';
+      case '"':
+        return '"';
+      case '\\':
+        return '\\';
+      default:
+        return escaped;
+    }
+  });
 }
 
 function renderTomlString(value: string): string {
   return `"${escapeTomlString(value)}"`;
 }
 
+function isValidTomlLiteralContent(content: string, allowNewlines = false): boolean {
+  // TOML literal strings permit only tab (U+0009) among control characters.
+  // Multiline strings additionally permit line feed (U+000A).
+  for (let i = 0; i < content.length; i++) {
+    const code = content.charCodeAt(i);
+    if (
+      code <= 0x08
+      || (code >= 0x0A && code <= 0x1F && !(allowNewlines && code === 0x0A))
+      || code === 0x7F
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function foldTomlMultilineBasicString(value: string): string {
+  let result = '';
+  for (let index = 0; index < value.length;) {
+    if (value[index] !== '\\') {
+      result += value[index++];
+      continue;
+    }
+
+    let backslashEnd = index;
+    while (value[backslashEnd] === '\\') backslashEnd++;
+    let whitespaceEnd = backslashEnd;
+    while (value[whitespaceEnd] === ' ' || value[whitespaceEnd] === '\t') whitespaceEnd++;
+
+    const backslashCount = backslashEnd - index;
+    if (backslashCount % 2 === 1 && value[whitespaceEnd] === '\n') {
+      result += '\\'.repeat(backslashCount - 1);
+      index = whitespaceEnd + 1;
+      while (value[index] === ' ' || value[index] === '\t' || value[index] === '\n') index++;
+      continue;
+    }
+
+    result += '\\'.repeat(backslashCount) + value.slice(backslashEnd, whitespaceEnd);
+    index = whitespaceEnd;
+  }
+  return result;
+}
+
 function parseTomlQuotedString(value: string): string | undefined {
-  const match = value.trim().match(/^"((?:\\.|[^"\\])*)"$/);
-  return match ? unescapeTomlString(match[1]) : undefined;
+  const trimmed = value.trim();
+
+  const multilineBasicMatch = trimmed.match(/^"""([\s\S]*?)"""\s*(?:#.*)?$/);
+  if (multilineBasicMatch) {
+    return unescapeTomlString(foldTomlMultilineBasicString(multilineBasicMatch[1].replace(/^\r?\n/, '')));
+  }
+
+  const multilineLiteralMatch = trimmed.match(/^'''([\s\S]*?)'''\s*(?:#.*)?$/);
+  if (multilineLiteralMatch) {
+    const content = multilineLiteralMatch[1].replace(/^\r?\n/, '');
+    return isValidTomlLiteralContent(content, true) ? content : undefined;
+  }
+
+  const basicMatch = trimmed.match(/^"((?:\\.|[^"\\])*)"\s*(?:#.*)?$/);
+  if (basicMatch) {
+    return unescapeTomlString(basicMatch[1]);
+  }
+
+  // TOML literal string ('...'): single-line, no escape processing.
+  // Reject raw CR/LF and multi-line; preserve every interior character verbatim.
+  if (trimmed.startsWith("'") && !trimmed.includes('\n') && !trimmed.includes('\r')) {
+    const literalMatch = trimmed.match(/^'([^']*)'\s*(?:#.*)?$/);
+    if (literalMatch && isValidTomlLiteralContent(literalMatch[1])) {
+      return literalMatch[1];
+    }
+  }
+
+  return undefined;
 }
 
 function renderTomlStringArray(values: string[]): string {
   return `[${values.map(renderTomlString).join(', ')}]`;
 }
 
+function parseTomlStringArrayFallback(value: string): string[] | undefined {
+  let i = 0;
+
+  // Skip leading whitespace; require opening '['.
+  while (i < value.length && (value[i] === ' ' || value[i] === '\t')) {
+    i++;
+  }
+  if (i >= value.length || value[i] !== '[') {
+    return undefined;
+  }
+  i++;
+
+  const result: string[] = [];
+
+  for (;;) {
+    // Skip horizontal whitespace between tokens.
+    while (i < value.length && (value[i] === ' ' || value[i] === '\t')) {
+      i++;
+    }
+
+    if (i >= value.length) {
+      return undefined; // Unterminated: EOF before ']'.
+    }
+
+    // Empty array.
+    if (value[i] === ']' && result.length === 0) {
+      i++;
+      // After ']', allow only horizontal whitespace through EOF.
+      while (i < value.length) {
+        if (value[i] !== ' ' && value[i] !== '\t') {
+          return undefined;
+        }
+        i++;
+      }
+      return result;
+    }
+
+    // Parse a quoted string member.
+    const quote = value[i];
+    if (quote !== '"' && quote !== "'") {
+      return undefined; // Non-string member.
+    }
+
+    let member: string;
+
+    if (quote === "'") {
+      // Literal string: scan to next apostrophe, no escapes.
+      i++;
+      const start = i;
+      while (i < value.length && value[i] !== "'") {
+        i++;
+      }
+      if (i >= value.length) {
+        return undefined; // Unterminated literal.
+      }
+      member = value.slice(start, i);
+      if (!isValidTomlLiteralContent(member)) {
+        return undefined;
+      }
+      i++; // Consume closing apostrophe.
+    } else {
+      // Basic string: backslash-aware scan to closing quote, then JSON.parse the full token.
+      i++; // Skip opening quote.
+      const tokenStart = i - 1;
+      while (i < value.length) {
+        if (value[i] === '\\') {
+          i += 2; // Skip escaped character.
+        } else if (value[i] === '"') {
+          break;
+        } else {
+          i++;
+        }
+      }
+      if (i >= value.length || value[i] !== '"') {
+        return undefined; // Unterminated basic string.
+      }
+      i++; // Consume closing quote.
+      const token = value.slice(tokenStart, i);
+      try {
+        const decoded = JSON.parse(token) as unknown;
+        if (typeof decoded !== 'string') {
+          return undefined;
+        }
+        member = decoded;
+      } catch {
+        return undefined;
+      }
+    }
+
+    result.push(member);
+
+    // After member: skip whitespace, require ',' or ']'.
+    while (i < value.length && (value[i] === ' ' || value[i] === '\t')) {
+      i++;
+    }
+    if (i >= value.length) {
+      return undefined; // Unterminated: EOF after member.
+    }
+    if (value[i] === ']') {
+      i++;
+      // After ']', allow only horizontal whitespace through EOF.
+      while (i < value.length) {
+        if (value[i] !== ' ' && value[i] !== '\t') {
+          return undefined;
+        }
+        i++;
+      }
+      return result;
+    }
+    if (value[i] !== ',') {
+      return undefined; // Missing separator.
+    }
+    i++; // Consume comma.
+
+    // After comma, allow a closing ']' (TOML v1.0 trailing comma) or another quoted member.
+    while (i < value.length && (value[i] === ' ' || value[i] === '\t')) {
+      i++;
+    }
+    if (i >= value.length) {
+      return undefined; // Unterminated: EOF after comma.
+    }
+    if (value[i] === ']') {
+      i++;
+      while (i < value.length) {
+        if (value[i] !== ' ' && value[i] !== '\t') {
+          return undefined;
+        }
+        i++;
+      }
+      return result;
+    }
+    if (value[i] !== '"' && value[i] !== "'") {
+      return undefined; // Missing member after comma.
+    }
+  }
+}
+
 function parseTomlStringArray(value: string): string[] | undefined {
+  const trimmed = value.trim();
+
+  // JSON-first path: all-basic arrays use existing JSON.parse semantics.
   try {
-    const parsed = JSON.parse(value.trim()) as unknown;
+    const parsed = JSON.parse(trimmed) as unknown;
     return Array.isArray(parsed) && parsed.every(item => typeof item === 'string')
       ? parsed
       : undefined;
   } catch {
+    // Fall through to the literal/mixed-array fallback.
+  }
+
+  // Reject raw CR/LF before scanning (single-line arrays only).
+  if (value.includes('\n') || value.includes('\r')) {
     return undefined;
   }
+
+  return parseTomlStringArrayFallback(value);
 }
 
 function renderTomlBareKey(key: string): string {
@@ -514,8 +828,36 @@ export function syncCodexConfigToml(existingContent: string, registry: UnifiedMc
   };
 }
 
-function parseCodexMcpRegistryEntries(content: string): UnifiedMcpRegistry {
+interface ParsedCodexMcpRegistry {
+  entries: UnifiedMcpRegistry;
+  typeFieldsPresent: Set<string>;
+}
+
+type TomlMultilineDelimiter = '"""' | "'''";
+
+function hasClosingTomlMultilineString(value: string, delimiter: TomlMultilineDelimiter): boolean {
+  let escaped = false;
+  for (let index = delimiter.length; index <= value.length - delimiter.length; index++) {
+    if (delimiter === '"""') {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (value[index] === '\\') {
+        escaped = true;
+        continue;
+      }
+    }
+    if (value.startsWith(delimiter, index)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function parseCodexMcpRegistryEntries(content: string): ParsedCodexMcpRegistry {
   const entries: UnifiedMcpRegistry = {};
+  const typeFieldsPresent = new Set<string>();
   const lines = content.split(/\r?\n/);
   let currentName: string | null = null;
   let currentEntry: UnifiedMcpRegistryEntry = {};
@@ -532,7 +874,8 @@ function parseCodexMcpRegistryEntries(content: string): UnifiedMcpRegistry {
     currentSection = null;
   };
 
-  for (const rawLine of lines) {
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+    const rawLine = lines[lineIndex];
     const line = rawLine.trim();
     if (!line || line.startsWith('#')) {
       continue;
@@ -568,11 +911,21 @@ function parseCodexMcpRegistryEntries(content: string): UnifiedMcpRegistry {
       continue;
     }
 
-    const key = currentSection === 'headers' ? parseTomlKey(rawKey) : rawKey.trim();
+    const key = parseTomlKey(rawKey);
     if (!key) {
       continue;
     }
-    const value = rawValueParts.join('=').trim();
+    let value = rawValueParts.join('=').trim();
+    const multilineDelimiter: TomlMultilineDelimiter | undefined = value.startsWith('"""')
+      ? '"""'
+      : value.startsWith("'''")
+        ? "'''"
+        : undefined;
+    if (multilineDelimiter && !hasClosingTomlMultilineString(value, multilineDelimiter)) {
+      while (lineIndex + 1 < lines.length && !hasClosingTomlMultilineString(value, multilineDelimiter)) {
+        value += `\n${lines[++lineIndex]}`;
+      }
+    }
 
     if (currentSection === 'headers') {
       const parsed = parseTomlQuotedString(value);
@@ -589,6 +942,7 @@ function parseCodexMcpRegistryEntries(content: string): UnifiedMcpRegistry {
       const parsed = parseTomlQuotedString(value);
       if (parsed) currentEntry.url = parsed;
     } else if (key === 'type') {
+      typeFieldsPresent.add(currentName);
       const parsed = parseTomlQuotedString(value);
       if (parsed) currentEntry.type = parsed;
     } else if (key === 'env') {
@@ -604,7 +958,10 @@ function parseCodexMcpRegistryEntries(content: string): UnifiedMcpRegistry {
   }
 
   flushCurrent();
-  return Object.fromEntries(Object.entries(entries).sort(([left], [right]) => left.localeCompare(right)));
+  return {
+    entries: Object.fromEntries(Object.entries(entries).sort(([left], [right]) => left.localeCompare(right))),
+    typeFieldsPresent,
+  };
 }
 
 export function syncUnifiedMcpRegistryTargets(
@@ -697,9 +1054,10 @@ export function inspectUnifiedMcpRegistrySync(): UnifiedMcpRegistryStatus {
   const serverNames = Object.keys(registry);
   const claudeSettings = readJsonObject(claudeConfigPath);
   const claudeEntries = extractClaudeMcpRegistry(claudeSettings);
-  const codexEntries = existsSync(codexConfigPath)
+  const codexRegistry = existsSync(codexConfigPath)
     ? parseCodexMcpRegistryEntries(readFileSync(codexConfigPath, 'utf-8'))
-    : {};
+    : { entries: {}, typeFieldsPresent: new Set<string>() };
+  const codexEntries = codexRegistry.entries;
 
   const claudeMissing: string[] = [];
   const claudeMismatched: string[] = [];
@@ -715,7 +1073,7 @@ export function inspectUnifiedMcpRegistrySync(): UnifiedMcpRegistryStatus {
 
     if (!codexEntries[name]) {
       codexMissing.push(name);
-    } else if (!entriesEqual(codexEntries[name], entry)) {
+    } else if (!codexEntriesEqual(codexEntries[name], entry, codexRegistry.typeFieldsPresent.has(name))) {
       codexMismatched.push(name);
     }
   }

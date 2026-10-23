@@ -9,7 +9,7 @@ import { parseEvaluatorResult, } from './contracts.js';
 const AUTORESEARCH_RESULTS_HEADER = 'iteration\tcommit\tpass\tscore\tstatus\tdescription\n';
 const AUTORESEARCH_WORKTREE_EXCLUDES = ['results.tsv', 'run.log', 'node_modules', '.omc/'];
 // Exclusive modes that cannot run concurrently with autoresearch
-const EXCLUSIVE_MODES = ['ralph', 'ultrawork', 'autopilot', 'autoresearch'];
+const EXCLUSIVE_MODES = ['ralph', 'autopilot', 'autoresearch'];
 function nowIso() {
     return new Date().toISOString();
 }
@@ -49,6 +49,7 @@ function readGit(repoPath, args) {
             cwd: repoPath,
             encoding: 'utf-8',
             stdio: ['ignore', 'pipe', 'pipe'],
+            windowsHide: true,
         }).trim();
     }
     catch (error) {
@@ -65,6 +66,7 @@ function tryResolveGitCommit(worktreePath, ref) {
     const result = spawnSync('git', ['rev-parse', '--verify', `${ref}^{commit}`], {
         cwd: worktreePath,
         encoding: 'utf-8',
+        windowsHide: true,
     });
     if (result.status !== 0)
         return null;
@@ -129,6 +131,7 @@ function requireGitSuccess(worktreePath, args) {
     const result = spawnSync('git', args, {
         cwd: worktreePath,
         encoding: 'utf-8',
+        windowsHide: true,
     });
     if (result.status === 0)
         return;
@@ -138,6 +141,7 @@ function gitStatusLines(worktreePath) {
     const result = spawnSync('git', ['status', '--porcelain', '--untracked-files=all'], {
         cwd: worktreePath,
         encoding: 'utf-8',
+        windowsHide: true,
     });
     if (result.status !== 0) {
         throw new Error((result.stderr || '').trim() || `git status failed for ${worktreePath}`);
@@ -211,7 +215,7 @@ async function assertAutoresearchLockAvailable(projectRoot) {
     }
 }
 /**
- * Assert no exclusive mode is already active (ralph, ultrawork, autopilot).
+ * Assert no exclusive mode is already active (ralph, autopilot).
  * Mirrors OMX assertModeStartAllowed semantics using OMC mode-state-io.
  */
 export async function assertModeStartAllowed(mode, projectRoot) {

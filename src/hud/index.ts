@@ -12,6 +12,7 @@ import {
   readStdinCache,
   getContextPercent,
   getModelId,
+  getEffortLevel,
   getModelName,
   getRateLimitsFromStdin,
   stabilizeContextPercent,
@@ -26,7 +27,6 @@ import {
 } from "./state.js";
 import {
   readRalphStateForHud,
-  readUltraworkStateForHud,
   readPrdStateForHud,
   readAutopilotStateForHud,
 } from "./omc-state.js";
@@ -49,6 +49,7 @@ import { compareVersions } from "../features/auto-update.js";
 import {
   resolveToWorktreeRoot,
   resolveTranscriptPath,
+  withWorktreePathRenderScope,
 } from "../lib/worktree-paths.js";
 import { writeFileSync, mkdirSync, existsSync, readFileSync } from "fs";
 import { access, readFile } from "fs/promises";
@@ -67,6 +68,29 @@ function extractSessionIdFromPath(transcriptPath: string): string | null {
   return match ? match[1] : null;
 }
 
+// The two sources round reset times differently (e.g. 17:59:59.924Z vs 18:00:00Z).
+const SAME_WINDOW_TOLERANCE_MS = 60 * 1000;
+
+/**
+ * Stdin rate limits only move when this session makes a request, so usage from
+ * other sessions or background agents leaves them stale. Usage within a window
+ * never decreases, so when both sources describe the same window the higher
+ * percentage is the fresher one.
+ */
+function pickFresherPercent(
+  stdinPercent: number | undefined,
+  stdinResetsAt: Date | null | undefined,
+  apiPercent: number | undefined,
+  apiResetsAt: Date | null | undefined,
+): number | undefined {
+  if (stdinPercent == null || apiPercent == null || !stdinResetsAt || !apiResetsAt) {
+    return stdinPercent;
+  }
+  const isSameWindow =
+    Math.abs(stdinResetsAt.getTime() - apiResetsAt.getTime()) <= SAME_WINDOW_TOLERANCE_MS;
+  return isSameWindow ? Math.max(stdinPercent, apiPercent) : stdinPercent;
+}
+
 function mergeStdinRateLimits(
   stdinRateLimits: RateLimits | null,
   usageResult: UsageResult | null,
@@ -75,12 +99,28 @@ function mergeStdinRateLimits(
     return usageResult;
   }
 
+  const apiRateLimits = usageResult?.rateLimits ?? {};
+  const merged: RateLimits = { ...apiRateLimits, ...stdinRateLimits };
+  if (stdinRateLimits.fiveHourPercent != null) {
+    merged.fiveHourPercent = pickFresherPercent(
+      stdinRateLimits.fiveHourPercent,
+      stdinRateLimits.fiveHourResetsAt,
+      apiRateLimits.fiveHourPercent,
+      apiRateLimits.fiveHourResetsAt,
+    );
+  }
+  if (stdinRateLimits.weeklyPercent != null) {
+    merged.weeklyPercent = pickFresherPercent(
+      stdinRateLimits.weeklyPercent,
+      stdinRateLimits.weeklyResetsAt,
+      apiRateLimits.weeklyPercent,
+      apiRateLimits.weeklyResetsAt,
+    );
+  }
+
   return {
     ...(usageResult ?? {}),
-    rateLimits: {
-      ...(usageResult?.rateLimits ?? {}),
-      ...stdinRateLimits,
-    },
+    rateLimits: merged,
   };
 }
 
@@ -253,7 +293,7 @@ function showDiagnostic(): void {
  * Main HUD entry point
  * @param watchMode - true when called from the --watch polling loop (stdin is TTY)
  */
-async function main(watchMode = false, skipInit = false): Promise<void> {
+async function mainImpl(watchMode = false, skipInit = false): Promise<void> {
   try {
     // Read stdin from Claude Code
     const previousStdinCache = readStdinCache();
@@ -320,10 +360,6 @@ async function main(watchMode = false, skipInit = false): Promise<void> {
 
     // Read OMC state files
     const ralph = readRalphStateForHud(cwd, currentSessionId ?? undefined);
-    const ultrawork = readUltraworkStateForHud(
-      cwd,
-      currentSessionId ?? undefined,
-    );
     const prd = readPrdStateForHud(cwd);
     const autopilot = readAutopilotStateForHud(
       cwd,
@@ -364,7 +400,10 @@ async function main(watchMode = false, skipInit = false): Promise<void> {
     // Stdin owns fresher five-hour/seven-day values, while getUsage() may provide
     // Sonnet/Opus weekly, monthly, extra, stale, and error metadata.
     const stdinRateLimits = getRateLimitsFromStdin(stdin);
-    const usageResult = config.elements.rateLimits === false ? null : await getUsage();
+    const usageResult =
+      config.elements.rateLimits === false
+        ? null
+        : await getUsage({ clientVersion: stdin.version });
     const rateLimitsResult =
       config.elements.rateLimits === false
         ? null
@@ -379,6 +418,9 @@ async function main(watchMode = false, skipInit = false): Promise<void> {
     // Read OMC version and update check cache
     let omcVersion: string | null = null;
     let updateAvailable: string | null = null;
+    let omcUpdateSource: "npm" | "marketplace" | null = null;
+    const claudeCodeVersion = stdin.version ?? null;
+    let claudeCodeUpdateAvailable: string | null = null;
     try {
       omcVersion = getRuntimePackageVersion();
       if (omcVersion === "unknown") omcVersion = null;
@@ -403,6 +445,18 @@ async function main(watchMode = false, skipInit = false): Promise<void> {
         compareVersions(omcVersion, cached.latestVersion) < 0
       ) {
         updateAvailable = cached.latestVersion;
+      }
+      if (cached?.source === "npm" || cached?.source === "marketplace") {
+        omcUpdateSource = cached.source;
+      }
+      // claudeCodeLatestVersion is absent on caches written before the
+      // Claude Code check existed; treat that as "no update known".
+      if (
+        cached?.claudeCodeLatestVersion &&
+        claudeCodeVersion &&
+        compareVersions(claudeCodeVersion, cached.claudeCodeLatestVersion) < 0
+      ) {
+        claudeCodeUpdateAvailable = cached.claudeCodeLatestVersion;
       }
     } catch (error) {
       // Ignore update cache read errors - expected if file doesn't exist yet
@@ -461,8 +515,9 @@ async function main(watchMode = false, skipInit = false): Promise<void> {
       contextDisplayScope: currentSessionId ?? cwd,
       modelName: getModelName(stdin),
       modelId: getModelId(stdin),
+      effortLevel: getEffortLevel(stdin),
       ralph,
-      ultrawork,
+      ultrawork: null,
       prd,
       autopilot,
       activeAgents: transcriptData.agents.filter((a) => a.status === "running"),
@@ -480,6 +535,9 @@ async function main(watchMode = false, skipInit = false): Promise<void> {
       sessionTotalTokens: transcriptData.sessionTotalTokens ?? null,
       omcVersion,
       updateAvailable,
+      omcUpdateSource,
+      claudeCodeVersion,
+      claudeCodeUpdateAvailable,
       toolCallCount: transcriptData.toolCallCount,
       agentCallCount: transcriptData.agentCallCount,
       skillCallCount: transcriptData.skillCallCount,
@@ -591,6 +649,10 @@ async function main(watchMode = false, skipInit = false): Promise<void> {
 }
 
 // Export for programmatic use (e.g., omc hud --watch loop)
+function main(watchMode = false, skipInit = false): Promise<void> {
+  return withWorktreePathRenderScope(() => mainImpl(watchMode, skipInit));
+}
+
 export { main };
 
 // Auto-run (unconditional so dynamic import() via omc-hud.mjs wrapper works correctly)

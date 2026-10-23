@@ -89,6 +89,9 @@ export interface OrchestratorConfig {
   pollIntervalMs?: number;
   /** Bound on `drainAndStop`. Defaults to 10000ms. */
   drainTimeoutMs?: number;
+  /** Persistent owner generation; stale attempts must not tear down its services. */
+  serviceGeneration?: number;
+  serviceAttemptId?: string;
 }
 
 export interface OrchestratorHandle {
@@ -117,7 +120,10 @@ export interface OrchestratorHandle {
 
 interface PersistedState {
   lastShas: Record<string, string>;
+  service?: { generation: number; attemptId: string };
 }
+
+const liveServiceOwners = new Map<string, { generation: number; attemptId: string }>();
 
 interface WorkerEntry {
   workerName: string;
@@ -252,6 +258,7 @@ function gitRevParseHead(repoRoot: string, branch: string): string {
     cwd: repoRoot,
     encoding: 'utf-8',
     stdio: 'pipe',
+    windowsHide: true,
   }).trim();
 }
 
@@ -261,6 +268,7 @@ function gitPath(worktreePath: string, gitPathName: string): string {
       cwd: worktreePath,
       encoding: 'utf-8',
       stdio: 'pipe',
+      windowsHide: true,
     }).trim();
     if (resolved) return resolved;
   } catch {
@@ -281,6 +289,7 @@ function isWorktreeRegistered(repoRoot: string, wtPath: string): boolean {
       cwd: repoRoot,
       encoding: 'utf-8',
       stdio: 'pipe',
+      windowsHide: true,
     });
     for (const line of out.split('\n')) {
       if (line.startsWith('worktree ')) {
@@ -303,6 +312,7 @@ function ensureMergerWorktree(repoRoot: string, mergerPath: string, leaderBranch
   execFileSync('git', ['worktree', 'add', '--force', mergerPath, leaderBranch], {
     cwd: repoRoot,
     stdio: 'pipe',
+    windowsHide: true,
   });
 }
 
@@ -312,6 +322,7 @@ function preflightMergerWorktree(mergerPath: string, leaderBranch: string): void
     execFileSync('git', ['fetch', '--no-tags', 'origin', leaderBranch], {
       cwd: mergerPath,
       stdio: 'pipe',
+      windowsHide: true,
     });
   } catch {
     // ignore
@@ -319,6 +330,7 @@ function preflightMergerWorktree(mergerPath: string, leaderBranch: string): void
   execFileSync('git', ['reset', '--hard', leaderBranch], {
     cwd: mergerPath,
     stdio: 'pipe',
+    windowsHide: true,
   });
 }
 
@@ -378,6 +390,15 @@ export async function startMergeOrchestrator(
       persisted = { lastShas: {} };
     }
   }
+  const service = config.serviceGeneration === undefined || config.serviceAttemptId === undefined
+    ? undefined : { generation: config.serviceGeneration, attemptId: config.serviceAttemptId };
+  const live = liveServiceOwners.get(config.teamName);
+  if (service && live && (live.generation > service.generation || (live.generation === service.generation && live.attemptId !== service.attemptId))) {
+    throw new Error('auto_merge_service_owned_by_live_generation');
+  }
+  if (service) liveServiceOwners.set(config.teamName, service);
+  const ownsService = (): boolean => !service || liveServiceOwners.get(config.teamName)?.generation === service.generation
+    && liveServiceOwners.get(config.teamName)?.attemptId === service.attemptId;
 
   const workers = new Map<string, WorkerEntry>();
   const pausedWorkers = new Set<string>(); // workers mid-rebase (cadence paused)
@@ -389,6 +410,7 @@ export async function startMergeOrchestrator(
       lastShas: Object.fromEntries(
         Array.from(workers.values()).map((w) => [w.workerName, w.lastObservedSha]),
       ),
+      ...(service ? { service } : {}),
     };
     atomicWriteJson(persistedPath, payload);
   }
@@ -422,6 +444,7 @@ export async function startMergeOrchestrator(
         execFileSync('git', ['fetch', '--no-tags', 'origin', config.leaderBranch], {
           cwd: wtPath,
           stdio: 'pipe',
+          windowsHide: true,
         });
       } catch {
         // offline OK
@@ -431,6 +454,7 @@ export async function startMergeOrchestrator(
         execFileSync('git', ['rebase', config.leaderBranch], {
           cwd: wtPath,
           stdio: 'pipe',
+          windowsHide: true,
         });
         // Clean rebase — resume immediately.
         await resumeHookViaSentinel(wtPath);
@@ -447,6 +471,7 @@ export async function startMergeOrchestrator(
             cwd: wtPath,
             encoding: 'utf-8',
             stdio: 'pipe',
+            windowsHide: true,
           });
           conflictingFiles = parseUUFiles(status);
         } catch {
@@ -459,6 +484,7 @@ export async function startMergeOrchestrator(
               cwd: config.repoRoot,
               encoding: 'utf-8',
               stdio: 'pipe',
+              windowsHide: true,
             }).trim();
           } catch {
             return 'unknown';
@@ -527,7 +553,7 @@ export async function startMergeOrchestrator(
           mergeBaseSha = execFileSync(
             'git',
             ['merge-base', config.leaderBranch, entry.workerBranch],
-            { cwd: mergerPath, encoding: 'utf-8', stdio: 'pipe' },
+            { cwd: mergerPath, encoding: 'utf-8', stdio: 'pipe', windowsHide: true },
           ).trim();
         } catch {
           // best-effort
@@ -604,7 +630,7 @@ export async function startMergeOrchestrator(
   }
 
   async function runPollOnce(): Promise<void> {
-    if (stopped) return;
+    if (stopped || !ownsService()) return;
     for (const entry of workers.values()) {
       // Apply per-worker exponential backoff: skip ticks based on consecutiveFailures.
       // Cap so we never fully starve a worker.
@@ -676,6 +702,7 @@ export async function startMergeOrchestrator(
         cwd: entry.workerWorktreePath,
         encoding: 'utf-8',
         stdio: 'pipe',
+        windowsHide: true,
       }).trim();
       if (status.length > 0) {
         const dirtyFiles = status
@@ -714,6 +741,7 @@ export async function startMergeOrchestrator(
   // ----- Public handle -----
   return {
     async registerWorker(workerName: string): Promise<void> {
+      if (!ownsService()) return;
       if (workers.has(workerName)) return;
       const workerBranch = getBranchName(config.teamName, workerName);
       // Defence-in-depth: reject worker branch names that could be misread as
@@ -746,6 +774,7 @@ export async function startMergeOrchestrator(
     },
 
     async unregisterWorker(workerName: string): Promise<void> {
+      if (!ownsService()) return;
       workers.delete(workerName);
       pausedWorkers.delete(workerName);
       try {
@@ -760,11 +789,51 @@ export async function startMergeOrchestrator(
     },
 
     async drainAndStop(): Promise<{ unmerged: Array<{ workerName: string; reason: string }> }> {
+      if (!ownsService()) return { unmerged: [] };
       stopped = true;
       clearInterval(interval);
 
       const start = Date.now();
       const unmerged: Array<{ workerName: string; reason: string }> = [];
+      // The final worker commit can land between poll ticks. Refresh branch
+      // heads before choosing drain candidates so shutdown does not silently
+      // skip work that the periodic poller has not observed yet.
+      for (const entry of workers.values()) {
+        if (pausedWorkers.has(entry.workerName)) continue;
+        try {
+          const currentSha = gitRevParseHead(config.repoRoot, entry.workerBranch);
+          if (currentSha && currentSha !== entry.lastObservedSha) {
+            entry.lastObservedSha = currentSha;
+            try {
+              persistState();
+            } catch {
+              // best-effort persistence
+            }
+            try {
+              await appendEvent(config.repoRoot, config.teamName, {
+                type: 'commit_observed',
+                worker: entry.workerName,
+                data: { sha: currentSha },
+              });
+            } catch {
+              // best-effort event logging
+            }
+          }
+        } catch (err) {
+          entry.consecutiveFailures += 1;
+          const reason = err instanceof Error ? err.message : String(err);
+          try {
+            await appendEvent(config.repoRoot, config.teamName, {
+              type: 'commit_observed',
+              worker: entry.workerName,
+              reason: `rev_parse_failed:${reason}`,
+            });
+          } catch {
+            // best-effort event logging
+          }
+        }
+      }
+
       const candidates = Array.from(workers.values()).filter(
         (w) => w.lastObservedSha && w.lastObservedSha !== w.lastMergedSha,
       );
@@ -799,6 +868,13 @@ export async function startMergeOrchestrator(
 
       // Audit any unmerged drain residue.
       if (unmerged.length > 0) {
+        try {
+          process.stderr.write(
+            `[team/merge-orchestrator] WARNING: auto-merge left worker commits unmerged at shutdown: ${unmerged.map((u) => `${u.workerName}:${u.reason}`).join(', ')}\n`,
+          );
+        } catch {
+          // best-effort warning
+        }
         const auditPath = teardownAuditPath(config.repoRoot, config.teamName);
         await mkdir(dirname(auditPath), { recursive: true });
         for (const u of unmerged) {
@@ -823,6 +899,7 @@ export async function startMergeOrchestrator(
         }
       }
 
+      if (service && ownsService()) liveServiceOwners.delete(config.teamName);
       return { unmerged };
     },
 

@@ -1,4 +1,4 @@
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { createReadStream, existsSync, readdirSync, statSync } from 'fs';
 import { dirname, join, normalize, resolve } from 'path';
 import { createInterface } from 'readline';
@@ -69,10 +69,11 @@ function parseSinceSpec(since?: string): number | undefined {
 
 function getMainRepoRoot(projectRoot: string): string | null {
   try {
-    const gitCommonDir = execSync('git rev-parse --git-common-dir', {
+    const gitCommonDir = execFileSync('git', ['rev-parse', '--git-common-dir'], {
       cwd: projectRoot,
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
     }).trim();
     const absoluteCommonDir = resolve(projectRoot, gitCommonDir);
     const mainRepoRoot = dirname(absoluteCommonDir);
@@ -138,13 +139,15 @@ function uniqueSortedTargets(targets: SearchTarget[]): SearchTarget[] {
     });
 }
 
-function buildCurrentProjectTargets(projectRoot: string): SearchTarget[] {
+function buildCurrentProjectTargets(projectRoot: string, transcriptProjectRoots: string[] = [projectRoot]): SearchTarget[] {
   const claudeDir = getClaudeConfigDir();
-  const projectRoots = new Set<string>([projectRoot]);
-  const mainRepoRoot = getMainRepoRoot(projectRoot);
-  if (mainRepoRoot) projectRoots.add(mainRepoRoot);
-  const claudeWorktreeParent = getClaudeWorktreeParent(projectRoot);
-  if (claudeWorktreeParent) projectRoots.add(claudeWorktreeParent);
+  const projectRoots = new Set<string>(transcriptProjectRoots);
+  for (const root of transcriptProjectRoots) {
+    const mainRepoRoot = getMainRepoRoot(root);
+    if (mainRepoRoot) projectRoots.add(mainRepoRoot);
+    const claudeWorktreeParent = getClaudeWorktreeParent(root);
+    if (claudeWorktreeParent) projectRoots.add(claudeWorktreeParent);
+  }
 
   const targets: SearchTarget[] = [];
 
@@ -198,9 +201,9 @@ function isWithinProject(projectPath: string | undefined, projectRoots: string[]
     return false;
   }
 
-  const normalizedProjectPath = normalize(resolve(projectPath));
+  const normalizedProjectPath = normalize(resolve(projectPath)).replace(/\\/g, '/');
   return projectRoots.some((root) => {
-    const normalizedRoot = normalize(resolve(root));
+    const normalizedRoot = normalize(resolve(root)).replace(/\\/g, '/');
     return normalizedProjectPath === normalizedRoot || normalizedProjectPath.startsWith(`${normalizedRoot}/`);
   });
 }
@@ -392,6 +395,87 @@ function buildScopeMode(project: string | undefined): 'current' | 'project' | 'a
   return 'project';
 }
 
+function compareMatches(a: SessionHistoryMatch, b: SessionHistoryMatch): number {
+  const parsedATime = a.timestamp ? Date.parse(a.timestamp) : 0;
+  const parsedBTime = b.timestamp ? Date.parse(b.timestamp) : 0;
+  // Malformed non-timestamps are outside the timestamp ordering contract. Keep
+  // them searchable with the same deterministic epoch-zero fallback as missing values.
+  const aTime = Number.isFinite(parsedATime) ? parsedATime : 0;
+  const bTime = Number.isFinite(parsedBTime) ? parsedBTime : 0;
+  if (aTime !== bTime) return bTime - aTime;
+  return a.sourcePath.localeCompare(b.sourcePath);
+}
+
+interface RankedMatch {
+  match: SessionHistoryMatch;
+  encounterOrder: number;
+}
+
+function compareRankedMatches(a: RankedMatch, b: RankedMatch): number {
+  const comparison = compareMatches(a.match, b.match);
+  return comparison || a.encounterOrder - b.encounterOrder;
+}
+
+function addToWorstFirstHeap(heap: RankedMatch[], candidate: RankedMatch, capacity: number): void {
+  if (capacity <= 0) return;
+
+  if (heap.length >= capacity) {
+    if (compareRankedMatches(candidate, heap[0]) >= 0) return;
+    heap[0] = candidate;
+    let index = 0;
+    while (true) {
+      const left = index * 2 + 1;
+      const right = left + 1;
+      let worst = index;
+      if (left < heap.length && compareRankedMatches(heap[left], heap[worst]) > 0) worst = left;
+      if (right < heap.length && compareRankedMatches(heap[right], heap[worst]) > 0) worst = right;
+      if (worst === index) break;
+      [heap[index], heap[worst]] = [heap[worst], heap[index]];
+      index = worst;
+    }
+    return;
+  }
+
+  heap.push(candidate);
+  let index = heap.length - 1;
+  while (index > 0) {
+    const parent = Math.floor((index - 1) / 2);
+    if (compareRankedMatches(heap[parent], heap[index]) >= 0) break;
+    [heap[parent], heap[index]] = [heap[index], heap[parent]];
+    index = parent;
+  }
+}
+
+interface MatchRetainer {
+  add(match: SessionHistoryMatch): void;
+  readonly retained: SessionHistoryMatch[];
+  readonly totalMatches: number;
+}
+
+function createMatchRetainer(limit: number): MatchRetainer {
+  const maxMatches = Number.isNaN(limit) ? 0 : Math.max(0, Math.trunc(limit));
+  const heap: RankedMatch[] = [];
+  let totalMatches = 0;
+  let encounterOrder = 0;
+
+  return {
+    add(match) {
+      totalMatches += 1;
+      const rankedMatch = { match, encounterOrder };
+      encounterOrder += 1;
+      addToWorstFirstHeap(heap, rankedMatch, maxMatches);
+    },
+    get retained() {
+      return [...heap]
+        .sort(compareRankedMatches)
+        .map((rankedMatch) => rankedMatch.match);
+    },
+    get totalMatches() {
+      return totalMatches;
+    },
+  };
+}
+
 async function collectMatchesFromFile(
   target: SearchTarget,
   options: {
@@ -402,26 +486,26 @@ async function collectMatchesFromFile(
     sessionId?: string;
     projectFilter?: string;
     projectRoots?: string[];
+    onMatch: (match: SessionHistoryMatch) => void;
   },
-): Promise<SessionHistoryMatch[]> {
-  const matches: SessionHistoryMatch[] = [];
+): Promise<void> {
   const fileMtime = existsSync(target.filePath) ? statSync(target.filePath).mtimeMs : 0;
 
   if (target.sourceType === 'omc-session-summary' && target.filePath.endsWith('.json')) {
     try {
       const payload = JSON.parse(await import('fs/promises').then((fs) => fs.readFile(target.filePath, 'utf-8')));
       const entry = buildSearchableEntry(payload as Record<string, unknown>, target.sourceType);
-      if (!entry) return [];
-      if (options.sessionId && entry.sessionId !== options.sessionId) return [];
-      if (options.projectRoots && options.projectRoots.length > 0 && !isWithinProject(entry.projectPath, options.projectRoots)) return [];
-      if (!matchesProjectFilter(entry.projectPath, options.projectFilter)) return [];
+      if (!entry) return;
+      if (options.sessionId && entry.sessionId !== options.sessionId) return;
+      if (options.projectRoots && options.projectRoots.length > 0 && !isWithinProject(entry.projectPath, options.projectRoots)) return;
+      if (!matchesProjectFilter(entry.projectPath, options.projectFilter)) return;
       const entryEpoch = entry.timestamp ? Date.parse(entry.timestamp) : fileMtime;
-      if (options.sinceEpoch && Number.isFinite(entryEpoch) && entryEpoch < options.sinceEpoch) return [];
+      if (options.sinceEpoch && Number.isFinite(entryEpoch) && entryEpoch < options.sinceEpoch) return;
 
       for (const text of entry.texts) {
         const matchIndex = findMatchIndex(text, options.query, options.caseSensitive);
         if (matchIndex < 0) continue;
-        matches.push({
+        options.onMatch({
           sessionId: entry.sessionId,
           timestamp: entry.timestamp,
           projectPath: entry.projectPath,
@@ -435,9 +519,9 @@ async function collectMatchesFromFile(
         break;
       }
     } catch {
-      return [];
+      return;
     }
-    return matches;
+    return;
   }
 
   const stream = createReadStream(target.filePath, { encoding: 'utf-8' });
@@ -468,7 +552,7 @@ async function collectMatchesFromFile(
       for (const text of entry.texts) {
         const matchIndex = findMatchIndex(text, options.query, options.caseSensitive);
         if (matchIndex < 0) continue;
-        matches.push({
+        options.onMatch({
           sessionId: entry.sessionId,
           agentId: entry.agentId,
           timestamp: entry.timestamp,
@@ -487,8 +571,6 @@ async function collectMatchesFromFile(
     reader.close();
     stream.destroy();
   }
-
-  return matches;
 }
 
 export async function searchSessionHistory(
@@ -511,19 +593,22 @@ export async function searchSessionHistory(
   const currentProjectRoot = resolveToWorktreeRoot(workingDirectory);
   const scopeMode = buildScopeMode(rawOptions.project);
   const projectFilter = scopeMode === 'project' ? rawOptions.project : undefined;
+  const literalWorkingDirectory = rawOptions.workingDirectory ? resolve(rawOptions.workingDirectory) : workingDirectory;
 
-  const currentProjectRoots = [currentProjectRoot]
+  const currentProjectRoots = [currentProjectRoot, literalWorkingDirectory]
     .concat(getMainRepoRoot(currentProjectRoot) ?? [])
     .concat(getClaudeWorktreeParent(currentProjectRoot) ?? [])
     .filter((value, index, arr): value is string => Boolean(value) && arr.indexOf(value) === index);
 
+  const transcriptProjectRoots = currentProjectRoots.filter((root) => isWithinProject(root, [currentProjectRoot]));
+
   const targets = scopeMode === 'all'
     ? buildAllProjectTargets()
-    : buildCurrentProjectTargets(currentProjectRoot);
+    : buildCurrentProjectTargets(currentProjectRoot, transcriptProjectRoots);
 
-  const allMatches: SessionHistoryMatch[] = [];
+  const matchRetainer = createMatchRetainer(limit);
   for (const target of targets) {
-    const fileMatches = await collectMatchesFromFile(target, {
+    await collectMatchesFromFile(target, {
       query,
       caseSensitive,
       contextChars,
@@ -531,16 +616,9 @@ export async function searchSessionHistory(
       sessionId: rawOptions.sessionId,
       projectFilter,
       projectRoots: scopeMode === 'current' ? currentProjectRoots : undefined,
+      onMatch: matchRetainer.add,
     });
-    allMatches.push(...fileMatches);
   }
-
-  allMatches.sort((a, b) => {
-    const aTime = a.timestamp ? Date.parse(a.timestamp) : 0;
-    const bTime = b.timestamp ? Date.parse(b.timestamp) : 0;
-    if (aTime !== bTime) return bTime - aTime;
-    return a.sourcePath.localeCompare(b.sourcePath);
-  });
 
   return {
     query,
@@ -552,12 +630,17 @@ export async function searchSessionHistory(
       caseSensitive,
     },
     searchedFiles: targets.length,
-    totalMatches: allMatches.length,
-    results: allMatches.slice(0, limit),
+    totalMatches: matchRetainer.totalMatches,
+    results: matchRetainer.retained,
   };
 }
 
-export { encodeProjectPath, parseSinceSpec };
+export {
+  encodeProjectPath,
+  isWithinProject as __testingIsWithinProject,
+  parseSinceSpec,
+  createMatchRetainer as __testingCreateMatchRetainer,
+};
 export type {
   SessionHistoryMatch,
   SessionHistorySearchOptions,

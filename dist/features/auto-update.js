@@ -187,8 +187,8 @@ function syncMarketplaceClone(verbose = false) {
         return { ok: true, message: 'Marketplace clone not found; skipping' };
     }
     const stdio = verbose ? 'inherit' : 'pipe';
-    const execOpts = { encoding: 'utf-8', stdio: stdio, timeout: 60000 };
-    const queryExecOpts = { encoding: 'utf-8', stdio: 'pipe', timeout: 60000 };
+    const execOpts = { encoding: 'utf-8', stdio: stdio, timeout: 60000, windowsHide: true };
+    const queryExecOpts = { encoding: 'utf-8', stdio: 'pipe', timeout: 60000, windowsHide: true };
     try {
         execFileSync('git', ['-C', marketplacePath, 'fetch', '--all', '--prune'], execOpts);
     }
@@ -742,10 +742,20 @@ export function reconcileUpdateRuntime(options) {
         if (purgeResult.removed > 0 && options?.verbose) {
             console.log(`[omc] Purged ${purgeResult.removed} stale plugin cache version(s)`);
         }
-        if (purgeResult.errors.length > 0 && options?.verbose) {
-            for (const err of purgeResult.errors) {
-                console.warn(`[omc] Cache purge warning: ${err}`);
-            }
+        if (purgeResult.restored > 0 && options?.verbose) {
+            console.log(`[omc] Restored ${purgeResult.restored} plugin cache version(s) from an interrupted relink`);
+        }
+        // Always surface purge errors and skipped backups, even without --verbose.
+        // Both leave a version path that live sessions resolve through, so a silent
+        // line here reads as a successful update while hooks are broken: a skipped
+        // backup keeps the pinned path unusable for as long as its owner runs, and
+        // forever if that pid was recycled by an unrelated process.
+        // Kept non-fatal — reconciliation must not fail on best-effort cleanup.
+        for (const skipped of purgeResult.skippedPaths) {
+            console.warn(`[omc] Cache purge warning: left a backup to its running owner: ${skipped}`);
+        }
+        for (const err of purgeResult.errors) {
+            console.warn(`[omc] Cache purge warning: ${err}`);
         }
     }
     catch {

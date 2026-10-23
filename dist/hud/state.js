@@ -265,7 +265,7 @@ export function readHudConfig() {
     if (legacyConfig) {
         return mergeWithDefaults(legacyConfig);
     }
-    return DEFAULT_HUD_CONFIG;
+    return mergeWithDefaults({});
 }
 /**
  * Merge partial config with defaults

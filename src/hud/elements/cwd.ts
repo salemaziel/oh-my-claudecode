@@ -6,7 +6,8 @@
  */
 
 import { homedir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, resolve, sep } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { dim } from '../colors.js';
 import type { CwdFormat } from '../types.js';
 
@@ -24,13 +25,20 @@ function osc8Link(url: string, text: string): string {
  * Handles Windows paths (C:\path -> file:///C:/path).
  */
 function pathToFileUrl(absPath: string): string {
-  // Normalize backslashes on Windows
-  const normalized = absPath.replace(/\\/g, '/');
-  // Windows absolute path (e.g. C:/...)
-  if (/^[A-Za-z]:\//.test(normalized)) {
-    return `file:///${normalized}`;
+  // Preserve portable drive-path inputs when rendering on a non-Windows host.
+  if (process.platform !== 'win32' && /^[A-Za-z]:[\\/]/.test(absPath)) {
+    const segments = absPath.replace(/\\/g, '/').split('/');
+    return `file:///${segments.map((segment, index) => index === 0 ? segment : encodeURIComponent(segment)).join('/')}`;
   }
-  return `file://${normalized}`;
+  // Do not add a sentinel to filesystem roots: UNC roots preserve repeated
+  // separators when pathToFileURL converts them.
+  const normalized = resolve(absPath);
+  if (normalized.endsWith(sep)) return pathToFileURL(normalized).href;
+
+  // A trailing directory separator keeps WHATWG URL trimming from dropping
+  // valid trailing control bytes in POSIX names; remove only the added slash.
+  const url = pathToFileURL(`${normalized}${sep}`).href;
+  return url.slice(0, -1);
 }
 
 /**
@@ -52,10 +60,20 @@ export function renderCwd(
 
   switch (format) {
     case 'relative': {
-      const home = homedir();
-      displayPath = cwd.startsWith(home)
-        ? '~' + cwd.slice(home.length)
-        : cwd;
+      // cwd reaches here from `git rev-parse --show-toplevel` (via
+      // resolveToWorktreeRoot), which emits forward slashes even on Windows,
+      // while homedir() emits backslashes. Compare on normalized separators,
+      // but only abbreviate when cwd is exactly home or crosses a real path
+      // boundary so sibling prefixes like /Users/testuser2 do not fold to ~2.
+      const home = homedir().replace(/\\/g, '/');
+      const normalizedCwd = cwd.replace(/\\/g, '/');
+      if (normalizedCwd === home) {
+        displayPath = '~';
+      } else if (normalizedCwd.startsWith(`${home}/`)) {
+        displayPath = '~' + normalizedCwd.slice(home.length);
+      } else {
+        displayPath = cwd;
+      }
       break;
     }
     case 'absolute':
@@ -66,14 +84,20 @@ export function renderCwd(
       // directory names like src/, test/, docs/, packages/core, apps/web.
       const parent = basename(dirname(cwd));
       const folder = basename(cwd);
-      displayPath = parent ? join(parent, folder) : folder;
+      // Join with a literal "/" rather than join(), whose win32 separator would
+      // render "parent\leaf" and break display consistency with the rest of the
+      // HUD (which uses forward slashes everywhere).
+      displayPath = parent ? `${parent}/${folder}` : folder;
       break;
     }
     default:
       displayPath = cwd;
   }
 
-  const rendered = `${dim(displayPath)}`;
+  // File names are untrusted terminal text; keep controls visible and inert.
+  const safeDisplayPath = displayPath.replace(/[\x00-\x1f\x7f-\x9f]/g,
+    character => `\\x${character.charCodeAt(0).toString(16).padStart(2, '0')}`);
+  const rendered = `${dim(safeDisplayPath)}`;
 
   if (useHyperlinks) {
     const url = pathToFileUrl(cwd);

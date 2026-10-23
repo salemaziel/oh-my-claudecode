@@ -20,6 +20,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, chmodSy
 import { join } from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { spawn } from 'child_process';
+import { randomUUID } from 'crypto';
 import { tmuxExec } from '../cli/tmux-utils.js';
 import { request as httpsRequest } from 'https';
 import { resolveDaemonModulePath } from '../utils/daemon-module-path.js';
@@ -31,14 +32,22 @@ import {
 } from '../features/rate-limit-wait/tmux-detector.js';
 import {
   lookupByMessageId,
+  lockRegistryIfEmpty,
   removeMessagesByPane,
   pruneStale,
   type SessionMapping,
 } from './session-registry.js';
+import { writeApprovalDecision } from '../graph/runtime/remote-approval.js';
+
 import type { ReplyConfig } from './types.js';
 import { parseMentionAllowedMentions } from './config.js';
 import { redactTokens } from './redact.js';
-import { isProcessAlive } from '../platform/index.js';
+import {
+  getProcessStartIdentity,
+  isProcessAlive,
+  isProcessIdentityLive,
+  terminateOwnedProcessTree,
+} from '../platform/index.js';
 import {
   validateSlackMessage,
   SlackConnectionStateTracker,
@@ -93,6 +102,10 @@ export interface ReplyListenerState {
   messagesInjected: number;
   errors: number;
   lastError?: string;
+  /** Unique per-launch generation used to reject stale PID/state pairs. */
+  generation?: string;
+  /** Platform-provided start identity that prevents PID-reuse signalling. */
+  processStartIdentity?: string;
 }
 
 /** Daemon configuration (written to state file) */
@@ -248,26 +261,39 @@ export async function buildDaemonConfig(): Promise<ReplyListenerDaemonConfig | n
   }
 }
 
-/**
- * Read PID file
- */
-function readPidFile(): number | null {
+interface ReplyListenerPidRecord {
+  pid: number;
+  generation?: string;
+  processStartIdentity?: string;
+}
+
+/** Read the PID record, accepting the legacy numeric format for cleanup only. */
+function readPidRecord(): ReplyListenerPidRecord | null {
   try {
-    if (!existsSync(PID_FILE_PATH)) {
+    if (!existsSync(PID_FILE_PATH)) return null;
+    const content = readFileSync(PID_FILE_PATH, 'utf-8').trim();
+    const parsed = JSON.parse(content) as Partial<ReplyListenerPidRecord>;
+    return typeof parsed.pid === 'number' && Number.isInteger(parsed.pid) && parsed.pid > 0
+      ? { pid: parsed.pid, generation: parsed.generation, processStartIdentity: parsed.processStartIdentity }
+      : null;
+  } catch {
+    try {
+      const pid = Number.parseInt(readFileSync(PID_FILE_PATH, 'utf-8').trim(), 10);
+      return Number.isInteger(pid) && pid > 0 ? { pid } : null;
+    } catch {
       return null;
     }
-    const content = readFileSync(PID_FILE_PATH, 'utf-8');
-    return parseInt(content.trim(), 10);
-  } catch {
-    return null;
   }
 }
 
-/**
- * Write PID file with secure permissions
- */
-function writePidFile(pid: number): void {
-  writeSecureFile(PID_FILE_PATH, String(pid));
+/** Read PID only for existing liveness/status callers. */
+function readPidFile(): number | null {
+  return readPidRecord()?.pid ?? null;
+}
+
+/** Write a generation-bound PID record with secure permissions. */
+function writePidFile(record: ReplyListenerPidRecord): void {
+  writeSecureFile(PID_FILE_PATH, JSON.stringify(record));
 }
 
 /**
@@ -315,12 +341,68 @@ export function sanitizeReplyInput(text: string): string {
   return text
     .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')  // Strip control chars (keep \n, \r, \t)
     .replace(/[\u202a-\u202e\u2066-\u2069]/g, '')      // Strip bidi override characters
-    .replace(/\r?\n/g, ' ')                            // Newlines -> spaces
+    .replace(/\r\n|[\r\n]/g, ' ')                            // Newlines -> spaces
     .replace(/\\/g, '\\\\')                            // Escape backslashes
     .replace(/`/g, '\\`')                              // Escape backticks
     .replace(/\$\(/g, '\\$(')                          // Escape $()
     .replace(/\$\{/g, '\\${')                          // Escape ${}
     .trim();
+}
+
+// ============================================================================
+// Approval Gate Replies
+// ============================================================================
+
+/** Keywords that resolve an approval gate (first word of the reply, case-insensitive). */
+const APPROVAL_APPROVE_WORDS = new Set([
+  'approve', 'approved', 'yes', 'y',
+  '批准', '同意',
+]);
+const APPROVAL_DENY_WORDS = new Set([
+  'deny', 'denied', 'no', 'n', 'reject', 'rejected',
+  '拒绝', '驳回',
+]);
+
+/**
+ * Parse a reply as an approval decision. Returns null when the reply does
+ * not look like a decision (the message is then left for normal handling).
+ */
+export function parseApprovalReply(text: string): 'approved' | 'denied' | null {
+  const firstWord = text.trim().toLowerCase().split(/\s+/)[0] || '';
+  if (APPROVAL_APPROVE_WORDS.has(firstWord)) return 'approved';
+  if (APPROVAL_DENY_WORDS.has(firstWord)) return 'denied';
+  return null;
+}
+
+/**
+ * Resolve an approval gate from a platform reply.
+ *
+ * Returns the recorded decision, or null when the text is not a decision
+ * (callers should fall back to normal reply handling or ignore).
+ */
+export function handleApprovalReply(
+  approvalRef: NonNullable<SessionMapping['approvalRef']>,
+  text: string,
+  platform: string,
+): 'approved' | 'denied' | null {
+  const decision = parseApprovalReply(text);
+  if (decision === null) return null;
+  try {
+    writeApprovalDecision(
+      approvalRef.runsRoot,
+      approvalRef.runId,
+      approvalRef.activationId,
+      decision,
+      `reply:${platform}`,
+    );
+  } catch (error) {
+    // A stale or cross-session approvalRef must never throw out of the
+    // poll loop: stale entries are pruned by their 24h TTL; log and skip.
+    log(`Approval reply ignored for stale ref ${approvalRef.runId}/${approvalRef.activationId}: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
+  log(`Approval ${decision} recorded for run ${approvalRef.runId} activation ${approvalRef.activationId} via ${platform} reply`);
+  return decision;
 }
 
 // ============================================================================
@@ -533,6 +615,33 @@ async function pollDiscord(
         continue;
       }
 
+      // Approval-gate replies resolve the gate instead of injecting a pane
+      if (mapping.approvalRef) {
+        // AT-MOST-ONCE: persist offset BEFORE processing
+        state.discordLastMessageId = msg.id;
+        writeDaemonState(state);
+        const decision = handleApprovalReply(mapping.approvalRef, msg.content, 'discord');
+        if (decision !== null) {
+          // Confirmation reaction (non-critical)
+          const reaction = decision === 'approved' ? '%E2%9C%85' : '%E2%9D%8C';
+          try {
+            await fetch(
+              `https://discord.com/api/v10/channels/${config.discordChannelId}/messages/${msg.id}/reactions/${reaction}/@me`,
+              {
+                method: 'PUT',
+                headers: { 'Authorization': `Bot ${config.discordBotToken}` },
+                signal: AbortSignal.timeout(5000),
+              }
+            );
+          } catch (e) {
+            log(`WARN: Failed to add approval confirmation reaction: ${e}`);
+          }
+        } else {
+          log(`Discord reply on approval message ${msg.id} was not a decision; ignored`);
+        }
+        continue;
+      }
+
       // Rate limiting
       if (!rateLimiter.canProceed()) {
         log(`WARN: Rate limit exceeded, dropping Discord message ${msg.id}`);
@@ -687,6 +796,55 @@ async function pollTelegram(
       if (!mapping) {
         state.telegramLastUpdateId = update.update_id;
         writeDaemonState(state);
+        continue;
+      }
+
+      // Approval-gate replies resolve the gate instead of injecting a pane
+      if (mapping.approvalRef) {
+        // AT-MOST-ONCE: persist offset BEFORE processing
+        state.telegramLastUpdateId = update.update_id;
+        writeDaemonState(state);
+        const decision = handleApprovalReply(mapping.approvalRef, msg.text || '', 'telegram');
+        if (decision !== null) {
+          // Confirmation reply (non-critical)
+          try {
+            const confirmBody = JSON.stringify({
+              chat_id: config.telegramChatId,
+              text: `Approval recorded: ${decision}`,
+              reply_to_message_id: msg.message_id,
+            });
+            await new Promise<void>((resolve) => {
+              const confirmReq = httpsRequest(
+                {
+                  hostname: 'api.telegram.org',
+                  path: `/bot${config.telegramBotToken}/sendMessage`,
+                  method: 'POST',
+                  family: 4,
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(confirmBody),
+                  },
+                  timeout: 5000,
+                },
+                (res) => {
+                  res.resume();
+                  resolve();
+                }
+              );
+              confirmReq.on('error', () => resolve());
+              confirmReq.on('timeout', () => {
+                confirmReq.destroy();
+                resolve();
+              });
+              confirmReq.write(confirmBody);
+              confirmReq.end();
+            });
+          } catch (e) {
+            log(`WARN: Failed to send approval confirmation: ${e}`);
+          }
+        } else {
+          log(`Telegram reply on approval message ${msg.message_id} was not a decision; ignored`);
+        }
         continue;
       }
 
@@ -845,6 +1003,20 @@ async function pollLoop(): Promise<void> {
             if (event.thread_ts && event.thread_ts !== event.ts) {
               const mapping = lookupByMessageId('slack-bot', event.thread_ts);
               if (mapping) {
+                // Approval-gate replies resolve the gate instead of injecting a pane
+                if (mapping.approvalRef) {
+                  const decision = handleApprovalReply(mapping.approvalRef, event.text, 'slack');
+                  if (decision !== null) {
+                    try {
+                      await addSlackReaction(slackBotToken, slackChannelId, event.ts);
+                    } catch (e) {
+                      log(`WARN: Failed to add Slack approval reaction: ${e}`);
+                    }
+                  } else {
+                    log(`Slack reply on approval message ${event.thread_ts} was not a decision; ignored`);
+                  }
+                  return;
+                }
                 targetPaneId = mapping.tmuxPaneId;
                 targetMapping = mapping;
               }
@@ -1005,7 +1177,8 @@ export function startReplyListener(_config: ReplyListenerDaemonConfig): DaemonRe
 
     const pid = child.pid;
     if (pid) {
-      writePidFile(pid);
+      const generation = randomUUID();
+      writePidFile({ pid, generation });
 
       const state: ReplyListenerState = {
         isRunning: true,
@@ -1016,8 +1189,19 @@ export function startReplyListener(_config: ReplyListenerDaemonConfig): DaemonRe
         discordLastMessageId: null,
         messagesInjected: 0,
         errors: 0,
+        generation,
       };
       writeDaemonState(state);
+
+      void getProcessStartIdentity(pid).then((processStartIdentity) => {
+        if (!processStartIdentity) return;
+        const current = readDaemonState();
+        const currentPid = readPidRecord();
+        if (current?.pid !== pid || current.generation !== generation || currentPid?.generation !== generation) return;
+        current.processStartIdentity = processStartIdentity;
+        writeDaemonState(current);
+        writePidFile({ pid, generation, processStartIdentity });
+      }).catch(() => {});
 
       log(`Reply listener daemon started with PID ${pid}`);
 
@@ -1041,51 +1225,71 @@ export function startReplyListener(_config: ReplyListenerDaemonConfig): DaemonRe
   }
 }
 
-/**
- * Stop the reply listener daemon
- */
-export function stopReplyListener(): DaemonResponse {
-  const pid = readPidFile();
+/** Stop only the exact live listener generation; never signal a reused PID. */
+export async function stopReplyListener(): Promise<DaemonResponse> {
+  const record = readPidRecord();
+  if (!record) return { success: true, message: 'Reply listener daemon is not running' };
 
-  if (pid === null) {
-    return {
-      success: true,
-      message: 'Reply listener daemon is not running',
-    };
+  if (!isProcessAlive(record.pid)) {
+    removePidFile();
+    return { success: true, message: 'Reply listener daemon was not running (cleaned up stale PID file)' };
   }
 
-  if (!isProcessAlive(pid)) {
-    removePidFile();
-    return {
-      success: true,
-      message: 'Reply listener daemon was not running (cleaned up stale PID file)',
-    };
+  const state = readDaemonState();
+  if (
+    !record.generation ||
+    !record.processStartIdentity ||
+    state?.pid !== record.pid ||
+    state.generation !== record.generation ||
+    state.processStartIdentity !== record.processStartIdentity
+  ) {
+    return { success: false, message: 'Refusing to stop listener without an exact live identity' };
+  }
+
+  // Revalidate under the registry lock. It is held through termination so a
+  // concurrent registration cannot be accepted for a listener we are stopping.
+  const emptyRegistryLock = lockRegistryIfEmpty();
+  if (emptyRegistryLock === 'active') {
+    return { success: true, message: 'Reply listener retained for active sessions', state };
+  }
+  if (emptyRegistryLock === null) {
+    return { success: false, message: 'Could not durably verify an empty reply registry' };
   }
 
   try {
-    process.kill(pid, 'SIGTERM');
-    removePidFile();
-
-    const state = readDaemonState();
-    if (state) {
-      state.isRunning = false;
-      state.pid = null;
-      writeDaemonState(state);
+    const deadlineAt = Date.now() + 500;
+    const liveness = await isProcessIdentityLive(record.pid, record.processStartIdentity, deadlineAt);
+    if (liveness !== 'live') {
+      return {
+        success: liveness === 'dead',
+        message: liveness === 'dead'
+          ? 'Reply listener was not running'
+          : 'Refusing to stop listener after identity revalidation failed',
+      };
     }
 
-    log(`Reply listener daemon stopped (PID ${pid})`);
-
-    return {
-      success: true,
-      message: `Reply listener daemon stopped (PID ${pid})`,
-      state: state ?? undefined,
-    };
+    const termination = await terminateOwnedProcessTree({
+      pid: record.pid,
+      expectedStartIdentity: record.processStartIdentity,
+      deadlineAt: new Date(deadlineAt).toISOString(),
+    });
+    if (termination !== 'terminated' && termination !== 'already-dead') {
+      return { success: false, message: 'Refusing to stop listener after termination identity revalidation failed' };
+    }
+    removePidFile();
+    state.isRunning = false;
+    state.pid = null;
+    writeDaemonState(state);
+    log(`Reply listener daemon stopped (PID ${record.pid})`);
+    return { success: true, message: `Reply listener daemon stopped (PID ${record.pid})`, state };
   } catch (error) {
     return {
       success: false,
       message: 'Failed to stop daemon',
       error: error instanceof Error ? error.message : String(error),
     };
+  } finally {
+    emptyRegistryLock();
   }
 }
 

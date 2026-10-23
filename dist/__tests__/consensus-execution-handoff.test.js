@@ -192,6 +192,63 @@ describe('Issue #595: Consensus mode execution handoff', () => {
         });
     });
 });
+describe('Issue #3617: consensus reviews are parallel-or-sequential and independent (Issue #4355)', () => {
+    beforeEach(() => {
+        clearSkillsCache();
+    });
+    const contractLiterals = [
+        'same fixed plan snapshot produced by Planner in step 1',
+        'Architect output MUST NOT be passed to Critic',
+        'Critic MUST NOT consume or receive the Architect review',
+        'combined only by Planner during revision or improvement synthesis',
+        'only after both reviews have completed',
+        // Issue #4355: Context-dependent execution
+        'parallel-or-sequential',
+        'MAY run in parallel as background subagents',
+        'MUST run sequentially',
+        'external provider',
+        'rate-limit',
+    ];
+    for (const skillName of ['omc-plan', 'ralplan']) {
+        it(`${skillName} documents the parallel-or-sequential and independent review contract`, () => {
+            const skill = getBuiltinSkill(skillName);
+            expect(skill).toBeDefined();
+            const workflowStart = skill.template.indexOf('The consensus workflow:');
+            const workflowEnd = skill.template.indexOf('\n## Pre-Execution Gate', workflowStart);
+            const workflow = skillName === 'omc-plan'
+                ? extractSection(skill.template, 'Consensus Mode')
+                : workflowStart === -1 || workflowEnd === -1 ? undefined : skill.template.slice(workflowStart, workflowEnd);
+            expect(workflow).toBeDefined();
+            const consensusWorkflow = workflow;
+            for (const literal of contractLiterals) {
+                expect(consensusWorkflow).toContain(literal);
+            }
+            const architectIdx = consensusWorkflow.indexOf('3. **Architect** reviews');
+            const criticIdx = consensusWorkflow.indexOf('4. **Critic** evaluates');
+            const reReviewIdx = consensusWorkflow.indexOf('5. **Re-review loop**');
+            const joinIdx = consensusWorkflow.indexOf('combined only by Planner during revision or improvement synthesis');
+            expect(architectIdx).toBeGreaterThan(-1);
+            expect(criticIdx).toBeGreaterThan(architectIdx);
+            expect(reReviewIdx).toBeGreaterThan(criticIdx);
+            expect(joinIdx).toBeGreaterThan(criticIdx);
+            const architectStep = consensusWorkflow.slice(architectIdx, criticIdx);
+            const criticStep = consensusWorkflow.slice(criticIdx, reReviewIdx);
+            expect(architectStep).toContain('same fixed plan snapshot produced by Planner in step 1');
+            expect(architectStep).toContain('Architect output MUST NOT be passed to Critic');
+            expect(criticStep).toContain('same fixed plan snapshot');
+            expect(criticStep).toContain('Critic MUST NOT consume or receive the Architect review');
+            expect(consensusWorkflow).not.toMatch(/Architect output (?:is|will be|shall be) (?:passed|forwarded|handed|provided) (?:to|into)/i);
+            expect(consensusWorkflow).not.toMatch(/Critic (?:receives|consumes|uses|relies on) (?:the )?Architect (?:output|review)/i);
+            expect(consensusWorkflow).not.toMatch(/Critic (?:is|will be|shall be) (?:provided|handed|forwarded) (?:the )?Architect (?:output|review)/i);
+            // Issue #4355: Parallel execution allowed for Claude agents, sequential required for external providers
+            expect(consensusWorkflow).toContain('parallel-or-sequential');
+            expect(consensusWorkflow).toContain('MAY run in parallel as background subagents');
+            expect(consensusWorkflow).toContain('MUST run sequentially');
+            expect(consensusWorkflow).toContain('external provider');
+            expect(consensusWorkflow).toContain('rate-limit');
+        });
+    }
+});
 describe('Issue #2945: planning modules require explicit execution consent', () => {
     beforeEach(() => {
         clearSkillsCache();

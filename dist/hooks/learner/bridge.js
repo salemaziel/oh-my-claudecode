@@ -10,7 +10,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, realpathSync, } from "fs";
 import { join, dirname, basename } from "path";
 import { homedir } from "os";
-import { OmcPaths } from "../../lib/worktree-paths.js";
+import { OmcPaths, getOmcRoot } from "../../lib/worktree-paths.js";
 import { parseYamlMetadata } from "./parser.js";
 import { expandTriggers } from "./transliteration-map.js";
 // Re-export constants
@@ -128,8 +128,6 @@ function summarizeSkillContent(content) {
         .find((line) => line && !line.startsWith("---"));
     return (firstUsefulLine || content.replace(/\s+/g, " ").trim()).slice(0, 240);
 }
-/** State file path */
-const STATE_FILE = `${OmcPaths.STATE}/skill-sessions.json`;
 // =============================================================================
 // Session Cache (File-Based)
 // =============================================================================
@@ -137,7 +135,7 @@ const STATE_FILE = `${OmcPaths.STATE}/skill-sessions.json`;
  * Get state file path for a project.
  */
 function getStateFilePath(projectRoot) {
-    return join(projectRoot, STATE_FILE);
+    return join(getOmcRoot(projectRoot), "state", "skill-sessions.json");
 }
 /**
  * Read session state from file.

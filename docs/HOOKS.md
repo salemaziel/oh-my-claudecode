@@ -47,7 +47,7 @@ Handle orchestration, keyword detection, and mode persistence.
 | Hook | Description |
 |------|-------------|
 | keyword-detector | Detects magic keywords and activates corresponding skills |
-| persistent-mode | Enforces continuation when an execution mode (ralph, autopilot, ultrawork, etc.) is active — injects reinforcement messages on Stop to prevent premature halting |
+| persistent-mode | Enforces continuation when an execution mode (ralph, autopilot, team, etc.) is active — injects reinforcement messages on Stop to prevent premature halting |
 
 ### Context Management Hooks
 
@@ -68,7 +68,7 @@ Handle code quality, permissions, and subagent tracking.
 | permission-handler | Handles permission requests and validation |
 | subagent-tracker | Tracks subagent spawn and completion |
 | code-simplifier | Auto-simplifies recently modified files on Stop (opt-in) |
-| workflow-drift-guard | Blocks only deterministic Stop-hook workflow drift: structured-question drift and fake completion with changed-code TODO/stub/skipped-test blockers |
+| workflow-drift-guard | Blocks only closed, local Stop-hook selection forks with two known-live alternatives and unchanged fake-completion blockers |
 
 ## Disabling Hooks
 
@@ -98,10 +98,12 @@ Fires when the user submits a prompt.
 
 | Script | Role | Timeout |
 |--------|------|---------|
-| `keyword-detector.mjs` | Detects magic keywords and invokes the corresponding skill | 5s |
-| `skill-injector.mjs` | Injects skill prompts | 3s |
+| `keyword-detector.mjs` | Detects magic keywords and invokes the corresponding skill | 30s outer host fuse; 8s trusted Worker limit |
+| `skill-injector.mjs` | Injects skill prompts | 30s outer host fuse; 12s trusted Worker limit |
 
-Runs on all user input (`matcher: "*"`). When the keyword detector finds keywords like "ultrawork", "ralph", or "autopilot", it injects the corresponding skill invocation instruction via `additionalContext`.
+Runs on all user input (`matcher: "*"`). When the keyword detector finds keywords like "ralph" or "autopilot", it injects the corresponding skill invocation instruction via `additionalContext`. Parallel work is invoked explicitly with `/oh-my-claudecode:team` and is not auto-detected.
+
+The 30s timeout is a per-command outer host fuse that includes launcher startup before `run.cjs`. Once the runner reaches its exact trusted Worker branch, `keyword-detector.mjs` is limited to 8s and `skill-injector.mjs` to 12s; lower manifest limits are never extended. A command that never reaches `run.cjs` can consume its full 30s outer fuse. The host schedules the two commands externally, so this does not claim an aggregate prompt latency.
 
 ### SessionStart
 
@@ -122,9 +124,11 @@ Fires immediately before Claude uses a tool.
 
 | Script | Role | Timeout |
 |--------|------|---------|
-| `pre-tool-enforcer.mjs` | Validates rules before tool use | 3s |
+| `pre-tool-enforcer.mjs` | Validates rules before tool use | 5s |
 
 Runs on all tool calls (`matcher: "*"`). Enforces agent permission restrictions (e.g., blocking Write/Edit for read-only agents).
+Denies Task/Agent calls whose `subagent_type` names a bundled skill (issue #3667): instead of Claude Code's generic native "Agent type not found", the hook returns a precise error naming the Skill tool and the correct identifier, and forbids closest-match agent substitution.
+The exact canonical shipped script runs in the trusted Worker path; untrusted paths, event mismatches, and extra arguments retain the isolated child-process fallback.
 
 ### PermissionRequest
 
@@ -142,10 +146,13 @@ Fires after a tool use completes.
 
 | Script | Role | Timeout |
 |--------|------|---------|
-| `post-tool-verifier.mjs` | Verifies tool results and injects additional context | 3s |
+| `post-tool-verifier.mjs` | Verifies tool results and injects additional context | 5s |
 | `project-memory-posttool.mjs` | Updates project memory | 3s |
+| `post-tool-rules-injector.mjs` | Injects matching project rules | 3s |
+| `post-tool-directory-context-injector.mjs` | Injects the README.md and AGENTS.md files from the file's directory up to the working directory, for Read, Write, Edit, and MultiEdit | 3s |
 
 Injects additional guidance based on Read, Write, Edit, and Bash results. For example, after reading a file it may hint "consider using parallel reads."
+These exact canonical shipped scripts use the trusted Worker path without changing their manifest timeout budgets. The verifier retains statistics for the current session and the 99 most recently updated historical sessions so per-tool writes stay bounded. Disable all four with `DISABLE_OMC=1` (or `DISABLE_OMC=true`) or `OMC_SKIP_HOOKS=post-tool-use`; `project-memory-posttool` also accepts its script-specific token.
 
 ### PostToolUseFailure
 
@@ -185,7 +192,7 @@ Fires immediately before context compaction.
 | `pre-compact.mjs` | Preserves state before compaction | 10s |
 | `project-memory-precompact.mjs` | Preserves project memory | 5s |
 
-Saves important state and memory before compaction runs because the context window is full.
+Saves important state and memory before compaction runs because the context window is full. The checkpoint captures active mode states, TODO counts, background job status, and durable plan anchors (PRD/boulder references). After compaction, the `SessionStart` hook (`source: "compact"`) restores the newest matching checkpoint into context so OMC-owned plan detail survives compaction (issue #3730).
 
 ### Stop
 
@@ -195,10 +202,10 @@ Fires when Claude finishes a response.
 |--------|------|---------|
 | `context-guard-stop.mjs` | Monitors context usage | 5s |
 | `workflow-drift-guard.mjs` | Blocks narrow structured-question and fake-completion drift | 3s |
-| `persistent-mode.cjs` | Maintains active mode state (ralph, ultrawork, etc.) | 10s |
+| `persistent-mode.mjs` | Maintains active mode state (ralph, team, etc.) | 10s |
 | `code-simplifier.mjs` | Auto-simplifies modified files (opt-in) | 5s |
 
-`persistent-mode` injects a reinforcement message like "The boulder never stops" when an active execution mode is running, prompting continued work.
+`persistent-mode` injects a reinforcement message like "The boulder never stops" when an active execution mode is running, prompting continued work. A fresh unconfirmed ultragoal is exempt while Claude `/goal` confirmation is pending; confirmed runs remain fail-closed.
 
 ### SessionEnd
 
@@ -222,34 +229,63 @@ Detects magic keywords in user prompts and invokes the corresponding skill.
 
 - **Event**: UserPromptSubmit
 - **Behavior**: Sanitizes the prompt (removes code blocks, URLs, file paths) then matches keyword patterns
-- **Conflict resolution**: cancel has highest priority, then ralph > autopilot > ultrawork
+- **Conflict resolution**: cancel has highest priority, then ralph > autopilot
+
 - **Safety**: Disabled inside team workers to prevent infinite spawning
 
 See the [Magic Keywords](#magic-keywords) section for the full keyword list.
-
 
 #### workflow-drift-guard
 
 Blocks only deterministic recurring workflow drift at the Claude Code `Stop` lifecycle point. The boundary follows the official Claude Code [hooks reference](https://code.claude.com/docs/en/hooks): Stop hooks receive `last_assistant_message`, may return `decision: "block"` with a `reason`, and must account for `stop_hook_active` to avoid self-reinforcing loops. Plugin/Hookify installs follow the official Claude Code [plugins reference](https://code.claude.com/docs/en/plugins-reference): plugin hooks can live in `hooks/hooks.json` at the plugin root and respond to the same lifecycle events as user hooks.
 
 - **Event**: Stop
-- **Behavior**: Blocks when the final assistant message ends with a narrow preference/approval question that should be asked via structured `AskUserQuestion`; the reason tells Claude to use 2-4 options and keep `allowOther` enabled unless free-form input is unsafe.
-- **Fake completion guard**: Blocks only when the final assistant message claims completion and changed code adds deterministic blockers (`test.skip`/`.only`, placeholder TODOs, unimplemented throws, placeholder returns, or explicit stub/placeholder implementations).
-- **Allowed cases**: Free-form/`Other` question wording is allowed; TODO/stub markers are allowed while the assistant is not claiming completion; `stop_hook_active` fails open to avoid hook loops.
+- **Behavior**: Blocks only a supported, local selection fork in the final assistant message. The block reason directs Claude to use `AskUserQuestion` with 2–4 options and `allowOther` unless free-form input is unsafe.
+- **Fake completion guard**: Unchanged. It blocks only when the final assistant message claims completion and changed code adds deterministic blockers (`test.skip`/`.only`, placeholder TODOs, unimplemented throws, placeholder returns, or explicit stub/placeholder implementations).
+
+##### Closed selection evidence
+
+The decision classifier is stateless and final-message-local. `last_assistant_message` takes precedence; only when it is absent does it use `lastAssistantMessage`, `message`, `output`, `response`, then `text`. It does not use transcript content, prior `AskUserQuestion` calls, firing history, counters, cooldowns, or session state. It masks recognized non-prose before extracting the final unmasked question and blocks only when exactly one of these three source-associated evidence forms independently establishes selection intent and at least two known-live alternatives:
+
+1. **Direct binary question**: either a bare `<single name> or <single name>?` with exactly one top-level ASCII ` or ` delimiter, `Would you prefer <1–6-token named operand> or <1–6-token named operand>?`, `Do you prefer <1–6-token named operand> or <1–6-token named operand>?`, or `Should I <1–8-token action operand> or <1–8-token action operand>?`. Unsupported prefixes, polarity/auxiliary forms, duplicate alternatives, multiple delimiters, or `and`/`or` grouping are not inferred.
+2. **One exact adjacent setup plus one selection closer**: the final question must immediately follow exactly one supported setup sentence and use an exact closer: `Which [option|approach|path|one] should I [choose|use|take]?` or `Which should I [choose|use|take]?`. A named setup enumerates exactly two (`C and C`), three (`C, C, and C`), or four (`C, C, C, and C`) candidates. Its `ENUMERATION` core ends in exactly `are viable options`, `are viable`, `are options`, or `were considered`. The full setup is then exactly `<ENUMERATION>.`, `<ENUMERATION>; <C> is|was <status>[ and <C> is|was <status>].`, `<ENUMERATION>; only <C> remains.`, `<ENUMERATION>; the other module is unchanged.`, `<ENUMERATION>, or <paste|provide|enter> the exact <operand>.`, or `<ENUMERATION>, or describe <operand>.` Named liveness statuses are exactly `ruled out`, `eliminated`, `discarded`, `not viable`, `no longer an option`, `already chosen`, `already selected`, and `already resolved`. A named candidate is 1–4 exact `NAME_TOKEN`s (`[A-Za-z0-9][A-Za-z0-9._/+:-]*`) separated by one ASCII space, after at most one balanced outer emphasis pair is removed. The parser enumerates every full-string syntactic parse before normalization; zero or multiple parses pass. Only after one parse is established are normalized duplicate identities collapsed, and only compatible states may merge—conflicting duplicate states are unknown and pass.
+3. **One exact contiguous option list plus one selection closer**: at least two supported `- `, `* `, `+ `, numeric (`1.`–`9.`), or alphabetic (`A.`–`Z.`/`a.`–`z.`) items must be contiguous and directly followed by that closer; blank lines are allowed only between items. Items may use only the exact eliminated-status suffixes `ruled out`, `eliminated`, `discarded`, `not viable`, or `no longer an option`, in an em-dash or parenthesized form. Any other marker, suffix, or intervening non-item prose passes.
+
+All candidate-bearing records use the same rules. Empty candidates and exact `this`, `that`, `it`, `something`, `yes`, `no`, and `not` do not count; valid candidates start live; exact supported statuses can eliminate them; and exact `only C remains` keeps that candidate live while eliminating its named peers. A record blocks only with at least two unique, substantive, known-live identities after compatible duplicate collapse. An unlinked, ambiguous, conflicting, or unknown candidate state passes.
+
+An offered candidate normalized exactly as `other` or `other/free-form` always takes precedence and makes its binary, named-setup, or list record pass. The named-setup free-form productions (`or paste`, `provide`, or `enter the exact …`, or `describe …`) also pass. Conversely, the exact local suffix `; the other module is unchanged.` is ignored non-evidence: it neither supplies an alternative nor triggers the `Other` escape.
+
+Cardinality is candidate-free: exact `I found two viable [paths|options|approaches].`, `There are two viable [paths|options|approaches].`, and `Two viable [paths|options|approaches] remain.` setups establish a minimum of two live alternatives when directly paired with a selection closer. The only reduction is the exact matching-noun sentence `<I found|There are> two viable <plural>, but one <singular> <is|was> <status>.`; its status may be `ruled out`, `eliminated`, `discarded`, `not viable`, `no longer an option`, `resolved`, `already chosen`, `already selected`, or `already resolved`, including `was resolved`. That makes cardinality unknown and passes unless the exact matching-noun re-establishment sentence `One <singular> <is|was> <status>; two viable <plural> remain.` restores two. `Only one path|option|approach remains.` creates no cardinality evidence. The guard never invents candidate names from cardinality.
+
+Ambiguous-regex and malformed-ternary uncertainty is bounded to the current physical line using half-open UTF-16 source ranges. Uncertainty intersecting or following a record passes; uncertainty ending before the record does not suppress it. Unlisted syntax, malformed or overlapping parses, unsupported open-input wording, uncertain boundaries, and any attempt to combine candidates, cardinality, liveness, intent, or free-form evidence across records all fail open.
+
+- **Unchanged pass behavior**: Free-form/`Other` cases, TODO/stub markers without a completion claim, `stop_hook_active` re-entry, environment skips, and exception handling fail open as before.
 - **Minimal safe boundary**: Worktree/session continuity remains SessionStart guidance plus existing mode-state restoration because a generic Stop hook cannot safely infer that the assistant is in the wrong branch or has lost context without overblocking valid work.
 
 #### persistent-mode
 
-Enforces continuation when an execution mode is active. This is the hook that keeps skills like autopilot, ralph, and ultrawork running.
+Enforces continuation when an execution mode is active. This is the hook that keeps skills like autopilot, ralph, and team running.
 
 - **Event**: Stop
-- **Behavior**: Checks `.omc/state/` for active mode state files. If any mode (ralph, ultragoal, autopilot, ultrawork, ultraqa, team, pipeline) is active, injects a reinforcement message to prevent Claude from stopping.
+- **Behavior**: Checks `.omc/state/` for active mode state files. If any current mode (ralph, ultragoal, autopilot, team) or legacy/retired state (ultrawork, pipeline) is active, injects a reinforcement message to prevent Claude from stopping.
+
 - **Reinforcement message**: "The boulder never stops" — prompts Claude to continue working
 - **Staleness check**: States older than 2 hours are treated as inactive to prevent stale state from blocking new sessions
 - **Notification**: Sends Discord/Telegram/Slack notification on first stop (if configured)
 - **Cancel**: Use `/oh-my-claudecode:cancel` to deactivate modes
 
-> **Note**: autopilot, ralph, ultrawork, and ultraqa are **skills** (invoked via keyword-detector), not hooks. The persistent-mode hook is what enforces their continuation by blocking the Stop event.
+> **Note**: autopilot, ralph, and team are **skills** (invoked through their current skill surfaces), not hooks. Legacy/retired `ultrawork` and `pipeline` state is cleanup-only and must never be invoked or reactivated. The persistent-mode hook enforces continuation by blocking the Stop event.
+
+#### budget-guard (`budget-guard.mjs`)
+
+Enforces `OMC_RUN_BUDGET_TOKENS` for unattended sessions: when an active unattended mode (ralph, autopilot, team, ultragoal) is running and the session's token spend crosses the budget, the hook blocks the Stop event and sends the model back to finish with a resumable budget report.
+
+On a Stop re-entry (`stop_hook_active` or `stopHookActive`), it records a pass and never blocks again, avoiding a self-reinforcing loop.
+
+- **Event**: Stop
+- **Token accounting**: sums the latest usage snapshot for each assistant message in a bounded tail (2 MB) of the session transcript, including cache tokens. Repeated records are deduplicated by `message.id`, falling back to `requestId`; records without either ID are counted individually. The bounded tail can undercount a long session. A missing or unreadable transcript degrades to a logged pass; the hook never blocks on absent evidence.
+- **Rollout (tri-state, mirrors the jev off/shadow/active protocol)**: `OMC_BUDGET_ENFORCE=off` does nothing; `shadow` (default) logs judgments to `.omc/state/enforcement/shadow.jsonl` and never blocks or warns; `active` warns at 90% (system message) and blocks at 100% (exit 2, budget-report contract in the refusal).
+- **Evidence**: every judgment is appended to the shadow log (`{ts, rule, mode, outcome, detail, latencyMs}`) — the promotion evidence for moving the default from shadow to active. A rule promotes only after enough samples with zero false blocks.
 
 ### Mode State Management
 
@@ -259,7 +295,7 @@ Execution mode hooks manage state files in the `.omc/state/` directory.
 {
   "active": true,
   "started_at": "2025-01-15T10:30:00Z",
-  "prompt": "ultrawork implement auth",
+  "prompt": "ralph implement auth",
   "session_id": "abc123",
   "project_path": "/path/to/project",
   "iteration": 0,
@@ -269,17 +305,19 @@ Execution mode hooks manage state files in the `.omc/state/` directory.
 }
 ```
 
-When a session ID is present, state is stored in session scope under `.omc/state/sessions/{sessionId}/`.
+The `linked_ultrawork` field is a legacy state field retained for compatibility with retired state files; it is not an invocable mode.
 
+When a session ID is present, state is stored in session scope under `.omc/state/sessions/{sessionId}/`.
 
 #### ultragoal-state.json lifecycle
 
 `ultragoal-state.json` is the session-scoped Stop/PreToolUse guard for `$ultragoal` runs. The durable plan and audit trail remain `.omc/ultragoal/goals.json` and `.omc/ultragoal/ledger.jsonl`; the state file only records the active runtime guard.
 
 - **Location**: `.omc/state/sessions/{sessionId}/ultragoal-state.json` when a Claude session id is available; legacy fallback is `.omc/state/ultragoal-state.json`.
-- **Active fields**: `active: true`, `session_id`, `project_path`, `started_at`, `last_checked_at`, `current_phase`, optional `claude_goal_objective`, and `reinforcement_count`.
-- **Stop hook**: reinforces only when the state is active, fresh (within the normal 2-hour mode-state freshness window), session-matching, and project-matching. Terminal phases (`complete`, `completed`, `done`, `all-done`, `failed`, `cancelled`) and all-done `.omc/ultragoal/goals.json` plans are ignored.
-- **PreToolUse guard**: while active, tools are denied unless the hook can see a matching active Claude `/goal` snapshot. Use `ALLOW_ULTRAGOAL_WITHOUT_GOAL=1` only as an intentional local bypass.
+- **Active fields**: `active: true`, `session_id`, `project_path`, `started_at`, `last_checked_at`, `current_phase`, optional `claude_goal_objective`, `reinforcement_count`, `awaiting_confirmation`, and `awaiting_confirmation_set_at`.
+- **Pending confirmation**: a fresh unconfirmed state is exempt from both Stop reinforcement and matching-`/goal` PreToolUse enforcement. Freshness requires `awaiting_confirmation: true` and a timestamp age in `[0, 2 minutes)`; a non-empty `awaiting_confirmation_set_at` is authoritative, while an absent or blank value may fall back to `started_at`. Invalid, future, or expired timestamps fail closed.
+- **Stop hook**: after confirmation, reinforces only when the state is active, fresh (within the normal 2-hour mode-state freshness window), session-matching, and project-matching. Terminal phases (`complete`, `completed`, `done`, `all-done`, `failed`, `cancelled`) and all-done `.omc/ultragoal/goals.json` plans are ignored.
+- **PreToolUse guard**: after confirmation, tools are denied unless the hook can see a matching active Claude `/goal` snapshot. Use `ALLOW_ULTRAGOAL_WITHOUT_GOAL=1` only as an intentional local bypass.
 - **Completion**: after the final quality gate and ultragoal checkpoint, mark the state inactive or run `/oh-my-claudecode:cancel` so the state file is cleared with other workflow state.
 
 #### Canceling a Mode
@@ -294,7 +332,26 @@ or
 /oh-my-claudecode:cancel
 ```
 
-`cancel` removes state files for all active modes: ralph, autopilot, ultrawork, and any others.
+`cancel` removes state files for all active modes: ralph, autopilot, team, and any others; it also clears legacy/retired `ultrawork` state.
+
+#### Git Guardrails (`git-guardrails.mjs`)
+
+A PreToolUse hook (matcher: `Bash`) that checks shell command positions and blocks destructive Git operations from agent-driven Bash calls with an authority message. It scans commands separated by shell chains and newlines, so a destructive command is still blocked when it follows a safe command. Quoted arguments and ordinary text commands such as `echo git push` are not mistaken for Git invocations. Git's global options before the subcommand are skipped, including `-C <dir>`, `-c key=value`, `--git-dir`/`--work-tree` (in `=` or separate-word form), `--no-pager`/`-P`, and the other flags `git help git` lists, so `git --no-pager push` is blocked like `git push`.
+
+- **Enable**: Set `OMC_GIT_GUARDRAILS=1` to enable in any session. The guard also auto-enables when the canonical state resolver finds an active ralph, autopilot, team, or ultragoal state owned by the current session. If the payload has no session ID, auto-enable fails open rather than borrowing another session's legacy state. `OMC_GIT_GUARDRAILS=0` disables both activation paths; otherwise the hook fails open when no active mode is found.
+- **Blocked operations**: non-dry-run `git push`, `git reset --hard`, non-dry-run `git clean -f/--force`, forced branch deletion (`git branch -D`, `-d --force`, or `--force --delete` in either order), and `git checkout .` / `git checkout -- .` or `git restore .` (working-tree discard). The hook ignores Git option-looking arguments after `--`; those are refspecs or pathspecs, not options.
+- **Safe operations**: `git push --dry-run` / `git push -n`, clean dry-runs (`git clean -n`, including `git clean -n -- -f`), soft resets, non-forced branch deletes (`-d`), and path-specific checkout/restore commands such as `git checkout ./path` and `git restore ./file` pass. Malformed, absent, or command-less payloads fail open. An unset guard variable outside an active mode also fails open after a bounded stdin read; explicit `=0` exits before reading stdin.
+- **Message**: the hook refuses with “You do not have authority for this operation” and names the two legitimate exits — the user runs it themselves, or explicitly sets `OMC_GIT_GUARDRAILS=0`. When auto-enabled by an active mode, the refusal names the mode.
+- **Prove it bites**: before trusting the guardrail in a session, feed it a planted violation once and watch it block (see the `refit` skill's landing rule). An installed guardrail nobody has seen fire is decoration, not protection.
+
+#### Stale Run Reporter (`stale-run-reporter.mjs`)
+
+A SessionStart hook: the unattended-run **watchdog**. It scans the resolved `.omc` state root for persistent unattended-mode state files — ralph, autopilot, team, ultragoal — left `active: true` with a stale mtime (the signature of a run whose process died mid-flight), and surfaces them as advisory `[STALE RUN]` context naming the mode, approximate age, and state path.
+
+- **Threshold**: 2 hours of mtime silence (matching the persistent-mode freshness window); tunable via `OMC_STALE_RUN_HOURS`.
+- **Coverage**: both layouts — legacy `.omc/state/<mode>-state.json` and session-scoped `.omc/state/sessions/<sessionId>/<mode>-state.json`. The starting session's own state is excluded; malformed state files are ignored, never findings.
+- **Doctrine**: the watchdog observes and reports only. It never mutates state, never resumes a run, and never infers approval — reclaiming a dead run (`/oh-my-claudecode:cancel` to clean up, or re-entering the mode to resume from artifacts) is always a human decision.
+
 
 ---
 
@@ -392,8 +449,6 @@ These keywords invoke a skill and create a state file.
 | `cancelomc`, `stopomc` | cancel | Cancels all active modes |
 | `ralph`, `don't stop`, `must complete`, `until done` | ralph | Persistent execution until verification completes |
 | `autopilot`, `build me`, `I want a`, `handle it all`, `end to end`, `auto-pilot`, `full auto`, `fullsend`, `e2e this` | autopilot | Fully autonomous execution |
-| `ultrawork`, `ulw`, `uw` | ultrawork | Maximum parallel execution |
-| `ccg`, `claude-codex-gemini` | ccg | Claude-Codex-Gemini tri-model orchestration (use `antigravity` workers when using the Antigravity CLI) |
 | `ralplan` | ralplan | Consensus-based iterative planning |
 | `deep interview`, `ouroboros` | deep-interview | Socratic deep interview |
 
@@ -447,17 +502,15 @@ When multiple keywords are detected simultaneously, they resolve by the followin
 cancel  (highest priority, exclusive)
   → ralph
     → autopilot
-      → ultrawork
-        → ccg
-          → ralplan
-            → deep-interview
-              → ai-slop-cleaner
-                → tdd
-                  → code-review
-                    → security-review
-                      → ultrathink
-                        → deepsearch
-                          → analyze
+      → ralplan
+        → deep-interview
+          → ai-slop-cleaner
+            → tdd
+              → code-review
+                → security-review
+                  → ultrathink
+                    → deepsearch
+                      → analyze
 ```
 
 `cancel` is exclusive — it ignores all other matches and only runs the cancel action. All other keywords can be matched together and are processed in priority order.
@@ -471,7 +524,7 @@ cancel  (highest priority, exclusive)
 autopilot: implement user authentication with OAuth
 
 # Parallel execution
-ultrawork write all tests for this module
+/oh-my-claudecode:team 3:executor "write all tests for this module"
 
 # Persistent execution
 ralph refactor this authentication module
@@ -488,8 +541,241 @@ stopomc
 
 ### Note on the `team` Keyword
 
-`team` is not auto-detected. It must be invoked explicitly via the `/team` slash command to prevent infinite spawning.
+`team` is not auto-detected. It must be invoked explicitly via the `/oh-my-claudecode:team` slash command to prevent infinite spawning.
 
 ```
 /oh-my-claudecode:team 3:executor "build a fullstack todo app"
 ```
+
+---
+
+## Jev Judgment Points
+
+**Jev** is a System One API (TypeSafe) that provides calibrated decision-making for OMC's orchestration points. It replaces keyword lists and heuristics for critical decisions like skill triggering, model-tier routing, loop continuation, and context pruning.
+
+### Zero Egress by Default
+
+Jev is **zero egress** — nothing is sent anywhere without explicit configuration:
+- No `TYPESAFE_API_KEY` → Jev is disabled; all points run heuristic twins
+- No `OMC_JEV` configuration → no points are opted in; even with a key, zero requests are sent
+- Heuristic fallback → if Jev times out, is unavailable, or over budget, every point runs its heuristic twin and workflows never block on Jev
+
+### Configuration
+
+Enable Jev with two environment variables:
+
+```bash
+# 1. Authenticate to TypeSafe (required, but not sufficient on its own)
+export TYPESAFE_API_KEY="your-api-key"
+
+# 2. Explicitly opt in to judgment points
+export OMC_JEV="point1,point2:active,all"
+```
+
+#### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TYPESAFE_API_KEY` | (absent) | API key for TypeSafe System One. Required to enable Jev; the key alone does not enable any points. |
+| `OMC_JEV` | (absent) | Per-point opt-in: `point`, `point:active`, `all` (every point, shadow), or `all:active` (every point, active). Comma-separated; unknown point names are ignored. |
+| `OMC_JEV_TIMEOUT_MS` | `2000` | Per-call timeout in milliseconds (single round-trip measured at 465–605 ms; default allows margin). |
+| `OMC_JEV_MAX_REQUESTS` | `0` (unlimited) | Maximum Jev requests per process. When reached, heuristic twins run for remaining calls. |
+| `OMC_JEV_EXCERPT_CHARS` | `200` | Maximum string length sent in state and shadow log. Recursively bounds all strings in the judgment payload. |
+| `OMC_JEV_ENDPOINT` | `https://api.typesafe.ai/v1/systemone` | Override for stub servers or tests. |
+| `OMC_JEV_LOG_DIR` | `.omc/state/jev` | Shadow-log directory override (test only). |
+| `OMC_JEV_QUIET` | (unset) | Set to `1` to silence the env-activation stderr warning. |
+| `OMC_JEV_PLAN_MODE` | (unset) | Behavior while Claude Code is in plan mode (`permission_mode: "plan"`): `shadow` runs every opted-in point in shadow, `off` disables every point. Unset or any other value changes nothing. See [Plan mode](#plan-mode). |
+| `OMC_JEV=off` | — | Master switch: disables every point regardless of key or other config. |
+
+#### Point Activation Syntax
+
+`OMC_JEV` accepts comma-separated entries with three syntax forms:
+
+```bash
+# Shadow mode (Jev runs but decision is not used, heuristic twin is authoritative)
+export OMC_JEV="intent,model-routing,task-size"
+
+# Active mode (Jev decision is used if blocking; non-blocking points fire-and-record)
+export OMC_JEV="intent:active,model-routing:active"
+
+# Wildcard: all registered points in shadow
+export OMC_JEV="all"
+
+# Wildcard: all registered points in active
+export OMC_JEV="all:active"
+
+# Master disable
+export OMC_JEV="off"
+```
+
+Unknown point names are ignored. Activation unions across sources: code-time `ACTIVATED_POINTS` (empty in every release) plus env `:active` suffix; either source activates a point.
+
+#### Plan mode
+
+`OMC_JEV` applies to every Claude Code permission mode. To keep Jev from deciding while Claude Code is in plan mode, set `OMC_JEV_PLAN_MODE`:
+
+```bash
+# Active outside plan mode; in plan mode Jev is still called and logged, but the heuristic decides
+export OMC_JEV="all:active"
+export OMC_JEV_PLAN_MODE="shadow"
+
+# No Jev requests at all while in plan mode
+export OMC_JEV_PLAN_MODE="off"
+```
+
+The plugin hook scripts read `permission_mode` from each hook payload and apply `OMC_JEV_PLAN_MODE` only when it is `plan`. It narrows existing `OMC_JEV` opt-ins and never enables a point. The TypeScript resolver behind `bridge.ts` receives no permission mode and ignores this variable.
+
+### Shadow vs. Active Mode
+
+Each judgment point operates in one of three states:
+
+| State | Behavior | When It Occurs |
+|-------|----------|----------------|
+| **off** | Point does not run; heuristic twin is used | No `TYPESAFE_API_KEY`, `OMC_JEV=off`, or point not opted in |
+| **shadow** | Both Jev and heuristic run; Jev answer is logged but NOT acted on; heuristic is authoritative; fire-and-forget for non-blocking points | Point is opted in but not activated; Jev unavailable, times out, or over budget |
+| **active** | Jev answer IS acted on; blocking points gate behavior, non-blocking points wait (bounded by `OMC_JEV_TIMEOUT_MS`) | Point is opted in and activated via env `:active` or code-time `ACTIVATED_POINTS` |
+
+Once a point is opted in (e.g., `OMC_JEV="model-routing"`), it automatically degrades to shadow if Jev is unavailable, times out, or exceeds the request budget — no workflow blocks on Jev. In active mode, non-blocking points wait for Jev up to `OMC_JEV_TIMEOUT_MS` (default 2000ms); if Jev fails, the heuristic twin is used and the call returns immediately.
+
+### Shadow Log Location
+
+Every Jev call—whether shadow or active—is recorded in the shadow log:
+
+```
+.omc/state/jev/<point>-shadow.jsonl
+```
+
+Each line is a JSON record with:
+- `ts`: ISO timestamp
+- `point`: judgment-point name
+- `state`: the payload sent to Jev (bounded to `OMC_JEV_EXCERPT_CHARS`)
+- `mode`: `"shadow"` or `"active"`
+- `jev_answer`: Jev's response (if successful)
+- `twin_answer`: the heuristic twin's result
+- `match`: `true` if Jev and twin agree
+- `error`: error message (if the call failed)
+- `latencyMs`: round-trip time
+
+Use shadow logs to collect evidence for promotion decisions (ticket 07) and to debug mismatches.
+
+### Heuristic Fallback on Failure
+
+Jev never blocks the workflow:
+
+- **Timeout**: If a call exceeds `OMC_JEV_TIMEOUT_MS`, the heuristic twin runs immediately.
+- **Over budget**: If `OMC_JEV_MAX_REQUESTS` is reached, all remaining calls use heuristic twins.
+- **Unavailable**: If the API is unreachable or returns an error, heuristic twin is used and the failure is logged.
+- **Blocking points**: Even in active mode, if Jev fails, the heuristic twin's decision is used and the workflow continues.
+
+### Judgment Points Registry
+
+Every registered judgment point with its lifecycle hook, decision type, and blocking behavior:
+
+| Point Name | Event | Hook | Decision | Type | Blocking | Activated* |
+|------------|-------|------|----------|------|----------|------------|
+| `intent` | UserPromptSubmit | keyword-detector | Is this an Intent-intake request? | Noul (yes/no) | No | — |
+| `skill-trigger` | UserPromptSubmit | keyword-detector | Which skill should this prompt trigger? | Choice (cancel/ralph/autopilot/…) | No | — |
+| `task-size` | UserPromptSubmit | task-size-detector | Is this small/medium/large? | Choice (small/medium/large) | No | — |
+| `model-routing` | PreToolUse | delegation-enforcer | Which model tier (haiku/sonnet/opus)? | Choice (haiku/sonnet/opus) | No | — |
+| `slop-warning` | PreToolUse | jev-slop-warning | Does this tool input have advisory language? | Noul (yes/no) | No | — |
+| `context-pruning` | PostToolUse | post-tool-verifier | How stale is this context candidate? | Score (fresh/recent/aging/stale) | No | — |
+| `loop-continuation` | Stop | persistent-mode | Is task complete? + Progress level? | Noul + Score | **Yes** | — |
+| `ralph-verdict` | Stop | ralph | Does completion satisfy PRD criteria? | Noul (yes/no) | **Yes** | — |
+| `learner-extraction` | Stop | learner | Does this message have extractable memory? | Noul (yes/no) | No | — |
+| `simplifier-trigger` | Stop | code-simplifier | Is this change simplification-worthy? | Noul (yes/no) | No | — |
+
+**Activated**: asterisk (`*`) means the point is in `ACTIVATED_POINTS` (empty in all releases; promoted by ticket 07). Use `OMC_JEV=<point>:active` to activate via environment instead.
+
+**Advisory vs. Blocking**:
+- **Advisory points** (Blocking=No): Jev answers are recorded in shadow log but do not affect workflow. Useful for collecting calibration data.
+- **Blocking points** (Blocking=Yes): In active mode, Jev's yes/no answer gates behavior (e.g., ralph stops when `ralph-verdict` decides completion is met). Timeout, unavailability, or budget exhaustion reverts to heuristic twin.
+
+### Request Budget and Latency
+
+Set limits to control cost and latency:
+
+```bash
+# Limit to 100 requests per process
+export OMC_JEV_MAX_REQUESTS=100
+
+# Raise timeout for slow networks
+export OMC_JEV_TIMEOUT_MS=5000
+
+# Truncate large state excerpts
+export OMC_JEV_EXCERPT_CHARS=500
+```
+
+Once the request budget is exhausted, all remaining points run heuristic twins.
+
+### Example Configurations
+
+#### Shadow Mode (Collect Data)
+
+Run every point in shadow to collect calibration evidence:
+
+```bash
+export TYPESAFE_API_KEY="sk-..."
+export OMC_JEV="all"  # All points in shadow; heuristic is authoritative
+```
+
+Review shadow logs at `.omc/state/jev/` to see how well Jev matches your heuristics.
+
+#### Active Model Routing Only
+
+Activate Jev only for model-tier decisions:
+
+```bash
+export TYPESAFE_API_KEY="sk-..."
+export OMC_JEV="model-routing:active"  # Only this point, active
+```
+
+#### Production (All Points Active)
+
+When evidence shows Jev outperforms heuristics on all points:
+
+```bash
+export TYPESAFE_API_KEY="sk-..."
+export OMC_JEV="all:active"  # All points, active; Jev decides
+export OMC_JEV_MAX_REQUESTS=1000  # Cost control
+```
+
+#### Disable Jev Globally
+
+```bash
+export OMC_JEV="off"  # Master switch
+```
+
+Or simply omit `TYPESAFE_API_KEY`.
+
+### Debugging
+
+#### Check What Was Decided
+
+Read the shadow log for a point:
+
+```bash
+cat .omc/state/jev/model-routing-shadow.jsonl | jq '.'
+```
+
+#### Verify Jev is Running
+
+Look for stderr output on point activation:
+
+```
+[jev] model-routing: ACTIVE via env — Jev decides
+```
+
+If this does not appear, the point is not activated or Jev is disabled.
+
+#### Quiet the Warning
+
+```bash
+export OMC_JEV_QUIET=1  # Suppress the activation message
+```
+
+### References
+
+- **Decision Model**: [Jev Issue #3669](https://github.com/Yeachan-Heo/oh-my-claudecode/issues/3669) — user stories and design
+- **Degradation Contract**: [ADR 03665](https://github.com/Yeachan-Heo/oh-my-claudecode/blob/dev/docs/adr/03665-jev-degradation-contract.md) — how Jev fails gracefully
+- **Env Activation**: [ADR 03672](https://github.com/Yeachan-Heo/oh-my-claudecode/blob/dev/docs/adr/03672-env-activated-active-mode.md) — `:active` syntax and union semantics
+- **Script-Side Points**: [ADR 03671](https://github.com/Yeachan-Heo/oh-my-claudecode/blob/dev/docs/adr/03671-script-side-judgment-channel.md) — hook-script integration points

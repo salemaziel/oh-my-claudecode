@@ -4,20 +4,38 @@ import { join } from 'path';
 import {
   sanitizeName,
   sessionName,
-  createSession,
-  killSession,
   shouldAttemptAdaptiveRetry,
   getDefaultShell,
   buildWorkerStartCommand,
   paneLooksReady,
   paneHasActiveTask,
   paneHasTrustPrompt,
+  verifyTeamTargetOwnership,
+  TeamSessionCreationError,
+  normalizeDetachedSessionTarget,
+  buildDetachedTmuxServerKeepaliveArgs,
+  buildPrivateTmuxSocketPath,
+  captureTmuxServerIdentity,
+  observeTmuxServerIdentity,
+  runTmuxServerIdentityGuard,
+  type TmuxServerIdentityObservation,
+  type WorkerPaneLiveness,
 } from '../tmux-session.js';
+import { isValidTmuxServerIdentity, type TmuxServerIdentity } from '../types.js';
+import type { WorkerLaunchAttempt } from '../worker-launch-ack.js';
 
 afterEach(() => {
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
 });
+
+const testProcessStartedAt = process.platform === 'linux'
+  ? 'linux:test-boot:1'
+  : process.platform === 'darwin'
+    ? 'darwin:1:1'
+    : process.platform === 'win32'
+      ? 'win32:1'
+      : 'unsupported:identity';
 
 describe('sanitizeName', () => {
   it('passes alphanumeric names', () => {
@@ -57,6 +75,589 @@ describe('sessionName', () => {
 
   it('sanitizes both parts', () => {
     expect(sessionName('my team!', 'work@er')).toBe('omc-team-myteam-worker');
+  });
+});
+
+describe('detached session target normalization', () => {
+  it('normalizes numeric window indices from new-session responses', () => {
+    // Base-index 0: new-session creates window 0
+    expect(normalizeDetachedSessionTarget('worker-detached-session:0')).toBe('worker-detached-session');
+    // Base-index 1: new-session creates window 1
+    expect(normalizeDetachedSessionTarget('worker-detached-session:1')).toBe('worker-detached-session');
+    // Base-index with custom offset: new-session might create window 5
+    expect(normalizeDetachedSessionTarget('worker-detached-session:5')).toBe('worker-detached-session');
+    // Non-numeric suffixes are rejected
+    expect(normalizeDetachedSessionTarget('worker-detached-session:workers')).toBeNull();
+    // Session name alone is accepted
+    expect(normalizeDetachedSessionTarget('worker-detached-session')).toBe('worker-detached-session');
+  });
+});
+
+describe('tmux creation allocation evidence', () => {
+  it('retains typed evidence when creation cleanup is unknown', () => {
+    const error = new TeamSessionCreationError(
+      'tmux_creation_cleanup_unverified',
+      {
+        sessionName: 'team:0',
+        leaderPaneId: '%1',
+        workerPaneIds: [],
+        sessionMode: 'split-pane',
+        tmuxServerIdentity: {
+          socket_path: '/tmp/team.sock',
+          server_pid: 7,
+          process_started_at: testProcessStartedAt,
+        },
+      },
+      {
+        provider: 'tmux',
+        operation: 'split-window',
+        rawOutput: 'unexpected output',
+        stderr: '',
+      },
+    );
+    expect(error.cleanupStatus).toBe('unknown');
+    expect(error.creationEvidence?.rawOutput).toBe('unexpected output');
+    expect(error.partialSession.workerPaneIds).toEqual([]);
+  });
+});
+
+describe('verifyTeamTargetOwnership tmux target kinds', () => {
+  const processStartedAt = process.platform === 'linux'
+    ? 'linux:test-boot:1'
+    : process.platform === 'darwin'
+      ? 'darwin:1:1'
+      : 'unsupported:identity';
+  const serverIdentity: TmuxServerIdentity = {
+    socket_path: '/tmp/omc-tmux-membership.sock',
+    server_pid: 42,
+    process_started_at: processStartedAt,
+  };
+  const dependenciesFor = (
+    tmuxExec: (args: string[]) => Promise<{ stdout: string; stderr: string }>,
+  ) => ({
+    tmuxExec,
+    cmuxExec: vi.fn(async () => ({ stdout: '', stderr: '' })),
+    serverIdentityDependencies: {
+      tmuxQuery: vi.fn(async () => ({ stdout: '42\n', stderr: '' })),
+      processIdentity: () => processStartedAt,
+      processObservation: () => 'matching' as const,
+    },
+  });
+  const target = (providerTarget: string) => ({
+    provider: 'tmux' as const,
+    providerTarget,
+    recipient: 'worker-1',
+    recipientRole: 'worker' as const,
+    paneId: '%9',
+    workerIndex: 1,
+    tmuxServerIdentity: serverIdentity,
+  });
+
+  it('uses an exact session selector for bare named-session membership', async () => {
+    const tmuxExec = vi.fn(async () => ({ stdout: '%9\n', stderr: '' }));
+
+    await expect(verifyTeamTargetOwnership(target('dispatch-session'), dependenciesFor(tmuxExec))).resolves.toEqual({
+      kind: 'owned',
+      provider: 'tmux',
+      providerTarget: 'dispatch-session',
+      paneId: '%9',
+      tmuxServerIdentity: serverIdentity,
+    });
+
+    expect(tmuxExec).toHaveBeenCalledWith([
+      '-S', serverIdentity.socket_path, 'list-panes', '-s', '-t', '=dispatch-session:', '-F', '#{pane_id}',
+    ]);
+  });
+
+  it('keeps an explicit session:window target exact without session scope', async () => {
+    const tmuxExec = vi.fn(async () => ({ stdout: '%9\n', stderr: '' }));
+
+    await expect(verifyTeamTargetOwnership(target('dispatch-session:0'), dependenciesFor(tmuxExec)))
+      .resolves.toMatchObject({ kind: 'owned', paneId: '%9', tmuxServerIdentity: serverIdentity });
+
+    expect(tmuxExec).toHaveBeenCalledWith([
+      '-S', serverIdentity.socket_path, 'list-panes', '-t', '=dispatch-session:0', '-F', '#{pane_id}',
+    ]);
+  });
+
+  it('adds exact matching to named windows to prevent prefix collisions', async () => {
+    const tmuxExec = vi.fn(async () => ({ stdout: '%9\n', stderr: '' }));
+
+    await expect(verifyTeamTargetOwnership(target('dispatch-session:worker'), dependenciesFor(tmuxExec)))
+      .resolves.toMatchObject({ kind: 'owned', paneId: '%9', tmuxServerIdentity: serverIdentity });
+
+    expect(tmuxExec).toHaveBeenCalledWith([
+      '-S', serverIdentity.socket_path, 'list-panes', '-t', '=dispatch-session:=worker', '-F', '#{pane_id}',
+    ]);
+  });
+
+  it('passes supported native session/window IDs without name prefixes', async () => {
+    const tmuxExec = vi.fn(async () => ({ stdout: '%9\n', stderr: '' }));
+    const dependencies = dependenciesFor(tmuxExec);
+
+    await expect(verifyTeamTargetOwnership(target('$7'), dependencies))
+      .resolves.toMatchObject({ kind: 'owned', paneId: '%9', tmuxServerIdentity: serverIdentity });
+    expect(tmuxExec).toHaveBeenLastCalledWith([
+      '-S', serverIdentity.socket_path, 'list-panes', '-s', '-t', '$7', '-F', '#{pane_id}',
+    ]);
+
+    await expect(verifyTeamTargetOwnership(target('@13'), dependencies))
+      .resolves.toMatchObject({ kind: 'owned', paneId: '%9', tmuxServerIdentity: serverIdentity });
+    expect(tmuxExec).toHaveBeenLastCalledWith([
+      '-S', serverIdentity.socket_path, 'list-panes', '-t', '@13', '-F', '#{pane_id}',
+    ]);
+  });
+
+  it('fails closed for malformed native-looking target IDs', async () => {
+    const tmuxExec = vi.fn(async () => ({ stdout: '%9\n', stderr: '' }));
+
+    await expect(verifyTeamTargetOwnership(target('$session'), dependenciesFor(tmuxExec)))
+      .resolves.toEqual({ kind: 'unavailable' });
+    expect(tmuxExec).not.toHaveBeenCalled();
+  });
+
+  it('handles base-index 0: numeric windows with index 0', async () => {
+    const tmuxExec = vi.fn(async () => ({ stdout: '%9\n', stderr: '' }));
+
+    await expect(verifyTeamTargetOwnership(target('dispatch-session:0'), dependenciesFor(tmuxExec)))
+      .resolves.toMatchObject({ kind: 'owned', paneId: '%9', tmuxServerIdentity: serverIdentity });
+
+    expect(tmuxExec).toHaveBeenCalledWith([
+      '-S', serverIdentity.socket_path, 'list-panes', '-t', '=dispatch-session:0', '-F', '#{pane_id}',
+    ]);
+  });
+
+  it('handles base-index 1: numeric windows with index 1', async () => {
+    const tmuxExec = vi.fn(async () => ({ stdout: '%9\n', stderr: '' }));
+
+    await expect(verifyTeamTargetOwnership(target('dispatch-session:1'), dependenciesFor(tmuxExec)))
+      .resolves.toMatchObject({ kind: 'owned', paneId: '%9', tmuxServerIdentity: serverIdentity });
+
+    expect(tmuxExec).toHaveBeenCalledWith([
+      '-S', serverIdentity.socket_path, 'list-panes', '-t', '=dispatch-session:1', '-F', '#{pane_id}',
+    ]);
+  });
+});
+
+describe('tmux server incarnation identity', () => {
+  const startIdentity = process.platform === 'linux'
+    ? 'linux:test-boot:1'
+    : process.platform === 'darwin'
+      ? 'darwin:1:1'
+      : process.platform === 'win32'
+        ? 'win32:1'
+        : `${process.platform}:native`;
+  const identity: TmuxServerIdentity = {
+    socket_path: '/tmp/omc-tmux-test.sock',
+    server_pid: 42,
+    process_started_at: startIdentity,
+  };
+
+  it('captures socket and PID from tmux output, then binds strict process identity', async () => {
+    const tmuxQuery = vi.fn(async () => ({ stdout: `${identity.socket_path}\t${identity.server_pid}\n`, stderr: '' }));
+    const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+    try {
+      await expect(captureTmuxServerIdentity(undefined, {
+        tmuxQuery,
+        processIdentity: () => identity.process_started_at,
+      })).resolves.toEqual(identity);
+      expect(tmuxQuery).toHaveBeenCalledWith(
+        ['display-message', '-p', '#{socket_path}\t#{pid}'],
+        undefined,
+      );
+    } finally {
+      kill.mockRestore();
+    }
+  });
+
+  it.each([
+    ['matching', 'matching', 'matching'],
+    ['dead', 'dead', 'dead'],
+    ['unknown', 'unknown', 'unknown'],
+  ] as const)(
+    'keeps process identity observation distinct for %s',
+    async (_label, processState, expected) => {
+      const actual = await observeTmuxServerIdentity(identity, {
+        tmuxQuery: vi.fn(async () => ({ stdout: '42\n', stderr: '' })),
+        processIdentity: () => identity.process_started_at,
+        processObservation: () => processState,
+      });
+      expect(actual as TmuxServerIdentityObservation).toBe(expected);
+    },
+  );
+
+  it('checks the Windows server incarnation once after confirming its PID', async () => {
+    const platform = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+    const windowsIdentity: TmuxServerIdentity = {
+      ...identity,
+      process_started_at: 'win32:638878752000000000',
+    };
+    const processIdentity = vi.fn(() => windowsIdentity.process_started_at);
+    const tmuxQuery = vi.fn(async () => ({ stdout: `${windowsIdentity.server_pid}\n`, stderr: '' }));
+
+    try {
+      await expect(observeTmuxServerIdentity(windowsIdentity, { tmuxQuery, processIdentity }))
+        .resolves.toBe('matching');
+      expect(kill).toHaveBeenNthCalledWith(1, windowsIdentity.server_pid, 0);
+      expect(kill).toHaveBeenNthCalledWith(2, windowsIdentity.server_pid, 0);
+      expect(kill).toHaveBeenCalledTimes(2);
+      expect(processIdentity).toHaveBeenCalledExactlyOnceWith(windowsIdentity.server_pid);
+    } finally {
+      kill.mockRestore();
+      platform.mockRestore();
+    }
+  });
+
+  it('fails closed when a Windows PID has been reused or its identity probe is invalid', async () => {
+    const platform = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+    const windowsIdentity: TmuxServerIdentity = {
+      ...identity,
+      process_started_at: 'win32:638878752000000000',
+    };
+    const tmuxQuery = vi.fn(async () => ({ stdout: `${windowsIdentity.server_pid}\n`, stderr: '' }));
+    const differentIncarnation = vi.fn(() => 'win32:638878752000000001');
+    const emptyProbe = vi.fn(() => null);
+    const malformedProbe = vi.fn(() => 'garbage');
+
+    try {
+      await expect(observeTmuxServerIdentity(windowsIdentity, {
+        tmuxQuery, processIdentity: differentIncarnation,
+      })).resolves.toBe('dead');
+      await expect(observeTmuxServerIdentity(windowsIdentity, {
+        tmuxQuery, processIdentity: emptyProbe,
+      })).resolves.toBe('unknown');
+      await expect(observeTmuxServerIdentity(windowsIdentity, {
+        tmuxQuery, processIdentity: malformedProbe,
+      })).resolves.toBe('unknown');
+      expect(differentIncarnation).toHaveBeenCalledExactlyOnceWith(windowsIdentity.server_pid);
+      expect(emptyProbe).toHaveBeenCalledExactlyOnceWith(windowsIdentity.server_pid);
+      expect(malformedProbe).toHaveBeenCalledExactlyOnceWith(windowsIdentity.server_pid);
+    } finally {
+      kill.mockRestore();
+      platform.mockRestore();
+    }
+  });
+
+  it('does not match a Windows process when the post-probe liveness check fails', async () => {
+    const platform = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    const kill = vi.spyOn(process, 'kill')
+      .mockReturnValueOnce(true)
+      .mockImplementationOnce(() => { throw Object.assign(new Error('denied'), { code: 'EPERM' }); });
+    const windowsIdentity: TmuxServerIdentity = {
+      ...identity,
+      process_started_at: 'win32:638878752000000000',
+    };
+    const processIdentity = vi.fn(() => windowsIdentity.process_started_at);
+
+    try {
+      await expect(observeTmuxServerIdentity(windowsIdentity, {
+        tmuxQuery: vi.fn(async () => ({ stdout: `${windowsIdentity.server_pid}\n`, stderr: '' })),
+        processIdentity,
+      })).resolves.toBe('unknown');
+      expect(processIdentity).toHaveBeenCalledExactlyOnceWith(windowsIdentity.server_pid);
+      expect(kill).toHaveBeenCalledTimes(2);
+    } finally {
+      kill.mockRestore();
+      platform.mockRestore();
+    }
+  });
+
+  it('probes a Windows server only after reading its PID and checks liveness afterward', async () => {
+    const platform = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    const calls: string[] = [];
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => {
+      calls.push('alive');
+      return true;
+    });
+    const windowsIdentity: TmuxServerIdentity = {
+      ...identity,
+      process_started_at: 'win32:638878752000000000',
+    };
+    const processIdentity = vi.fn((pid: number) => {
+      calls.push(`probe:${pid}`);
+      return windowsIdentity.process_started_at;
+    });
+
+    try {
+      await expect(captureTmuxServerIdentity(undefined, {
+        tmuxQuery: vi.fn(async () => ({
+          stdout: `${windowsIdentity.socket_path}\t${windowsIdentity.server_pid}\n`,
+          stderr: '',
+        })),
+        processIdentity,
+      })).resolves.toEqual(windowsIdentity);
+      expect(calls).toEqual([`probe:${windowsIdentity.server_pid}`, 'alive']);
+    } finally {
+      kill.mockRestore();
+      platform.mockRestore();
+    }
+  });
+
+  it('rejects malformed identity before querying and rejects a mismatched server response', async () => {
+    expect(isValidTmuxServerIdentity({ socket_path: 'relative', server_pid: 42, process_started_at: startIdentity })).toBe(false);
+    const tmuxQuery = vi.fn(async () => ({ stdout: '42\n', stderr: '' }));
+    await expect(observeTmuxServerIdentity({
+      ...identity,
+      socket_path: 'relative',
+    }, { tmuxQuery })).resolves.toBe('unknown');
+    expect(tmuxQuery).not.toHaveBeenCalled();
+    await expect(observeTmuxServerIdentity({
+      ...identity,
+      server_pid: 43,
+    }, {
+      tmuxQuery,
+      processIdentity: () => identity.process_started_at,
+      processObservation: () => 'matching',
+    })).resolves.toBe('unknown');
+    expect(tmuxQuery).toHaveBeenCalledExactlyOnceWith(
+      ['-S', identity.socket_path, 'display-message', '-p', '#{pid}'],
+      { timeout: 2_000, stripTmux: true },
+    );
+  });
+
+  it('returns guard success only for exact PID/socket and strict process identity', () => {
+    expect(runTmuxServerIdentityGuard(identity, '42', identity.socket_path, {
+      processIdentity: () => identity.process_started_at,
+    })).toBe(0);
+    expect(runTmuxServerIdentityGuard(identity, '43', identity.socket_path, {
+      processIdentity: () => identity.process_started_at,
+    })).toBe(1);
+    expect(runTmuxServerIdentityGuard(identity, '42', '/tmp/other.sock', {
+      processIdentity: () => identity.process_started_at,
+    })).toBe(1);
+  });
+});
+
+describe('detached tmux no-server startup handshake', () => {
+  it('starts the first session directly on a short private endpoint', () => {
+    const socketPath = buildPrivateTmuxSocketPath();
+    const keepalive = buildDetachedTmuxServerKeepaliveArgs(socketPath);
+
+    expect(keepalive).toEqual([
+      '-S', socketPath, 'start-server', ';', 'set-option', '-g', 'exit-empty', 'off',
+    ]);
+    if (process.platform === 'darwin' || process.platform === 'linux') {
+      expect(Buffer.byteLength(socketPath, 'utf8')).toBeLessThan(104);
+    }
+  });
+});
+
+describe('getWorkerLiveness tmux inventory fallback', () => {
+  async function loadLivenessWithTmuxOutputs(
+    displayOutput: string,
+    inventoryOutput: string,
+  ): Promise<{ liveness: WorkerPaneLiveness; calls: string[][] }> {
+    const calls: string[][] = [];
+    const tmuxCmdAsync = vi.fn(async (args: string[]) => {
+      calls.push(args);
+      if (args[0] === 'display-message') return { stdout: displayOutput, stderr: '' };
+      return { stdout: inventoryOutput, stderr: '' };
+    });
+
+    vi.resetModules();
+    vi.doMock('../../cli/tmux-utils.js', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('../../cli/tmux-utils.js')>();
+      return { ...actual, tmuxCmdAsync };
+    });
+
+    try {
+      const { getWorkerLiveness } = await import('../tmux-session.js');
+      return { liveness: await getWorkerLiveness('%1'), calls };
+    } finally {
+      vi.doUnmock('../../cli/tmux-utils.js');
+      vi.resetModules();
+    }
+  }
+
+  it('proves a removed pane dead from a valid non-empty native inventory', async () => {
+    const result = await loadLivenessWithTmuxOutputs('', '%0 0\n');
+
+    expect(result.liveness).toBe('dead');
+    expect(result.calls).toEqual([
+      ['display-message', '-t', '%1', '-p', '#{pane_dead}'],
+      ['list-panes', '-a', '-F', '#{pane_id} #{pane_dead}'],
+    ]);
+  });
+
+  it.each(['', 'not-a-pane\n', '%0 malformed\n', '%0 0\nmalformed\n'])(
+    'preserves unknown when fallback inventory is empty or malformed: %j',
+    async (inventoryOutput) => {
+      const result = await loadLivenessWithTmuxOutputs('', inventoryOutput);
+
+      expect(result.liveness).toBe('unknown');
+    },
+  );
+
+  it('matches native pane IDs exactly instead of treating a prefix as present', async () => {
+    const result = await loadLivenessWithTmuxOutputs('', '%10 0\n');
+
+    expect(result.liveness).toBe('dead');
+  });
+});
+
+describe('applyMainVerticalLayout', () => {
+  const identity: TmuxServerIdentity = {
+    socket_path: '/tmp/layout-test.sock',
+    server_pid: 42,
+    process_started_at: process.platform === 'linux' ? 'linux:fixture:42' : 'darwin:42:123456',
+  };
+  function guardedResult(args: string[]): { stdout: string; stderr: string } {
+    expect(args.slice(0, 3)).toEqual(['-S', identity.socket_path, 'if-shell']);
+    expect(args[3]).toContain('--tmux-server-identity-guard');
+    const marker = args[4]?.match(/OMC_TMUX_GUARD_OK_[A-Za-z0-9_]+/)?.[0];
+    expect(marker).toBeDefined();
+    return { stdout: `${marker}\n`, stderr: '' };
+  }
+
+  it('sets the 80-column main width before its sole layout selection', async () => {
+    const calls: string[][] = [];
+    let mainPaneWidth: number | undefined;
+    const selectedPaneWidths: Array<number | undefined> = [];
+
+    vi.resetModules();
+    vi.doMock('../../cli/tmux-utils.js', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('../../cli/tmux-utils.js')>();
+      return {
+        ...actual,
+        tmuxCmdAsync: vi.fn(async (args: string[]) => {
+          calls.push(args);
+          if (args[2] === 'if-shell') {
+            const command = args[4] ?? '';
+            const width = command.match(/'main-pane-width' '(\d+)'/)?.[1];
+            if (width) mainPaneWidth = Number(width);
+            if (command.includes("'select-layout'")) selectedPaneWidths.push(mainPaneWidth);
+            return guardedResult(args);
+          }
+          return { stdout: '80\n', stderr: '' };
+        }),
+        tmuxExecAsync: vi.fn(async (args: string[]) => {
+          throw new Error(`unguarded layout effect: ${args.join(' ')}`);
+        }),
+      };
+    });
+
+    try {
+      const { applyMainVerticalLayout } = await import('../tmux-session.js');
+      await applyMainVerticalLayout('team-session', { tmuxServerIdentity: identity });
+    } finally {
+      vi.doUnmock('../../cli/tmux-utils.js');
+      vi.resetModules();
+    }
+
+    expect(calls).toEqual([
+      ['-S', identity.socket_path, 'display-message', '-p', '-t', 'team-session', '#{window_width}'],
+      ['-S', identity.socket_path, 'if-shell', expect.any(String), expect.stringContaining("'main-pane-width' '40'"), expect.any(String)],
+      ['-S', identity.socket_path, 'if-shell', expect.any(String), expect.stringContaining("'select-layout' '-t' 'team-session' 'main-vertical'"), expect.any(String)],
+    ]);
+    expect(calls.filter(args => args[4]?.includes("'select-layout'"))).toHaveLength(1);
+    expect(selectedPaneWidths).toEqual([40]);
+  });
+
+  it('fails required startup layout before selecting when width is invalid', async () => {
+    const calls: string[][] = [];
+
+    vi.resetModules();
+    vi.doMock('../../cli/tmux-utils.js', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('../../cli/tmux-utils.js')>();
+      return {
+        ...actual,
+        tmuxCmdAsync: vi.fn(async (args: string[]) => {
+          calls.push(args);
+          return { stdout: 'not-a-width\n', stderr: '' };
+        }),
+        tmuxExecAsync: vi.fn(async (args: string[]) => {
+          calls.push(args);
+          return { stdout: '', stderr: '' };
+        }),
+      };
+    });
+
+    try {
+      const { applyMainVerticalLayout } = await import('../tmux-session.js');
+      await expect(applyMainVerticalLayout('team-session', { required: true, tmuxServerIdentity: identity }))
+        .rejects.toThrow('team_layout_window_width_invalid:not-a-width');
+    } finally {
+      vi.doUnmock('../../cli/tmux-utils.js');
+      vi.resetModules();
+    }
+
+    expect(calls).toEqual([
+      ['-S', identity.socket_path, 'display-message', '-p', '-t', 'team-session', '#{window_width}'],
+    ]);
+  });
+
+  it('rejects a required layout below the startup width boundary', async () => {
+    const calls: string[][] = [];
+
+    vi.resetModules();
+    vi.doMock('../../cli/tmux-utils.js', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('../../cli/tmux-utils.js')>();
+      return {
+        ...actual,
+        tmuxCmdAsync: vi.fn(async (args: string[]) => {
+          calls.push(args);
+          return { stdout: '39\n', stderr: '' };
+        }),
+        tmuxExecAsync: vi.fn(async (args: string[]) => {
+          calls.push(args);
+          return { stdout: '', stderr: '' };
+        }),
+      };
+    });
+
+    try {
+      const { applyMainVerticalLayout } = await import('../tmux-session.js');
+      await expect(applyMainVerticalLayout('team-session', { required: true, tmuxServerIdentity: identity }))
+        .rejects.toThrow('team_layout_window_width_invalid:39');
+    } finally {
+      vi.doUnmock('../../cli/tmux-utils.js');
+      vi.resetModules();
+    }
+
+    expect(calls).toEqual([
+      ['-S', identity.socket_path, 'display-message', '-p', '-t', 'team-session', '#{window_width}'],
+    ]);
+  });
+
+  it('never selects a best-effort layout when main-pane-width cannot be set', async () => {
+    const calls: string[][] = [];
+
+    vi.resetModules();
+    vi.doMock('../../cli/tmux-utils.js', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('../../cli/tmux-utils.js')>();
+      return {
+        ...actual,
+        tmuxCmdAsync: vi.fn(async (args: string[]) => {
+          calls.push(args);
+          if (args[2] === 'if-shell') {
+            guardedResult(args);
+            return { stdout: '', stderr: 'set failed' };
+          }
+          return { stdout: '80\n', stderr: '' };
+        }),
+        tmuxExecAsync: vi.fn(async (args: string[]) => {
+          calls.push(args);
+          if (args[0] === 'set-window-option') throw new Error('set failed');
+          return { stdout: '', stderr: '' };
+        }),
+      };
+    });
+
+    try {
+      const { applyMainVerticalLayout } = await import('../tmux-session.js');
+      await expect(applyMainVerticalLayout('team-session', { tmuxServerIdentity: identity }))
+        .rejects.toThrow('team_layout_server_guard_failed');
+    } finally {
+      vi.doUnmock('../../cli/tmux-utils.js');
+      vi.resetModules();
+    }
+
+    expect(calls).toEqual([
+      ['-S', identity.socket_path, 'display-message', '-p', '-t', 'team-session', '#{window_width}'],
+      ['-S', identity.socket_path, 'if-shell', expect.any(String), expect.stringContaining("'main-pane-width' '40'"), expect.any(String)],
+    ]);
   });
 });
 
@@ -147,9 +748,108 @@ describe('buildWorkerStartCommand', () => {
 
     expect(cmd).toBe(
       'C:\\Windows\\System32\\cmd.exe /d /s /c "set "OMC_TEAM_WORKER=team/worker-1" && ' +
-      '"C:\\Users\\tester\\AppData\\Local\\Programs\\claude\\claude.exe" "--agent-id" "worker-1""'
+      '"C:\\Users\\tester\\AppData\\Local\\Programs\\claude\\claude.exe" "--agent-id" "worker-1"" & exit /b'
     );
     expect(cmd).not.toContain('$env:OMC_TEAM_WORKER');
+  });
+
+  it('preserves POSIX argv-style exec while routing launch through the acknowledgement bootstrap', () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+    vi.stubEnv('SHELL', '/bin/bash');
+    const cmd = buildWorkerStartCommand({
+      teamName: 't',
+      workerName: 'w',
+      envVars: { OMC_TEAM_WORKER: 't/w' },
+      launchBinary: '/opt/codex/bin/codex',
+      launchArgs: ['--label', 'worker one'],
+      cwd: '/tmp/team workspace',
+      provider: 'codex',
+      launchAttempt: {
+        schema_version: 1,
+        attempt_id: '11111111-1111-4111-8111-111111111111',
+        nonce: '22222222-2222-4222-8222-222222222222',
+        instance_id: '33333333-3333-4333-8333-333333333333',
+        team_name: 't',
+        worker_name: 'w',
+        pane_id: '%2',
+        provider: 'codex',
+        created_at: '2026-01-01T00:00:00.000Z',
+        currentPath: '/tmp/current.json',
+        expectedPath: '/tmp/expected.json',
+        ackPath: '/tmp/ack.json',
+        decisionPath: '/tmp/decision.json',
+        startedPath: '/tmp/provider-started.json',
+        transportOwnerPath: '/tmp/transport-owner.json',
+        bootstrapDescriptorPath: '/tmp/bootstrap.json',
+        wrapperPath: '/tmp/launch.cmd',
+        transportCleanupCompletePath: '/tmp/transport-cleanup-complete.json',
+        runtimeCliPath: '/opt/omc/runtime-cli.cjs',
+      },
+    });
+
+    // Supervised POSIX launches reference the attempt-owned descriptor by path
+    // (issue #3655); the bootstrap spec itself must never travel inline.
+    expect(cmd).toContain("OMC_WORKER_LAUNCH_SPEC_FILE='/tmp/bootstrap.json'");
+    expect(cmd).not.toContain('OMC_WORKER_LAUNCH_SPEC=');
+    expect(cmd).toContain("exec \"$@\"");
+    expect(cmd).toContain("'--worker-launch'");
+    expect(cmd).toContain("'/opt/omc/runtime-cli.cjs'");
+  });
+
+  it('keeps provider percent/quote metacharacters out of the native Windows cmd command', () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    vi.stubEnv('COMSPEC', 'C:\\Windows\\System32\\cmd.exe');
+    const cmd = buildWorkerStartCommand({
+      teamName: 't',
+      workerName: 'w',
+      envVars: { OMC_TEAM_WORKER: 't/w' },
+      launchBinary: 'C:\\Program Files\\Codex\\codex.exe',
+      launchArgs: ['--label', '100% ready %USERPROFILE%', '--title="quoted"'],
+      cwd: 'C:\\team workspace',
+      provider: 'codex',
+      launchAttempt: {
+        schema_version: 1,
+        attempt_id: '11111111-1111-4111-8111-111111111111',
+        nonce: '22222222-2222-4222-8222-222222222222',
+        instance_id: '33333333-3333-4333-8333-333333333333',
+        team_name: 't',
+        worker_name: 'w',
+        pane_id: '%2',
+        provider: 'codex',
+        created_at: '2026-01-01T00:00:00.000Z',
+        currentPath: 'C:\\state\\current.json',
+        expectedPath: 'C:\\state\\expected.json',
+        ackPath: 'C:\\state\\ack.json',
+        decisionPath: 'C:\\state\\decision.json',
+        startedPath: 'C:\\state\\provider-started.json',
+        transportOwnerPath: 'C:\\state\\transport-owner.json',
+        bootstrapDescriptorPath: 'C:\\state\\bootstrap.json',
+        wrapperPath: 'C:\\state\\launch.cmd',
+        transportCleanupCompletePath: 'C:\\state\\transport-cleanup-complete.json',
+        runtimeCliPath: 'C:\\Program Files\\omc\\runtime-cli.cjs',
+      },
+    });
+
+    expect(cmd).toContain('C:\\Windows\\System32\\cmd.exe /d /s /c');
+    // Supervised launches deliver the attempt-owned descriptor by path; the
+    // bootstrap spec (and its percent/quote metacharacters) never travels in
+    // the command line or cmd environment (issue #3655).
+    expect(cmd).toContain('set "OMC_WORKER_LAUNCH_SPEC_FILE=C:\\state\\bootstrap.json"');
+    expect(cmd).not.toContain('OMC_WORKER_LAUNCH_SPEC_B64=');
+    expect(cmd).not.toContain('OMC_WORKER_LAUNCH_SPEC=');
+    expect(cmd).not.toContain('100% ready %USERPROFILE%');
+    expect(cmd).not.toContain('pane_id=%%2');
+  });
+
+  it('rejects CRLF injection in native Windows provider argv', () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    vi.stubEnv('COMSPEC', 'C:\\Windows\\System32\\cmd.exe');
+
+    expect(() => buildWorkerStartCommand({
+      teamName: 't', workerName: 'w', envVars: {},
+      launchBinary: 'C:\\Program Files\\Cursor\\cursor-agent.exe',
+      launchArgs: ['--model', 'safe\r\nset PWNED=1'], cwd: 'C:\\repo',
+    })).toThrow('contains CR, LF, or NUL');
   });
 
   it('escapes psmux cmd.exe env vars and quoted launch args without PowerShell syntax', () => {
@@ -202,6 +902,29 @@ describe('buildWorkerStartCommand', () => {
     expect(cmd).toContain('"--token=abc%%25"');
     expect(cmd).not.toContain('literal%USERPROFILE%token%25');
   });
+  it('base64-encodes recovery gate launch identities for native Windows cmd', () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    vi.stubEnv('COMSPEC', 'C:\\Windows\\System32\\cmd.exe');
+    const gate = { recoveryId: 'recovery-1', launchAttempt: { attempt_id: 'attempt-1', nonce: 'nonce-1', pane_id: '%2' } };
+
+    const cmd = buildWorkerStartCommand({
+      teamName: 't',
+      workerName: 'w',
+      envVars: { OMC_RECOVERY_GATE_SPEC: JSON.stringify(gate) },
+      launchBinary: 'C:\\Program Files\\nodejs\\node.exe',
+      launchArgs: ['C:\\omc\\runtime-cli.cjs', '--recovery-gate'],
+      cwd: 'C:\\repo',
+    });
+
+    const marker = 'set "OMC_RECOVERY_GATE_SPEC_B64=';
+    const encodedStart = cmd.indexOf(marker) + marker.length;
+    const encodedEnd = cmd.indexOf('" &&', encodedStart);
+    expect(JSON.parse(Buffer.from(cmd.slice(encodedStart, encodedEnd), 'base64').toString('utf8')))
+      .toMatchObject({ launchAttempt: { pane_id: '%2' } });
+    expect(cmd).not.toContain('OMC_RECOVERY_GATE_SPEC=');
+    expect(cmd).not.toContain('pane_id=%%2');
+  });
+
 
   it('does not cmd-escape percent signs on MSYS Windows worker startup', () => {
     vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
@@ -240,7 +963,7 @@ describe('buildWorkerStartCommand', () => {
 
     expect(cmd).toBe(
       'C:\\Windows\\System32\\cmd.exe /d /s /c "set "OMC_TEAM_WORKER=team/worker-1" && ' +
-      '"C:\\Program Files\\OpenAI\\Codex\\codex.exe" "--full-auto""'
+      '"C:\\Program Files\\OpenAI\\Codex\\codex.exe" "--full-auto"" & exit /b'
     );
   });
 
@@ -454,6 +1177,18 @@ describe('pane readiness startup banners', () => {
     expect(paneLooksReady(capture)).toBe(false);
   });
 
+  it('treats an exact directory trust selector as ready for legacy delivery', () => {
+    const capture = [
+      'Do you trust the contents of this directory?',
+      '› 1. Yes, continue',
+      '  2. No, quit',
+    ].join('\n');
+
+    expect(paneHasTrustPrompt(capture)).toBe(true);
+    expect(paneLooksReady(capture)).toBe(true);
+    expect(paneHasActiveTask(capture)).toBe(false);
+  });
+
   it('detects Codex CLI hook-trust review screen as a trust prompt', () => {
     const capture = [
       '  Hooks need review',
@@ -470,6 +1205,43 @@ describe('pane readiness startup banners', () => {
     expect(paneHasTrustPrompt(capture)).toBe(true);
     expect(paneLooksReady(capture)).toBe(true);
     expect(paneHasActiveTask(capture)).toBe(false);
+  });
+
+  it('detects the cursor-agent workspace-trust banner and refuses to call it ready', () => {
+    // Verbatim capture from `cursor-agent` launched in tmux on an untrusted
+    // directory. It offers no numbered choice and the process exits, unlike
+    // the dismissible Claude/Codex prompts above.
+    const capture = [
+      '⚠ Workspace Trust Required',
+      '',
+      '  Cursor Agent can execute code and access files in this directory.',
+      '  Do you trust the contents of this directory?',
+      '',
+      '    /private/tmp/ct-nf2',
+      '',
+      '  To proceed, you can either:',
+      "    • Run 'agent' interactively to decide",
+      '    • Pass --trust, --yolo, or -f if you trust this directory',
+    ].join('\n');
+
+    expect(paneHasTrustPrompt(capture)).toBe(true);
+    // The pane is dead: treating it as ready would hand work to a gone process.
+    expect(paneLooksReady(capture, 'cursor')).toBe(false);
+    expect(paneHasActiveTask(capture, 'cursor')).toBe(false);
+  });
+
+  it('gives the Cursor trust banner precedence and keeps it provider-scoped', () => {
+    const capture = [
+      '⚠ Workspace Trust Required',
+      'Do you trust the contents of this directory?',
+      '› 1. Yes, continue',
+      '  2. No, quit',
+      "  • Pass --trust, --yolo, or -f if you trust this directory",
+    ].join('\n');
+
+    expect(paneHasTrustPrompt(capture, 'cursor')).toBe(true);
+    expect(paneLooksReady(capture, 'cursor')).toBe(false);
+    expect(paneLooksReady(capture, 'claude')).toBe(true);
   });
 
   it('still treats actual prompt lines as ready', () => {
@@ -528,6 +1300,17 @@ describe('pane readiness startup banners', () => {
     expect(paneLooksReady(capture)).toBe(true);
     expect(paneHasActiveTask(capture)).toBe(true);
   });
+
+  it.each(['✢', '✳', '✶', '✽', '✺', '✹', '✸', '✷', '*'])(
+    'treats Claude Code spinner glyph %s as an active task',
+    (glyph) => {
+      expect(paneHasActiveTask(`${glyph} Compacting…`)).toBe(true);
+    },
+  );
+
+  it('treats a Claude Code spinner status suffix as an active task', () => {
+    expect(paneHasActiveTask('✻ Compacting… (12 tokens, 3s)')).toBe(true);
+  });
 });
 
 describe('sendToWorker implementation guards', () => {
@@ -555,29 +1338,105 @@ describe('sendToWorker implementation guards', () => {
   });
 });
 
-// NOTE: createSession, killSession require tmux to be installed.
-// Gate with: describe.skipIf(!hasTmux)('tmux integration', () => { ... })
-
-function hasTmux(): boolean {
-  try {
-    const { execSync } = require('child_process');
-    execSync('tmux -V', { stdio: 'pipe', timeout: 3000 });
-    return true;
-  } catch { return false; }
-}
-
-describe.skipIf(!hasTmux())('createSession with workingDirectory', () => {
-
-  it('accepts optional workingDirectory param', () => {
-    // Should not throw — workingDirectory is optional
-    const name = createSession('tmuxtest', 'wdtest', '/tmp');
-    expect(name).toBe('omc-team-tmuxtest-wdtest');
-    killSession('tmuxtest', 'wdtest');
+describe('buildWorkerStartCommand MAX_CANON compliance (issue #4191)', () => {
+  it('keeps supervised launch command under 1024 bytes even with long cwd paths', () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+    vi.stubEnv('SHELL', '/bin/bash');
+    
+    // Create a long cwd (300+ chars) to simulate real-world paths
+    const longCwd = '/home/user/projects/very/deep/nested/directory/structure/' +
+      'with/many/components/that/add/up/to/make/a/realistically/long/path/to/the/working/' +
+      'directory/where/the/team/would/be/running/from/and/this/represents/typical/monorepo/' +
+      'layouts/or/deeply/nested/project/structures/that/developers/might/encounter/in/' +
+      'their/workflows/on/their/systems/today';
+    
+    const attempt: WorkerLaunchAttempt = {
+      schema_version: 1 as const,
+      attempt_id: '11111111-1111-4111-8111-111111111111',
+      nonce: '22222222-2222-4222-8222-222222222222',
+      instance_id: '33333333-3333-4333-8333-333333333333',
+      team_name: 'test-team',
+      worker_name: 'worker-1',
+      pane_id: '%2',
+      provider: 'codex' as const,
+      created_at: '2026-01-01T00:00:00.000Z',
+      currentPath: '/tmp/current.json',
+      expectedPath: '/tmp/expected.json',
+      ackPath: '/tmp/ack.json',
+      decisionPath: '/tmp/decision.json',
+      startedPath: '/tmp/provider-started.json',
+      transportOwnerPath: '/tmp/transport-owner.json',
+      bootstrapDescriptorPath: '/tmp/bootstrap.json',
+      wrapperPath: '/tmp/launch.cmd',
+      transportCleanupCompletePath: '/tmp/transport-cleanup-complete.json',
+      runtimeCliPath: '/opt/omc/runtime-cli.cjs',
+    };
+    
+    // Simulate what runtime-v2 passes in envVars with long paths
+    const envVarsWithLongPaths = {
+      OMC_TEAM_WORKER: 'test-team/worker-1',
+      OMC_TEAM_NAME: 'test-team',
+      OMC_WORKER_AGENT_TYPE: 'codex',
+      OMC_TEAM_STATE_ROOT: `/home/user/projects/very/deep/nested/directory/structure/with/many/components/.omc/state/team/test-team`,
+      OMC_TEAM_LEADER_CWD: longCwd,
+      OMC_TEAM_WORKTREE_PATH: `/home/user/projects/very/deep/nested/directory/structure/with/many/components/worktree`,
+      OMC_TEAM_WORKER_CWD: `/home/user/projects/very/deep/nested/directory/structure/with/many/components/worker-cwd`,
+    };
+    
+    const cmd = buildWorkerStartCommand({
+      teamName: 'test-team',
+      workerName: 'worker-1',
+      envVars: envVarsWithLongPaths,
+      launchBinary: '/usr/bin/codex',
+      launchArgs: ['--full-auto'],
+      cwd: longCwd,
+      provider: 'codex',
+      launchAttempt: attempt,
+    });
+    
+    const cmdBytes = Buffer.byteLength(cmd, 'utf8');
+    
+    // Key assertion: command must stay under 1024 bytes (macOS MAX_CANON limit)
+    // to avoid truncation in terminal line discipline
+    expect(cmdBytes).toBeLessThan(1024);
+    expect(cmdBytes).toBeGreaterThan(100); // Sanity check - not too short
+    
+    // Verify supervised launch only includes OMC_WORKER_LAUNCH_SPEC_FILE
+    // NOT the long env vars that would push it over the limit
+    expect(cmd).toContain("OMC_WORKER_LAUNCH_SPEC_FILE='/tmp/bootstrap.json'");
+    expect(cmd).not.toContain('OMC_TEAM_STATE_ROOT');
+    expect(cmd).not.toContain('OMC_TEAM_LEADER_CWD');
+    expect(cmd).not.toContain('OMC_TEAM_WORKER_CWD');
+    expect(cmd).not.toContain(longCwd);
+    
+    // Verify it still invokes the runtime CLI correctly
+    expect(cmd).toContain('--worker-launch');
+    expect(cmd).toContain('/opt/omc/runtime-cli.cjs');
   });
-
-  it('works without workingDirectory param', () => {
-    const name = createSession('tmuxtest', 'nowd');
-    expect(name).toBe('omc-team-tmuxtest-nowd');
-    killSession('tmuxtest', 'nowd');
+  
+  it('non-supervised launches still include env vars normally', () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+    vi.stubEnv('SHELL', '/bin/bash');
+    
+    const cmd = buildWorkerStartCommand({
+      teamName: 'test-team',
+      workerName: 'worker-1',
+      envVars: {
+        OMC_TEAM_WORKER: 'test-team/worker-1',
+        OMC_TEAM_NAME: 'test-team',
+        OMC_TEAM_STATE_ROOT: '/tmp/state',
+      },
+      launchBinary: '/usr/bin/codex',
+      launchArgs: ['--full-auto'],
+      cwd: '/tmp',
+      provider: 'codex',
+      // No launchAttempt - non-supervised
+    });
+    
+    // Non-supervised launches should include all env vars
+    expect(cmd).toContain('OMC_TEAM_WORKER');
+    expect(cmd).toContain('OMC_TEAM_NAME');
+    expect(cmd).toContain('OMC_TEAM_STATE_ROOT');
   });
 });
+

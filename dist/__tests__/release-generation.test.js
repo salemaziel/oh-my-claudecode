@@ -1,7 +1,7 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
-import { join, resolve } from 'path';
+import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { join } from 'path';
 import { describe, expect, it } from 'vitest';
-import { execSync } from 'child_process';
+import { execSync, execFileSync } from 'child_process';
 import { tmpdir } from 'os';
 import { extractPullRequestNumbers, isReleasePullRequest, deriveContributorLogins, buildReleaseNoteEntriesFromPullRequests, categorizeReleaseNoteEntries, generateChangelog, generateReleaseBody, getLatestTag, } from '../lib/release-generation.js';
 describe('release generation', () => {
@@ -64,6 +64,25 @@ describe('release generation', () => {
         expect(changelog).toContain('Fix team tmux pane geometry collapse and bundled agent path resolution');
         expect(changelog).not.toContain('1+ PRs merged');
     });
+    it('preserves literal shell substitution characters in refs and excluded tags', () => {
+        const repoDir = mkdtempSync(join(tmpdir(), 'release-literal-tag-'));
+        const git = (...args) => execFileSync('git', args, { cwd: repoDir, stdio: 'pipe' });
+        try {
+            git('init');
+            git('config', 'user.name', 'Test');
+            git('config', 'user.email', 'test@example.com');
+            git('commit', '--allow-empty', '-m', 'first');
+            git('tag', 'v1.0.0');
+            git('commit', '--allow-empty', '-m', 'second');
+            const tag = 'v$(echo)';
+            git('tag', tag);
+            expect(getLatestTag({ cwd: repoDir, ref: tag })).toBe(tag);
+            expect(getLatestTag({ cwd: repoDir, excludeTag: tag })).toBe('v1.0.0');
+        }
+        finally {
+            rmSync(repoDir, { recursive: true, force: true });
+        }
+    });
     it('excludes the current release tag when resolving the previous tag', () => {
         const repoDir = mkdtempSync(join(tmpdir(), 'release-tag-test-'));
         try {
@@ -87,16 +106,14 @@ describe('release generation', () => {
     });
     it('assembles a single custom release body with compare link and contributors', () => {
         const body = generateReleaseBody('4.10.2', '# oh-my-claudecode v4.10.2: Bug Fixes', ['blue-int', 'DdangJin', 'Yeachan-Heo'], 'v4.10.1');
+        expect(body).toContain('The npm CLI and the Claude Code marketplace/plugin are separate install tracks');
+        expect(body).toContain('if you have both installed, update both');
+        expect(body).toContain('CLI-dependent skill paths such as `ask` and CLI-backed `team` require the `omc` CLI');
         expect(body).toContain('npm install -g oh-my-claude-sisyphus@4.10.2');
-        expect(body).toContain('https://github.com/salemaziel/oh-my-claudecode/compare/v4.10.1...v4.10.2');
+        expect(body).toContain('/plugin marketplace update omc');
+        expect(body).toContain('https://github.com/Yeachan-Heo/oh-my-claudecode/compare/v4.10.1...v4.10.2');
         expect(body).toContain('@blue-int @DdangJin @Yeachan-Heo');
         expect(body.match(/## Contributors/g)).toHaveLength(1);
-    });
-    it('configures the workflow to use one custom release body source with github auth', () => {
-        const workflow = readFileSync(resolve(process.cwd(), '.github/workflows/release.yml'), 'utf-8');
-        expect(workflow).toContain('body_path: release-notes.md');
-        expect(workflow).toContain('GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}');
-        expect(workflow).not.toContain('generate_release_notes: true');
     });
 });
 //# sourceMappingURL=release-generation.test.js.map

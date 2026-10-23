@@ -123,6 +123,7 @@ export interface CreateUltragoalOptions {
 export interface StartNextOptions {
   now?: Date;
   retryFailed?: boolean;
+  goalId?: string;
   planId?: string;
 }
 
@@ -575,17 +576,36 @@ function validateQualityGate(value: unknown): UltragoalQualityGate {
 export async function startNextUltragoal(cwd: string, options: StartNextOptions = {}): Promise<{ plan: UltragoalPlan; goal: UltragoalItem | null; resumed: boolean; done: boolean }> {
   const plan = await readUltragoalPlan(cwd, options.planId);
   const now = iso(options.now);
+  const named = options.goalId ? plan.goals.find((goal) => goal.id === options.goalId) : undefined;
+  if (options.goalId && !named) throw new UltragoalError(`Unknown ultragoal id: ${options.goalId}`);
+  if (named?.status === 'complete') throw new UltragoalError(`Cannot start ultragoal ${named.id}: it is already complete.`);
+  if (named?.status === 'review_blocked') throw new UltragoalError(`Cannot start ultragoal ${named.id}: it is review-blocked.`);
   if (plan.aggregateCompletion?.status === 'complete') return { plan, goal: null, resumed: false, done: true };
   const existing = plan.goals.find((goal) => goal.status === 'in_progress');
   if (existing) {
+    if (options.goalId && options.goalId !== existing.id) {
+      throw new UltragoalError(`Cannot start ultragoal ${options.goalId}: active goal ${existing.id} is already in progress.`);
+    }
     await appendLedger(cwd, { ts: now, event: 'goal_resumed', goalId: existing.id, status: existing.status, message: 'Resuming active ultragoal' }, plan.planId);
     return { plan, goal: existing, resumed: true, done: false };
   }
 
-  let next = plan.goals.find((goal) => goal.status === 'pending');
-  if (!next && options.retryFailed) {
-    next = plan.goals.find((goal) => goal.status === 'failed');
-    if (next) await appendLedger(cwd, { ts: now, event: 'goal_retried', goalId: next.id, status: 'pending', message: next.failureReason }, plan.planId);
+  let next: UltragoalItem | undefined;
+  if (options.goalId) {
+    next = named;
+    if (!next) throw new UltragoalError(`Unknown ultragoal id: ${options.goalId}`);
+    if (next.status === 'failed' && !options.retryFailed) {
+      throw new UltragoalError(`Cannot start failed ultragoal ${next.id} without --retry-failed.`);
+    }
+    if (next.status !== 'pending' && next.status !== 'failed') {
+      throw new UltragoalError(`Cannot start ultragoal ${next.id} while it is ${next.status}.`);
+    }
+  } else {
+    next = plan.goals.find((goal) => goal.status === 'pending');
+    if (!next && options.retryFailed) next = plan.goals.find((goal) => goal.status === 'failed');
+  }
+  if (next?.status === 'failed') {
+    await appendLedger(cwd, { ts: now, event: 'goal_retried', goalId: next.id, status: 'pending', message: next.failureReason }, plan.planId);
   }
   if (!next) return { plan, goal: null, resumed: false, done: isUltragoalDone(plan) };
 
@@ -820,7 +840,7 @@ function buildPerStoryClaudeGoalInstruction(goal: UltragoalItem, plan: Ultragoal
     `Goal: ${goal.id} — ${goal.title}`,
     '',
     'Claude /goal integration constraints (model-facing — OMC cannot mutate Claude /goal state from a shell):',
-    '- First confirm the active Claude /goal condition for this session. If none is active, invoke /goal <condition> with the payload below.',
+    '- First confirm the active Claude /goal for this session; if none is active, invoke /goal <condition> with the payload below. If you cannot invoke /goal in this session (e.g. standalone Claude Code), ask the user to type it and wait; --claude-goal-json reconciles the ledger only and does not satisfy the PreToolUse /goal guard.',
     '- If a different active Claude /goal exists, finish or clear that /goal before starting this ultragoal.',
     '- If the active /goal is a different completed legacy goal and the Claude session refuses to set a new /goal, continue this ultragoal in a fresh Claude Code session (same repo/worktree) and invoke /goal there.',
     `- To preserve the durable ledger before switching sessions, record the non-terminal blocker without failing this goal: omc ultragoal checkpoint --goal-id ${goal.id} --status blocked --evidence "<completed legacy Claude goal blocks new /goal in this session>" --claude-goal-json "<goal snapshot JSON or path>"`,
@@ -845,7 +865,7 @@ function buildPerStoryClaudeGoalInstruction(goal: UltragoalItem, plan: Ultragoal
       : null,
     '- If blocked or failed, checkpoint with --status failed and the failure evidence; rerun complete-goals --retry-failed to resume.',
     '',
-    'Suggested /goal payload (model-facing — invoke /goal yourself in-session):',
+    'Suggested /goal payload (model-facing — invoke /goal in-session; if you cannot, e.g. standalone Claude Code, ask the user to):',
     JSON.stringify(createPayload, null, 2),
     '',
     'Objective (use as the /goal condition):',
@@ -866,7 +886,7 @@ function buildAggregateClaudeGoalInstruction(goal: UltragoalItem, plan: Ultragoa
     '',
     'Claude /goal integration constraints (model-facing — OMC cannot mutate Claude /goal state from a shell):',
     '- Claude /goal = the whole ultragoal run; OMC G001/G002/etc. = ledger stories.',
-    '- First confirm the active Claude /goal condition for this session. If none is active, invoke /goal <condition> with the aggregate payload below.',
+    '- First confirm the active Claude /goal for this session; if none is active, invoke /goal <condition> with the aggregate payload below. If you cannot invoke /goal in this session (e.g. standalone Claude Code), ask the user to type it and wait; --claude-goal-json reconciles the ledger only and does not satisfy the PreToolUse /goal guard.',
     '- If the active /goal already reports the same aggregate objective as active, continue this OMC story without setting a new /goal.',
     '- If a different active or incomplete Claude /goal exists, finish or clear that /goal before starting this ultragoal; do not claim a shell command can replace Claude /goal state.',
     finalStory
@@ -887,7 +907,7 @@ function buildAggregateClaudeGoalInstruction(goal: UltragoalItem, plan: Ultragoa
       : `  omc ultragoal checkpoint --goal-id ${goal.id} --status complete --evidence "<tests/files/PR evidence>" --claude-goal-json "<fresh /goal snapshot JSON or path>"`,
     '- If blocked or failed, checkpoint with --status failed and the failure evidence; rerun complete-goals --retry-failed to resume.',
     '',
-    'Suggested /goal payload (model-facing — invoke /goal yourself in-session):',
+    'Suggested /goal payload (model-facing — invoke /goal in-session; if you cannot, e.g. standalone Claude Code, ask the user to):',
     JSON.stringify(createPayload, null, 2),
     '',
     'Aggregate /goal condition:',

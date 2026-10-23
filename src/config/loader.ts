@@ -10,14 +10,15 @@
 import { readFileSync, existsSync } from "fs";
 import { join, dirname } from "path";
 import type {
+  AutopilotWorkflowProfileV1,
   PluginConfig,
   ExternalModelsConfig,
   DelegationProvider,
   TeamRoleAssignmentSpec,
+  ModelType,
 } from "../shared/types.js";
 import {
   CANONICAL_TEAM_ROLES,
-  CURSOR_EXECUTOR_TEAM_ROLES,
   KNOWN_AGENT_NAMES,
 } from "../shared/types.js";
 import { getConfigDir } from "../utils/paths.js";
@@ -88,7 +89,6 @@ export function buildDefaultConfig(): PluginConfig {
       maxBackgroundTasks: 5,
     },
     magicKeywords: {
-      ultrawork: ["ultrawork", "ulw", "uw"],
       search: ["search", "find", "locate"],
       analyze: ["analyze", "investigate", "examine"],
       ultrathink: ["ultrathink", "think", "reason", "ponder"],
@@ -198,7 +198,7 @@ export function buildDefaultConfig(): PluginConfig {
         context: ["CONTEXT"],
       },
       blockingTools: ["Edit", "MultiEdit", "Write", "Agent", "Task"],
-      executionKeywords: ["ralph", "ultrawork", "autopilot"],
+      executionKeywords: ["ralph", "autopilot"],
     },
   };
 }
@@ -269,6 +269,15 @@ export function deepMerge<T extends object>(target: T, source: Partial<T>): T {
   return result as T;
 }
 
+const MIN_BACKGROUND_TASKS = 1;
+const MAX_BACKGROUND_TASKS = 50;
+
+function parseBackgroundTaskLimit(value: string | undefined): number | null {
+  if (typeof value !== "string" || !/^[1-9]\d*$/.test(value)) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed <= MAX_BACKGROUND_TASKS ? parsed : null;
+}
+
 /**
  * Load configuration from environment variables
  */
@@ -298,14 +307,14 @@ export function loadEnvConfig(): Partial<PluginConfig> {
     };
   }
 
-  if (process.env.OMC_MAX_BACKGROUND_TASKS) {
-    const maxTasks = parseInt(process.env.OMC_MAX_BACKGROUND_TASKS, 10);
-    if (!isNaN(maxTasks)) {
-      config.permissions = {
-        ...config.permissions,
-        maxBackgroundTasks: maxTasks,
-      };
-    }
+  const maxBackgroundTasks = parseBackgroundTaskLimit(
+    process.env.OMC_MAX_BACKGROUND_TASKS,
+  );
+  if (maxBackgroundTasks !== null) {
+    config.permissions = {
+      ...config.permissions,
+      maxBackgroundTasks,
+    };
   }
 
   // Routing configuration from environment
@@ -333,8 +342,8 @@ export function loadEnvConfig(): Partial<PluginConfig> {
     }
   }
 
-  // Model alias overrides from environment (issue #1211)
-  const aliasKeys = ["HAIKU", "SONNET", "OPUS"] as const;
+  // Model alias overrides from environment (issue #1211, issue #3726)
+  const aliasKeys = ["HAIKU", "SONNET", "OPUS", "FABLE"] as const;
   const modelAliases: Record<string, string> = {};
   for (const key of aliasKeys) {
     const envVal = process.env[`OMC_MODEL_ALIAS_${key}`];
@@ -346,9 +355,8 @@ export function loadEnvConfig(): Partial<PluginConfig> {
   if (Object.keys(modelAliases).length > 0) {
     config.routing = {
       ...config.routing,
-      modelAliases: modelAliases as Record<
-        string,
-        "haiku" | "sonnet" | "opus" | "inherit"
+      modelAliases: modelAliases as Partial<
+        Record<"haiku" | "sonnet" | "opus" | "fable", ModelType>
       >,
     };
   }
@@ -392,6 +400,14 @@ export function loadEnvConfig(): Partial<PluginConfig> {
   } else if (process.env.OMC_GROK_DEFAULT_MODEL) {
     // Legacy fallback
     externalModelsDefaults.grokModel = process.env.OMC_GROK_DEFAULT_MODEL;
+  }
+
+  if (process.env.OMC_EXTERNAL_MODELS_DEFAULT_CURSOR_MODEL) {
+    externalModelsDefaults.cursorModel =
+      process.env.OMC_EXTERNAL_MODELS_DEFAULT_CURSOR_MODEL;
+  } else if (process.env.OMC_CURSOR_DEFAULT_MODEL) {
+    // Legacy fallback
+    externalModelsDefaults.cursorModel = process.env.OMC_CURSOR_DEFAULT_MODEL;
   }
 
   if (process.env.OMC_EXTERNAL_MODELS_DEFAULT_ANTIGRAVITY_MODEL) {
@@ -496,11 +512,16 @@ function warnOnDeprecatedDelegationRouting(config: PluginConfig): void {
  * Throws a descriptive error naming offending key + allowed values.
  */
 const CANONICAL_TEAM_ROLE_SET = new Set<string>(CANONICAL_TEAM_ROLES);
-const CURSOR_EXECUTOR_TEAM_ROLE_SET = new Set<string>(CURSOR_EXECUTOR_TEAM_ROLES);
 const KNOWN_AGENT_NAME_SET = new Set<string>(KNOWN_AGENT_NAMES);
 // /team CLI workers — codex/gemini/grok/cursor here are CLI integrations, NOT the deprecated MCP delegationRouting providers.
 const TEAM_ROLE_PROVIDERS = new Set(["claude", "codex", "gemini", "grok", "cursor", "antigravity"]);
 const TEAM_ROLE_TIERS = new Set(["HIGH", "MEDIUM", "LOW"]);
+// Only providers whose CLI has a verified effort flag (see model-contract.ts buildLaunchArgs).
+const REASONING_EFFORT_BY_PROVIDER: Record<string, Set<string>> = {
+  claude: new Set(["low", "medium", "high", "xhigh", "max"]),
+  codex: new Set(["low", "medium", "high", "xhigh", "max", "ultra"]),
+  antigravity: new Set(["low", "medium", "high", "max"]),
+};
 
 export function validateTeamConfig(config: PluginConfig): void {
   const team = (config as Record<string, unknown>).team as
@@ -565,15 +586,12 @@ export function validateTeamConfig(config: PluginConfig): void {
       continue;
     }
 
+    const provider = (spec.provider ?? "claude") as string;
+
     if (spec.provider !== undefined) {
       if (typeof spec.provider !== "string" || !TEAM_ROLE_PROVIDERS.has(spec.provider)) {
         throw new Error(
           `[OMC] team.roleRouting.${rawRoleKey}.provider: invalid value "${String(spec.provider)}". Allowed: ${[...TEAM_ROLE_PROVIDERS].join(", ")}`,
-        );
-      }
-      if (spec.provider === "cursor" && !CURSOR_EXECUTOR_TEAM_ROLE_SET.has(normalized)) {
-        throw new Error(
-          `[OMC] team.roleRouting.${rawRoleKey}.provider: cursor is only supported for executor-style roles (${[...CURSOR_EXECUTOR_TEAM_ROLE_SET].join(", ")})`,
         );
       }
     }
@@ -591,6 +609,21 @@ export function validateTeamConfig(config: PluginConfig): void {
         );
       }
     }
+
+    if (spec.reasoningEffort !== undefined) {
+      if (typeof spec.reasoningEffort !== "string") {
+        throw new Error(
+          `[OMC] team.roleRouting.${rawRoleKey}.reasoningEffort: must be a string, got ${typeof spec.reasoningEffort}`,
+        );
+      }
+      const allowedForProvider = REASONING_EFFORT_BY_PROVIDER[provider];
+      if (!allowedForProvider || !allowedForProvider.has(spec.reasoningEffort)) {
+        const allowed = allowedForProvider ? [...allowedForProvider].join("|") : "(not supported for this provider)";
+        throw new Error(
+          `[OMC] team.roleRouting.${rawRoleKey}.reasoningEffort: invalid value "${spec.reasoningEffort}" for provider "${provider}". Allowed: ${allowed}`,
+        );
+      }
+    }
   }
 }
 
@@ -605,11 +638,127 @@ const AUTOPILOT_TEAM_AGENT_TYPES = new Set([
   "antigravity",
 ]);
 
+const AUTOPILOT_WORKFLOW_NAME = /^[a-z][a-z0-9-]{0,62}$/;
+const AUTOPILOT_WORKFLOW_RESERVED_NAMES = new Set([
+  "autopilot",
+  "ralplan",
+  "execution",
+  "ralph",
+  "qa",
+  "autoresearch",
+  "ultraqa",
+  "merge-readiness",
+  "self-improve",
+  "ultrawork",
+  "ultrapilot",
+  "swarm",
+  "pipeline",
+  "plan",
+  "team",
+  "cancel",
+  "deep-interview",
+  "deepsearch",
+  "ultrathink",
+  "tdd",
+  "code-review",
+  "security-review",
+  "analyze",
+  "search",
+  "ultragoal",
+  "default",
+]);
+const AUTOPILOT_WORKFLOW_SEQUENCES = [
+  ["ralplan", "execution"],
+  ["ralplan", "execution", "ralph"],
+  ["ralplan", "execution", "qa"],
+  ["ralplan", "execution", "ralph", "qa"],
+] as const;
+
+function isAutopilotWorkflowSequence(stages: unknown[]): boolean {
+  return AUTOPILOT_WORKFLOW_SEQUENCES.some(
+    (sequence) => stages.length === sequence.length && stages.every((stage, index) => typeof stage === "string" && stage === sequence[index]),
+  );
+}
+
+function workflowError(source: string, path: string, message: string): never {
+  throw new Error(`[OMC] ${source} ${path}: ${message}`);
+}
+
+/** Validate the closed v1 workflow block without changing legacy config validation. */
+export function validateAutopilotWorkflows(config: unknown, source: string): void {
+  if (!config || typeof config !== "object" || Array.isArray(config)) return;
+  const autopilot = (config as Record<string, unknown>).autopilot;
+  if (autopilot === undefined) return;
+  if (!autopilot || typeof autopilot !== "object" || Array.isArray(autopilot)) return;
+
+  const workflows = (autopilot as Record<string, unknown>).workflows;
+  if (workflows === undefined) return;
+  if (!workflows || typeof workflows !== "object" || Array.isArray(workflows)) {
+    workflowError(source, "autopilot.workflows", "must be an object map");
+  }
+
+  for (const [name, profile] of Object.entries(workflows as Record<string, unknown>)) {
+    const path = `autopilot.workflows.${name}`;
+    if (!AUTOPILOT_WORKFLOW_NAME.test(name)) {
+      workflowError(source, path, "name must match ^[a-z][a-z0-9-]{0,62}$");
+    }
+    if (AUTOPILOT_WORKFLOW_RESERVED_NAMES.has(name)) {
+      workflowError(source, path, `name "${name}" is reserved`);
+    }
+    if (!profile || typeof profile !== "object" || Array.isArray(profile)) {
+      workflowError(source, path, "must be an object");
+    }
+
+    const profileRecord = profile as Record<string, unknown>;
+    for (const key of Object.keys(profileRecord)) {
+      if (key !== "version" && key !== "stages") {
+        workflowError(source, `${path}.${key}`, "unknown profile key");
+      }
+    }
+    if (profileRecord.version !== 1) {
+      workflowError(source, `${path}.version`, "must be the number 1");
+    }
+    if (!Array.isArray(profileRecord.stages)) {
+      workflowError(source, `${path}.stages`, "must be an array");
+    }
+    if (!isAutopilotWorkflowSequence(profileRecord.stages)) {
+      workflowError(
+        source,
+        `${path}.stages`,
+        "must be one of: [ralplan, execution], [ralplan, execution, ralph], [ralplan, execution, qa], [ralplan, execution, ralph, qa]",
+      );
+    }
+  }
+}
+
+function composeAutopilotWorkflows(
+  config: PluginConfig,
+  userConfig: PluginConfig | null,
+  projectConfig: PluginConfig | null,
+): PluginConfig {
+  const userWorkflows = (userConfig?.autopilot as Record<string, unknown> | undefined)?.workflows;
+  const projectWorkflows = (projectConfig?.autopilot as Record<string, unknown> | undefined)?.workflows;
+  if (userWorkflows === undefined && projectWorkflows === undefined) return config;
+
+  return {
+    ...config,
+    autopilot: {
+      ...config.autopilot,
+      workflows: {
+        ...(userWorkflows as Record<string, AutopilotWorkflowProfileV1> | undefined),
+        ...(projectWorkflows as Record<string, AutopilotWorkflowProfileV1> | undefined),
+      },
+    },
+  };
+}
+
 export function validateAutopilotConfig(config: PluginConfig): void {
   const autopilot = (config as Record<string, unknown>).autopilot as
     | Record<string, unknown>
     | undefined;
   if (!autopilot || typeof autopilot !== "object") return;
+
+  validateAutopilotWorkflows(config, "effective");
 
   if (
     autopilot.execution !== undefined &&
@@ -687,19 +836,26 @@ export function loadConfig(): PluginConfig {
   // Start with fresh defaults so env-based model overrides are resolved at call time
   let config = buildDefaultConfig();
 
-  // Merge user config
+  // Validate workflow profiles in each file before ordinary merging so a malformed
+  // project replacement can never mask a malformed user profile.
   const userConfig = loadJsoncFile(paths.user);
   if (userConfig) {
+    validateAutopilotWorkflows(userConfig, "user");
     config = deepMerge(config, userConfig);
   }
 
-  // Merge project config (takes precedence over user)
   const projectConfig = loadJsoncFile(paths.project);
   if (projectConfig) {
+    validateAutopilotWorkflows(projectConfig, "project");
     config = deepMerge(config, projectConfig);
   }
 
-  // Merge environment variables (highest precedence)
+  // Workflow profiles are atomic definitions: project replaces a same-named user
+  // profile instead of deep-merging its closed fields.
+  config = composeAutopilotWorkflows(config, userConfig, projectConfig);
+
+  // Merge environment variables (highest precedence); environment has no workflow
+  // profile inputs and therefore cannot define or replace profiles.
   const envConfig = loadEnvConfig();
   config = deepMerge(config, envConfig);
 
@@ -1010,8 +1166,8 @@ export function generateConfigSchema(): object {
           maxBackgroundTasks: {
             type: "integer",
             default: 5,
-            minimum: 1,
-            maximum: 50,
+            minimum: MIN_BACKGROUND_TASKS,
+            maximum: MAX_BACKGROUND_TASKS,
           },
         },
       },
@@ -1019,7 +1175,6 @@ export function generateConfigSchema(): object {
         type: "object",
         description: "Magic keyword triggers",
         properties: {
-          ultrawork: { type: "array", items: { type: "string" } },
           search: { type: "array", items: { type: "string" } },
           analyze: { type: "array", items: { type: "string" } },
           ultrathink: { type: "array", items: { type: "string" } },
@@ -1090,6 +1245,10 @@ export function generateConfigSchema(): object {
                 type: "string",
                 default: BUILTIN_EXTERNAL_MODEL_DEFAULTS.antigravityModel,
                 description: "Default Antigravity model",
+              },
+              cursorModel: {
+                type: "string",
+                description: "Default Cursor model (ids from `cursor-agent --list-models`)",
               },
             },
           },
@@ -1210,6 +1369,39 @@ export function generateConfigSchema(): object {
             ],
           },
           qa: { type: "boolean", default: true },
+          workflows: {
+            type: "object",
+            description:
+              "Named v1 autopilot stage profiles. Project profiles replace same-named user profiles.",
+            propertyNames: {
+              pattern: "^[a-z][a-z0-9-]{0,62}$",
+              not: {
+                enum: [
+                  "autopilot", "ralplan", "execution", "ralph", "qa", "autoresearch", "ultraqa",
+                  "merge-readiness", "self-improve", "ultrawork", "ultrapilot", "swarm", "pipeline",
+                  "plan", "team", "cancel", "deep-interview", "deepsearch", "ultrathink", "tdd",
+                  "code-review", "security-review", "analyze", "search",
+                ],
+              },
+            },
+            additionalProperties: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                version: { type: "integer", enum: [1] },
+                stages: {
+                  type: "array",
+                  enum: [
+                    ["ralplan", "execution"],
+                    ["ralplan", "execution", "ralph"],
+                    ["ralplan", "execution", "qa"],
+                    ["ralplan", "execution", "ralph", "qa"],
+                  ],
+                },
+              },
+              required: ["version", "stages"],
+            },
+          },
           team: {
             type: "object",
             properties: {

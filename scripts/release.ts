@@ -220,6 +220,17 @@ async function fetchCompareCommitAuthors(prevTag: string): Promise<string[]> {
     .filter((author): author is string => Boolean(author));
 }
 
+type ReleaseCommand = (command: string, options: { cwd: string; stdio: 'inherit' }) => unknown;
+
+export function regeneratePackageLock(runCommand: ReleaseCommand = execSync): void {
+  runCommand('npm install --package-lock-only --ignore-scripts', { cwd: ROOT, stdio: 'inherit' });
+}
+
+export function syncMetadata(runCommand: ReleaseCommand = execSync): void {
+  runCommand('npx tsx scripts/sync-metadata.ts', { cwd: ROOT, stdio: 'inherit' });
+}
+
+
 // ── Version file bumping ────────────────────────────────────────────────────
 
 function bumpVersionFiles(newVersion: string, dryRun: boolean): string[] {
@@ -262,14 +273,9 @@ function bumpVersionFiles(newVersion: string, dryRun: boolean): string[] {
       changes.push(`docs/CLAUDE.md: version marker → ${newVersion}`);
     }
   }
-
   if (!dryRun) {
-    try {
-      execSync('npm install --package-lock-only --ignore-scripts 2>/dev/null', { cwd: ROOT });
-      changes.push('package-lock.json: regenerated');
-    } catch {
-      changes.push('package-lock.json: FAILED to regenerate');
-    }
+    regeneratePackageLock();
+    changes.push('package-lock.json: regenerated');
   } else {
     changes.push('package-lock.json: would regenerate');
   }
@@ -294,6 +300,28 @@ function buildFallbackPullRequests(prNumbers: string[], subjects: string[]): Rel
 
 function isMainModule(): boolean {
   return process.argv[1] ? resolve(process.argv[1]) === __filename : false;
+}
+
+function releaseNextSteps(version: string): string {
+  return `
+  git switch -c release/v${version}
+  npm run build
+  # The build rewrites CLAUDE.md and .github/CLAUDE.md from docs/CLAUDE.md with the
+  # new version marker. The golden fixture carries the same marker, and the inventory
+  # baseline must be regenerated while HEAD is still the base-branch commit so that
+  # provenance.head stays an ancestor after the release squash merge.
+  cp CLAUDE.md tests/fixtures/prompt-projection/claude-managed-block.golden
+  node scripts/generate-inventory-graph.mjs --write
+  npm run plugin:shipping:verify
+  npm run plugin:shipping:stage
+  git add -- package.json package-lock.json .claude-plugin/plugin.json .claude-plugin/marketplace.json CLAUDE.md docs/CLAUDE.md CHANGELOG.md README.md docs/REFERENCE.md .github/CLAUDE.md docs/ARCHITECTURE.md .github/release-body.md tests/fixtures/prompt-projection/claude-managed-block.golden inventory/inventory-graph.json
+  git commit -S -m "chore(release): bump version to v${version}"
+  git push origin HEAD:release/v${version}
+  # Open a release PR from release/v${version} to dev. The signed commit is required; do not push or merge a protected branch directly.
+  # The maintainer shipping transaction stages only the verified generated closure.
+  # bridge/claude-md-coordinator.cjs embeds the engine version, so it ships inside the
+  # signed generated closure and needs a matching base-owned authorization entry.
+`;
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -324,12 +352,7 @@ ${clr('What it does:', c.cyan)}
   4. Runs sync-metadata to update doc badges
 
 ${clr('After running:', c.cyan)}
-  git add -A && git commit -m "chore(release): bump version to vX.Y.Z"
-  git push origin dev
-  # Wait for CI green, then:
-  git checkout main && git merge dev && git push origin main
-  git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z
-  # release.yml handles npm publish + GitHub release
+${releaseNextSteps('X.Y.Z')}
 `);
     return;
   }
@@ -408,24 +431,16 @@ ${clr('After running:', c.cyan)}
 
   console.log(clr('\n🔄 Sync Metadata', c.cyan));
   if (!dryRun) {
-    try {
-      execSync('npx tsx scripts/sync-metadata.ts', { cwd: ROOT, stdio: 'inherit' });
-    } catch {
-      console.log(`  ${clr('⚠', c.yellow)} sync-metadata had warnings (non-fatal)`);
-    }
+    syncMetadata();
   } else {
     console.log(`  ${clr('→', c.yellow)} Would run sync-metadata`);
   }
 
+
   console.log(clr('\n✅ Done!', c.green));
   if (!dryRun) {
     console.log(clr('\nNext steps:', c.bold));
-    console.log(`  1. ${clr(`git add -A && git commit -m "chore(release): bump version to v${newVersion}"`, c.cyan)}`);
-    console.log(`  2. ${clr('git push origin dev', c.cyan)}`);
-    console.log('  3. Wait for CI green');
-    console.log(`  4. ${clr('git checkout main && git merge dev && git push origin main', c.cyan)}`);
-    console.log(`  5. ${clr(`git tag -a v${newVersion} -m "v${newVersion}" && git push origin v${newVersion}`, c.cyan)}`);
-    console.log('  6. release.yml handles npm publish + GitHub release automatically');
+    console.log(releaseNextSteps(newVersion));
   }
 }
 

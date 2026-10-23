@@ -27,9 +27,11 @@ import { renderHostname } from "./elements/hostname.js";
 import { renderGitRepo, renderGitBranch, renderGitStatus } from "./elements/git.js";
 import { renderMultiRepo } from "./elements/multi-repo.js";
 import { renderModel } from "./elements/model.js";
+import { renderEffort } from "./elements/effort.js";
 import { renderApiKeySource } from "./elements/api-key-source.js";
 import { renderCallCounts } from "./elements/call-counts.js";
 import { renderContextLimitWarning, renderPayloadLimitWarning, } from "./elements/context-warning.js";
+import { renderUpdateHints } from "./elements/update-hint.js";
 import { renderMissionBoard } from "./mission-board.js";
 import { renderSessionSummary } from "./elements/session-summary.js";
 import { renderLastTool } from "./elements/last-tool.js";
@@ -236,6 +238,18 @@ export async function render(context, config) {
         if (modelElement)
             rendered.set("model", modelElement);
     }
+    if (enabledElements.effort) {
+        const effortElement = renderEffort(context.effortLevel);
+        if (effortElement)
+            rendered.set("effort", effortElement);
+    }
+    if (enabledElements.updateNotification !== false &&
+        context.claudeCodeUpdateAvailable) {
+        const versionTag = context.claudeCodeVersion
+            ? `#${context.claudeCodeVersion}`
+            : "";
+        rendered.set("claudeLabel", bold(`[Claude${versionTag}] -> ${context.claudeCodeUpdateAvailable} claude update`));
+    }
     if (enabledElements.apiKeySource && context.apiKeySource) {
         const keySource = renderApiKeySource(context.apiKeySource);
         if (keySource)
@@ -422,6 +436,15 @@ export async function render(context, config) {
     const payloadWarning = renderPayloadLimitWarning(context.payloadEstimate);
     if (payloadWarning)
         renderedDetail.set("payloadWarning", [payloadWarning]);
+    if (enabledElements.updateNotification !== false) {
+        const updateHints = renderUpdateHints({
+            omcUpdateAvailable: context.updateAvailable,
+            omcUpdateSource: context.omcUpdateSource ?? null,
+            claudeCodeUpdateAvailable: context.claudeCodeUpdateAvailable ?? null,
+        });
+        if (updateHints.length > 0)
+            renderedDetail.set("updateHint", updateHints);
+    }
     if (enabledElements.todos) {
         const todos = renderTodosWithCurrent(context.todos);
         if (todos)

@@ -5,7 +5,7 @@
  * Minimal continuation enforcer for all OMC modes.
  * Stripped down for reliability — no optional imports, no PRD, no notepad pruning.
  *
- * Supported modes: ralph, autopilot, ultrapilot, swarm, ultrawork, ultraqa, pipeline, team
+ * Supported modes: ralph, autopilot, ultrapilot, swarm, pipeline, team
  */
 
 const {
@@ -99,6 +99,7 @@ function runCommand(command, args, cwd) {
       encoding: 'utf-8',
       timeout: COMMAND_TIMEOUT_MS,
       stdio: ['pipe', 'pipe', 'pipe'],
+      ...(command === 'git' ? { windowsHide: true } : {}),
     }).trim();
   } catch {
     return null;
@@ -273,6 +274,11 @@ async function sendStopNotification(modeName, stateData, sessionId, directory) {
  */
 const STALE_STATE_THRESHOLD_MS = 2 * 60 * 60 * 1000; // 2 hours
 const PENDING_ASYNC_STATE_STALE_MS = 24 * 60 * 60 * 1000;
+// A delegated subagent counts as pending owned async work while its tracking
+// entry stays "running". Bound by 30 min so an orphaned entry (subagent killed
+// without SubagentStop) eventually releases the gate; over-suppression is the
+// benign direction (the agent stops cleanly instead of being nagged mid-work).
+const RUNNING_SUBAGENT_STALE_MS = 30 * 60 * 1000;
 
 // Stop breaker constants for first-class mode enforcement
 const TEAM_PIPELINE_STOP_BLOCKER_MAX = 20;
@@ -403,8 +409,25 @@ function hasPendingScheduledWakeup(stateDir, sessionId) {
   });
 }
 
+function hasRunningSubagent(stateDir) {
+  // subagent-tracking.json is per-directory (not session-scoped), written by the
+  // wired SubagentStart/SubagentStop hooks. A "running" entry means a delegated
+  // agent is still working, so persistent modes must not inject a "stalled"
+  // reinforcement while we wait for it (mirrors the background-task gate).
+  const tracking = readJsonFile(join(stateDir, "subagent-tracking.json"));
+  const agents = Array.isArray(tracking?.agents) ? tracking.agents : [];
+  return agents.some((agent) => {
+    if (agent?.status !== "running") return false;
+    return isFreshTimestamp(agent.started_at, RUNNING_SUBAGENT_STALE_MS);
+  });
+}
+
 function hasPendingOwnedAsyncWork(stateDir, sessionId) {
-  return hasPendingBackgroundTask(stateDir, sessionId) || hasPendingScheduledWakeup(stateDir, sessionId);
+  return (
+    hasPendingBackgroundTask(stateDir, sessionId) ||
+    hasRunningSubagent(stateDir) ||
+    hasPendingScheduledWakeup(stateDir, sessionId)
+  );
 }
 
 function normalizeTeamPhase(state) {
@@ -471,9 +494,14 @@ function getAutopilotPhase(state) {
     : "unspecified";
 }
 
+// keyword-detector persists this in place of a prompt that was only a pasted
+// system echo; a state carrying it has no user request to resume (#4250).
+const PASTED_ECHO_PROMPT_SENTINEL = "(prompt omitted: pasted system echo)";
+
 function isAutopilotRoutingEchoPrompt(promptText) {
   return /^\[MAGIC KEYWORDS?(?: DETECTED)?:\s*AUTOPILOT\s*\]\s*$/i.test(promptText) ||
-    /^\/(?:oh-my-claudecode:|omc:)?autopilot(?:\s+execute)?\s*$/i.test(promptText);
+    /^\/(?:oh-my-claudecode:|omc:)?autopilot(?:\s+execute)?\s*$/i.test(promptText) ||
+    promptText === PASTED_ECHO_PROMPT_SENTINEL;
 }
 
 function isOrphanedAutopilotRoutingEchoState(state) {
@@ -728,129 +756,6 @@ function getActiveSubagentCount(stateDir) {
 }
 
 /**
- * Count incomplete Tasks from Claude Code's native Task system.
- */
-function countIncompleteTasks(sessionId) {
-  if (!sessionId || typeof sessionId !== "string") return 0;
-  if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,255}$/.test(sessionId)) return 0;
-
-  const cfgDir = getClaudeConfigDir();
-  const taskDir = join(cfgDir, "tasks", sessionId);
-  if (!existsSync(taskDir)) return 0;
-
-  let count = 0;
-  try {
-    const files = readdirSync(taskDir).filter(
-      (f) => f.endsWith(".json") && f !== ".lock",
-    );
-    for (const file of files) {
-      try {
-        const content = readFileSync(join(taskDir, file), "utf-8");
-        const task = JSON.parse(content);
-        if (task.status === "pending" || task.status === "in_progress") count++;
-      } catch {
-        /* skip */
-      }
-    }
-  } catch {
-    /* skip */
-  }
-  return count;
-}
-
-async function countIncompleteTodos(sessionId, projectDir) {
-  let count = 0;
-
-  // Session-specific todos only (no global scan)
-  if (
-    sessionId &&
-    typeof sessionId === "string" &&
-    /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,255}$/.test(sessionId)
-  ) {
-    const sessionTodoPath = join(
-      getClaudeConfigDir(),
-      "todos",
-      `${sessionId}.json`,
-    );
-    try {
-      const data = readJsonFile(sessionTodoPath);
-      const todos = Array.isArray(data)
-        ? data
-        : Array.isArray(data?.todos)
-          ? data.todos
-          : [];
-      count += todos.filter(
-        (t) => t.status !== "completed" && t.status !== "cancelled",
-      ).length;
-    } catch {
-      /* skip */
-    }
-  }
-
-  // Project-local todos only
-  const omcRoot = await resolveOmcStateRoot(projectDir);
-  for (const path of [
-    join(omcRoot, "todos.json"),
-    join(projectDir, ".claude", "todos.json"),
-  ]) {
-    try {
-      const data = readJsonFile(path);
-      const todos = Array.isArray(data)
-        ? data
-        : Array.isArray(data?.todos)
-          ? data.todos
-          : [];
-      count += todos.filter(
-        (t) => t.status !== "completed" && t.status !== "cancelled",
-      ).length;
-    } catch {
-      /* skip */
-    }
-  }
-
-  return count;
-}
-
-
-const ULTRAWORK_OBJECTIVE_MAX_CHARS = 140;
-
-function firstStringValue(source, keys) {
-  if (!source || typeof source !== "object") return "";
-  for (const key of keys) {
-    const value = source[key];
-    if (typeof value === "string" && value.trim()) {
-      return value.trim();
-    }
-  }
-  return "";
-}
-
-function formatConciseObjective(value, maxChars = ULTRAWORK_OBJECTIVE_MAX_CHARS) {
-  if (typeof value !== "string") return "";
-  const compact = value.replace(/\s+/g, " ").trim();
-  if (!compact) return "";
-  const chars = [...compact];
-  if (chars.length <= maxChars) return compact;
-  return `${chars.slice(0, maxChars).join("").trimEnd()}…`;
-}
-
-function getLiveUltraworkObjective(state) {
-  const objective = firstStringValue(state, [
-    "current_objective",
-    "currentObjective",
-    "objective_summary",
-    "objectiveSummary",
-    "task_summary",
-    "taskSummary",
-    "current_task",
-    "currentTask",
-    "active_task",
-    "activeTask",
-  ]);
-  return formatConciseObjective(objective);
-}
-
-/**
  * Detect if stop was triggered by context-limit related reasons.
  * When context is exhausted, Claude Code needs to stop so it can compact.
  * Blocking these stops causes a deadlock: can't compact because can't stop,
@@ -1053,8 +958,6 @@ async function main() {
     const ralph = readStateFileWithSession(stateDir, "ralph-state.json", sessionId);
     const autopilot = readStateFileWithSession(stateDir, "autopilot-state.json", sessionId);
     const ultrapilot = readStateFileWithSession(stateDir, "ultrapilot-state.json", sessionId);
-    const ultrawork = readStateFileWithSession(stateDir, "ultrawork-state.json", sessionId);
-    const ultraqa = readStateFileWithSession(stateDir, "ultraqa-state.json", sessionId);
     const pipeline = readStateFileWithSession(stateDir, "pipeline-state.json", sessionId);
     const team = readStateFileWithSession(stateDir, "team-state.json", sessionId);
     const ralplan = readStateFileWithSession(stateDir, "ralplan-state.json", sessionId);
@@ -1063,11 +966,6 @@ async function main() {
     // Swarm uses swarm-summary.json (not swarm-state.json) + marker file
     const swarmMarker = existsSync(join(stateDir, "swarm-active.marker"));
     const swarmSummary = readJsonFile(join(stateDir, "swarm-summary.json"));
-
-    // Count incomplete items (session-specific + project-local only)
-    const taskCount = countIncompleteTasks(sessionId);
-    const todoCount = await countIncompleteTodos(sessionId, directory);
-    const totalIncomplete = taskCount + todoCount;
 
     // Check if cancel is in progress - if so, allow stop immediately
     // Cache the result to pass to sub-checks (avoids TOCTOU re-reads, issue #1058)
@@ -1379,100 +1277,7 @@ async function main() {
       }
     }
 
-    // Priority 7: UltraQA (QA cycling)
-    if (ultraqa.state?.active && !isStaleState(ultraqa.state) && isSessionMatch(ultraqa.state, sessionId)) {
-      const cycle = ultraqa.state.cycle || 1;
-      const maxCycles = ultraqa.state.max_cycles || 10;
-      if (cycle < maxCycles && !ultraqa.state.all_passing) {
-        ultraqa.state.cycle = cycle + 1;
-        ultraqa.state.last_checked_at = new Date().toISOString();
-        writeJsonFile(ultraqa.path, ultraqa.state);
-
-        // Fire-and-forget notification
-        sendStopNotification('ultraqa', ultraqa.state, sessionId, directory).catch(() => {});
-
-        console.log(
-          JSON.stringify({
-            decision: "block",
-            reason: `[ULTRAQA - Cycle ${cycle + 1}/${maxCycles}] Tests not all passing. Continue fixing. When all tests pass, run /oh-my-claudecode:cancel to cleanly exit and clean up state files. If cancel fails, retry with /oh-my-claudecode:cancel --force.`,
-          }),
-        );
-        return;
-      }
-    }
-
-    // Priority 8: Ultrawork - reinforce only while tracked work remains incomplete.
-    // This prevents false stops from bash errors or transient failures mid-task.
-    // Session isolation: only block if state belongs to this session (issue #311)
-    // Project isolation: only block if state belongs to this project
-    if (
-      isAuthoritativeModeActive(stateDir, "ultrawork", ultrawork, sessionId) && !isAwaitingConfirmation(ultrawork.state) &&
-      !isStaleState(ultrawork.state) &&
-      isSessionMatch(ultrawork.state, sessionId) &&
-      isStateForCurrentProject(ultrawork.state, directory, ultrawork.isGlobal)
-    ) {
-      if (totalIncomplete === 0) {
-        // Issue #2419: once tracked work is complete, auto-clear ultrawork so
-        // Stop can exit cleanly instead of forcing repeated cancel prompts.
-        try {
-          ultrawork.state.active = false;
-          ultrawork.state.deactivated_reason = 'task_completion';
-          ultrawork.state.last_checked_at = new Date().toISOString();
-          writeJsonFile(ultrawork.path, ultrawork.state);
-        } catch { /* best-effort cleanup */ }
-        console.log(JSON.stringify({ continue: true, suppressOutput: true }));
-        return;
-      }
-
-      const newCount = (ultrawork.state.reinforcement_count || 0) + 1;
-      const maxReinforcements = ultrawork.state.max_reinforcements || 50;
-
-      if (newCount > maxReinforcements) {
-        // Max reinforcements reached - deactivate state before allowing stop
-        // Without this, state stays active: true and HUD keeps showing ultrawork
-        try {
-          ultrawork.state.active = false;
-          ultrawork.state.deactivated_reason = 'max_reinforcements_reached';
-          ultrawork.state.last_checked_at = new Date().toISOString();
-          writeJsonFile(ultrawork.path, ultrawork.state);
-        } catch { /* best-effort cleanup */ }
-        console.log(JSON.stringify({ continue: true, suppressOutput: true }));
-        return;
-      }
-
-      ultrawork.state.reinforcement_count = newCount;
-      ultrawork.state.last_checked_at = new Date().toISOString();
-      writeJsonFile(ultrawork.path, ultrawork.state);
-
-      // Fire-and-forget notification
-      sendStopNotification('ultrawork', ultrawork.state, sessionId, directory).catch(() => {});
-
-      let reason = `[ULTRAWORK #${newCount}/${maxReinforcements}] Mode active.`;
-
-      if (totalIncomplete > 0) {
-        const itemType = taskCount > 0 ? "Tasks" : "todos";
-        reason += ` ${totalIncomplete} incomplete ${itemType} remain. Continue working. When all work is complete, run /oh-my-claudecode:cancel to cleanly exit ultrawork mode and clean up state files.`;
-      } else if (newCount >= 5) {
-        // Strong directive: LLM must call cancel NOW
-        reason += ` No incomplete tasks detected. You MUST invoke /oh-my-claudecode:cancel immediately to exit ultrawork mode and clean up state files. Call state_clear(mode="ultrawork") if the cancel skill is unavailable.`;
-      } else if (newCount >= 3) {
-        // Reinforce clean-exit guidance once no tracked work remains.
-        reason += ` If all work is complete, run /oh-my-claudecode:cancel to cleanly exit ultrawork mode and clean up state files. If cancel fails, retry with /oh-my-claudecode:cancel --force. Otherwise, continue working.`;
-      } else {
-        // Early iterations with no tasks yet still need an immediately visible exit path.
-        reason += ` No incomplete tasks detected. If all work is complete, run /oh-my-claudecode:cancel to cleanly exit ultrawork mode and clean up state files. Otherwise, continue working - create Tasks to track your progress.`;
-      }
-
-      const currentObjective = getLiveUltraworkObjective(ultrawork.state);
-      if (currentObjective) {
-        reason += `\nCurrent objective: ${currentObjective}`;
-      }
-
-      console.log(JSON.stringify({ decision: "block", reason }));
-      return;
-    }
-
-    // Priority 9: Skill Active State (issue #1033)
+    // Priority 8: Skill Active State (issue #1033)
     // Skills like code-review, plan, ralplan, tdd, etc. write skill-active-state.json
     // when invoked via the Skill tool. This prevents premature stops mid-skill.
     {

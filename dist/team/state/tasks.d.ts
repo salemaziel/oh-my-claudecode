@@ -1,8 +1,28 @@
 import type { TeamTaskStatus } from '../contracts.js';
-import type { TeamTask, TeamTaskV2, TaskReadiness, ClaimTaskResult, TransitionTaskResult, ReleaseTaskClaimResult, TeamMonitorSnapshotState } from '../types.js';
+import type { TeamTask, TeamTaskV2, TaskReadiness, ClaimTaskResult, TransitionTaskResult, ReleaseTaskClaimResult, TaskRecoveryAdoptionProof, TaskRecoveryAdoptionResult, TaskRecoveryCheckpoint, TaskRecoveryRequeueResult, TaskRecoveryRequeueSidecar } from '../types.js';
 interface TaskReadDeps {
     readTask: (teamName: string, taskId: string, cwd: string) => Promise<TeamTask | null>;
 }
+export interface TaskDependencyFields {
+    id?: unknown;
+    depends_on?: unknown;
+    blocked_by?: unknown;
+}
+/**
+ * `depends_on` is the canonical dependency field, while `blocked_by` is kept
+ * for compatibility with older task producers. Once both fields are present
+ * they must describe the same ordered set; otherwise a reader could claim a
+ * task using one field while a monitor or writer reasons about the other.
+ */
+export declare function validateTaskDependencies(fields: TaskDependencyFields, errorMessage?: string): string[];
+/**
+ * Build the canonical persisted representation for a newly-created task.
+ *
+ * Task files are the source of truth, so every producer must use the same
+ * dependency normalization and must not persist null/undefined optional
+ * fields that readers treat as absent.
+ */
+export declare function createTaskRecord(id: string, task: Omit<TeamTask, 'id' | 'created_at'>): TeamTaskV2;
 export declare function computeTaskReadiness(teamName: string, taskId: string, cwd: string, deps: TaskReadDeps): Promise<TaskReadiness>;
 interface ClaimTaskDeps extends TaskReadDeps {
     teamName: string;
@@ -22,6 +42,7 @@ interface ClaimTaskDeps extends TaskReadDeps {
     isTerminalTaskStatus: (status: TeamTaskStatus) => boolean;
     taskFilePath: (teamName: string, taskId: string, cwd: string) => string;
     writeAtomic: (path: string, data: string) => Promise<void>;
+    launchAttemptId?: string;
 }
 export declare function claimTask(taskId: string, workerName: string, expectedVersion: number | null, deps: ClaimTaskDeps): Promise<ClaimTaskResult>;
 interface TransitionDeps extends ClaimTaskDeps {
@@ -33,12 +54,12 @@ interface TransitionDeps extends ClaimTaskDeps {
         message_id?: string | null;
         reason?: string;
     }, cwd: string) => Promise<unknown>;
-    readMonitorSnapshot: (teamName: string, cwd: string) => Promise<TeamMonitorSnapshotState | null>;
-    writeMonitorSnapshot: (teamName: string, snapshot: TeamMonitorSnapshotState, cwd: string) => Promise<void>;
+    markTaskCompleted: (teamName: string, taskId: string, cwd: string) => Promise<void>;
 }
 export declare function transitionTaskStatus(taskId: string, from: TeamTaskStatus, to: TeamTaskStatus, claimToken: string, terminalData: {
     result?: string;
     error?: string;
+    metadata?: Record<string, unknown>;
 } | undefined, deps: TransitionDeps): Promise<TransitionTaskResult>;
 type ReleaseDeps = ClaimTaskDeps;
 export declare function releaseTaskClaim(taskId: string, claimToken: string, _workerName: string, deps: ReleaseDeps): Promise<ReleaseTaskClaimResult>;
@@ -46,6 +67,38 @@ export declare function listTasks(teamName: string, cwd: string, deps: {
     teamDir: (teamName: string, cwd: string) => string;
     isTeamTask: (value: unknown) => value is TeamTask;
     normalizeTask: (task: TeamTask) => TeamTaskV2;
+    stateError?: (path: string, cause: 'json' | 'schema' | 'unreadable') => Error;
 }): Promise<TeamTask[]>;
+export interface RecoveryTaskTransitionDeps extends ClaimTaskDeps {
+    readRecoverySidecar: (teamName: string, recoveryId: string, taskId: string, cwd: string) => Promise<TaskRecoveryRequeueSidecar | null | 'malformed'>;
+    writeRecoverySidecar: (teamName: string, recoveryId: string, taskId: string, sidecar: TaskRecoveryRequeueSidecar, cwd: string) => Promise<void>;
+    selectRecoveryCheckpoint: (teamName: string, task: TeamTaskV2, cwd: string) => Promise<{
+        ok: true;
+        checkpoint: TaskRecoveryCheckpoint;
+        path: string;
+    } | {
+        ok: false;
+        error: 'missing' | 'malformed' | 'stale' | 'ambiguous';
+    }>;
+    readRecoveryCheckpoint: (path: string) => Promise<{
+        ok: true;
+        checkpoint: TaskRecoveryCheckpoint;
+        path: string;
+    } | {
+        ok: false;
+        error: 'missing' | 'malformed' | 'stale' | 'ambiguous';
+    }>;
+    verifyAdoptionToken: (token: string, hash: string) => boolean;
+}
+export interface RequeueRecoveredTaskInput {
+    recoveryId: string;
+    requestId: string;
+    taskId: string;
+    replacementWorker: string;
+    replacementGeneration: number;
+    adoptionTokenHash: string;
+}
+export declare function requeueRecoveredTask(input: RequeueRecoveredTaskInput, deps: RecoveryTaskTransitionDeps): Promise<TaskRecoveryRequeueResult>;
+export declare function adoptRecoveryReservations(taskIds: string[], workerName: string, proof: TaskRecoveryAdoptionProof, deps: RecoveryTaskTransitionDeps): Promise<TaskRecoveryAdoptionResult[]>;
 export {};
 //# sourceMappingURL=tasks.d.ts.map

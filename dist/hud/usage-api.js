@@ -1,7 +1,8 @@
 /**
  * OMC HUD - Usage API
  *
- * Fetches rate limit usage from Anthropic's OAuth API.
+ * Fetches rate limit usage from Anthropic's OAuth API, with overrides for
+ * third-party providers (z.ai, MiniMax, Kimi) detected via ANTHROPIC_BASE_URL.
  * Based on claude-hud implementation by jarrodwatts.
  *
  * Authentication:
@@ -31,11 +32,15 @@ const MAX_STALE_DATA_MS = 15 * 60 * 1000; // 15 minutes — discard stale data a
 const TOKEN_REFRESH_URL_HOSTNAME = 'platform.claude.com';
 const USAGE_CACHE_LOCK_OPTS = { staleLockMs: API_TIMEOUT_MS + 5000 };
 const TOKEN_REFRESH_URL_PATH = '/v1/oauth/token';
+const OMC_USAGE_PROFILE_ID_FIELD = 'omcUsageProfileId';
+const OMC_USAGE_PROFILE_TOKEN_HASH_FIELD = 'omcUsageProfileTokenHash';
 /**
  * OAuth client_id for Claude Code (public client).
  * This is the production value; can be overridden via CLAUDE_CODE_OAUTH_CLIENT_ID env var.
  */
 const DEFAULT_OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
+let storedCredentialCache;
+let storedCredentialLookupGeneration = 0;
 function isEnterpriseUsageContext(options) {
     if (!options)
         return true;
@@ -79,6 +84,34 @@ export function isMinimaxHost(urlString) {
         return false;
     }
 }
+/**
+ * Check if a URL points to the Kimi For Coding platform (kimi.com).
+ * Matches kimi.com and any subdomain (e.g. api.kimi.com). The Moonshot open
+ * platform (api.moonshot.ai / api.moonshot.cn) is intentionally NOT matched:
+ * it exposes balance, not plan quota windows (no /usages endpoint).
+ */
+export function isKimiHost(urlString) {
+    try {
+        const url = new URL(urlString);
+        const hostname = url.hostname.toLowerCase();
+        return hostname === 'kimi.com' || hostname.endsWith('.kimi.com');
+    }
+    catch {
+        return false;
+    }
+}
+/**
+ * Hostnames allowed to receive the Kimi bearer token.
+ *
+ * `isKimiHost()` deliberately matches every `*.kimi.com` subdomain so provider
+ * detection stays forgiving, but the credential itself must only ever travel to
+ * the first-party origin Moonshot documents (`https://api.kimi.com/coding/`).
+ * Pinning here keeps an attacker-influenced `ANTHROPIC_BASE_URL` — say a
+ * takeover-prone or user-content `*.kimi.com` subdomain — from exfiltrating it.
+ */
+const KIMI_USAGE_HOSTNAMES = new Set(['api.kimi.com', 'kimi.com']);
+/** Fixed path of the Kimi usage endpoint; never derived from the environment */
+const KIMI_USAGE_PATH = '/coding/v1/usages';
 /**
  * Get the legacy (pre-split) cache file path
  */
@@ -151,6 +184,15 @@ function readCache(source) {
             if (cache.data.extraUsageResetsAt) {
                 cache.data.extraUsageResetsAt = new Date(cache.data.extraUsageResetsAt);
             }
+            if (Array.isArray(cache.data.scopedWeeklyBuckets)) {
+                for (const bucket of cache.data.scopedWeeklyBuckets) {
+                    const rawResetsAt = bucket?.resetsAt;
+                    if (rawResetsAt == null || rawResetsAt instanceof Date)
+                        continue;
+                    const parsedResetsAt = new Date(rawResetsAt);
+                    bucket.resetsAt = isNaN(parsedResetsAt.getTime()) ? null : parsedResetsAt;
+                }
+            }
         }
         return cache;
     }
@@ -178,6 +220,9 @@ function writeCache(opts) {
             rateLimitedCount: opts.rateLimitedCount && opts.rateLimitedCount > 0 ? opts.rateLimitedCount : undefined,
             rateLimitedUntil: opts.rateLimitedUntil,
             lastSuccessAt: opts.lastSuccessAt,
+            rateLimitIdentity: opts.rateLimitIdentity,
+            credentialIdentity: opts.credentialIdentity,
+            rateLimitBackoffs: opts.rateLimitBackoffs,
         };
         writeFileSync(cachePath, JSON.stringify(cache, null, 2));
     }
@@ -209,8 +254,160 @@ function getRateLimitedBackoffMs(pollIntervalMs, count) {
 function getTransientNetworkBackoffMs(pollIntervalMs) {
     return Math.max(CACHE_TTL_TRANSIENT_NETWORK_MS, sanitizePollIntervalMs(pollIntervalMs));
 }
-function isCacheValid(cache, pollIntervalMs) {
-    if (cache.rateLimited) {
+function getRateLimitBackoff(cache, rateLimitIdentity) {
+    const identity = rateLimitIdentity ?? 'anonymous';
+    const stored = cache?.rateLimitBackoffs?.[identity];
+    if (stored)
+        return stored;
+    // Interpret caches written before per-identity backoffs existed as anonymous
+    // entries, preserving their protection without letting them suppress a
+    // versioned request.
+    if (cache?.rateLimited &&
+        (cache.rateLimitIdentity ?? 'anonymous') === identity) {
+        return {
+            timestamp: cache.timestamp,
+            rateLimitedCount: cache.rateLimitedCount || 1,
+            rateLimitedUntil: cache.rateLimitedUntil,
+        };
+    }
+    return null;
+}
+function getRateLimitBackoffs(cache) {
+    const backoffs = { ...(cache?.rateLimitBackoffs ?? {}) };
+    if (cache?.rateLimited) {
+        const identity = cache.rateLimitIdentity ?? 'anonymous';
+        backoffs[identity] ??= {
+            timestamp: cache.timestamp,
+            rateLimitedCount: cache.rateLimitedCount || 1,
+            rateLimitedUntil: cache.rateLimitedUntil,
+        };
+    }
+    return backoffs;
+}
+function clearRateLimitBackoff(cache, rateLimitIdentity) {
+    const backoffs = getRateLimitBackoffs(cache);
+    delete backoffs[rateLimitIdentity ?? 'anonymous'];
+    return Object.keys(backoffs).length > 0 ? backoffs : undefined;
+}
+/** Hash credential identity material before persisting it in caches or markers. */
+function hashCredentialIdentity(identity) {
+    return createHash('sha256').update(identity).digest('hex');
+}
+function getOAuthAccountProfileIdentity(credentials) {
+    const nestedAccount = credentials.oauthAccount;
+    const account = typeof nestedAccount === 'object' && nestedAccount !== null && !Array.isArray(nestedAccount)
+        ? nestedAccount
+        : {};
+    const firstString = (...values) => {
+        for (const value of values) {
+            if (typeof value === 'string' && value.trim())
+                return value.trim();
+        }
+        return undefined;
+    };
+    const credentialUuid = firstString(credentials.accountUuid, credentials.accountUUID, account.accountUuid, account.accountUUID, account.uuid);
+    if (credentialUuid) {
+        return hashCredentialIdentity(JSON.stringify(['oauth-account-uuid', credentialUuid.toLowerCase()]));
+    }
+    const credentialAccountId = firstString(credentials.accountId, credentials.userId, credentials.userID, account.accountId, account.userId, account.userID);
+    const credentialEmail = firstString(credentials.emailAddress, credentials.email, account.emailAddress, account.email);
+    // Managed OMC launches copy account metadata into the active config directory;
+    // the standard Claude layout keeps it beside that directory instead.
+    let claudeJsonAccount = {};
+    const configDir = getClaudeConfigDir();
+    const claudeJsonPaths = new Set([
+        join(configDir, '.claude.json'),
+        join(dirname(configDir), '.claude.json'),
+    ]);
+    for (const claudeJsonPath of claudeJsonPaths) {
+        let parsed;
+        try {
+            if (!existsSync(claudeJsonPath))
+                continue;
+            parsed = JSON.parse(readFileSync(claudeJsonPath, 'utf-8'));
+        }
+        catch {
+            // Do not substitute a different account identity when an existing file is unreadable.
+            return null;
+        }
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed))
+            return null;
+        const accountMetadata = parsed.oauthAccount;
+        if (accountMetadata == null)
+            continue;
+        if (typeof accountMetadata === 'object' &&
+            !Array.isArray(accountMetadata)) {
+            const candidate = accountMetadata;
+            if (firstString(candidate.accountUuid, candidate.accountUUID, candidate.uuid, candidate.accountId, candidate.userId, candidate.userID, candidate.emailAddress, candidate.email)) {
+                claudeJsonAccount = candidate;
+                break;
+            }
+        }
+        else {
+            return null;
+        }
+    }
+    const accountUuid = firstString(claudeJsonAccount.accountUuid, claudeJsonAccount.accountUUID, claudeJsonAccount.uuid);
+    const claudeJsonAccountId = firstString(claudeJsonAccount.accountId, claudeJsonAccount.userId, claudeJsonAccount.userID);
+    const claudeJsonEmail = firstString(claudeJsonAccount.emailAddress, claudeJsonAccount.email);
+    if (accountUuid) {
+        // A config UUID cannot safely stand in for a credential with a different identifier shape.
+        if (credentialAccountId)
+            return null;
+        if (credentialEmail &&
+            (!claudeJsonEmail || credentialEmail.toLowerCase() !== claudeJsonEmail.toLowerCase())) {
+            return null;
+        }
+        return hashCredentialIdentity(JSON.stringify(['oauth-account-uuid', accountUuid.toLowerCase()]));
+    }
+    if (claudeJsonAccountId && credentialAccountId) {
+        if (claudeJsonAccountId !== credentialAccountId)
+            return null;
+        return hashCredentialIdentity(JSON.stringify(['oauth-account', credentialAccountId]));
+    }
+    if ((claudeJsonAccountId && credentialEmail) || (credentialAccountId && claudeJsonEmail)) {
+        return null;
+    }
+    const accountId = credentialAccountId ?? claudeJsonAccountId;
+    if (accountId)
+        return hashCredentialIdentity(JSON.stringify(['oauth-account', accountId]));
+    if (credentialEmail && claudeJsonEmail &&
+        credentialEmail.toLowerCase() !== claudeJsonEmail.toLowerCase()) {
+        return null;
+    }
+    const tokenMaterial = firstString(credentials.refreshToken, credentials.accessToken);
+    const tokenHash = tokenMaterial ? hashCredentialIdentity(tokenMaterial) : undefined;
+    const storedProfileIdentity = firstString(credentials[OMC_USAGE_PROFILE_ID_FIELD]);
+    const storedTokenHash = firstString(credentials[OMC_USAGE_PROFILE_TOKEN_HASH_FIELD]);
+    if (storedProfileIdentity && tokenHash && storedTokenHash === tokenHash) {
+        return storedProfileIdentity;
+    }
+    const emailAddress = credentialEmail ?? claudeJsonEmail;
+    if (emailAddress) {
+        return hashCredentialIdentity(JSON.stringify(['oauth-email', emailAddress.toLowerCase()]));
+    }
+    return tokenHash ?? null;
+}
+function isCacheForCredential(cache, credentialIdentity) {
+    if (!cache)
+        return false;
+    if (credentialIdentity !== undefined)
+        return cache.credentialIdentity === credentialIdentity;
+    return cache.credentialIdentity === undefined && cache.data === null;
+}
+function isCacheValid(cache, pollIntervalMs, rateLimitIdentity) {
+    if (cache.source === 'anthropic') {
+        const backoff = getRateLimitBackoff(cache, rateLimitIdentity);
+        if (backoff) {
+            if (backoff.rateLimitedUntil != null) {
+                return Date.now() < backoff.rateLimitedUntil;
+            }
+            return Date.now() - backoff.timestamp < getRateLimitedBackoffMs(pollIntervalMs, backoff.rateLimitedCount);
+        }
+        if (cache.rateLimited)
+            return false;
+    }
+    else if (cache.rateLimited) {
         if (cache.rateLimitedUntil != null) {
             return Date.now() < cache.rateLimitedUntil;
         }
@@ -233,7 +430,13 @@ function hasUsableStaleData(cache) {
     }
     return true;
 }
-function getCachedUsageResult(cache) {
+function getCachedUsageResult(cache, rateLimitIdentity) {
+    if (cache.source === 'anthropic' && getRateLimitBackoff(cache, rateLimitIdentity)) {
+        if (!hasUsableStaleData(cache) && cache.data) {
+            return { rateLimits: null, error: 'rate_limited' };
+        }
+        return { rateLimits: cache.data, error: 'rate_limited', stale: cache.data ? true : undefined };
+    }
     if (cache.rateLimited) {
         if (!hasUsableStaleData(cache) && cache.data) {
             return { rateLimits: null, error: 'rate_limited' };
@@ -249,9 +452,10 @@ function getCachedUsageResult(cache) {
     }
     return { rateLimits: cache.data };
 }
-function createRateLimitedCacheEntry(source, data, pollIntervalMs, previousCount, lastSuccessAt) {
+function createRateLimitedCacheEntry(source, data, pollIntervalMs, previousCount, lastSuccessAt, rateLimitIdentity, previousBackoffs) {
     const timestamp = Date.now();
     const rateLimitedCount = previousCount + 1;
+    const identity = rateLimitIdentity ?? 'anonymous';
     return {
         timestamp,
         data,
@@ -262,6 +466,19 @@ function createRateLimitedCacheEntry(source, data, pollIntervalMs, previousCount
         rateLimitedCount,
         rateLimitedUntil: timestamp + getRateLimitedBackoffMs(pollIntervalMs, rateLimitedCount),
         lastSuccessAt,
+        rateLimitIdentity,
+        ...(source === 'anthropic'
+            ? {
+                rateLimitBackoffs: {
+                    ...(previousBackoffs ?? {}),
+                    [identity]: {
+                        timestamp,
+                        rateLimitedCount,
+                        rateLimitedUntil: timestamp + getRateLimitedBackoffMs(pollIntervalMs, rateLimitedCount),
+                    },
+                },
+            }
+            : {}),
     };
 }
 /**
@@ -283,6 +500,12 @@ function getKeychainServiceName() {
 function isCredentialExpired(creds) {
     return creds.expiresAt != null && creds.expiresAt <= Date.now();
 }
+function isMissingKeychainItem(error) {
+    if (typeof error !== 'object' || error === null)
+        return false;
+    const details = error;
+    return /the specified item could not be found in the keychain/i.test(`${String(details.message ?? '')}\n${String(details.stderr ?? '')}`);
+}
 function readKeychainCredential(serviceName, account) {
     try {
         const args = account
@@ -294,24 +517,30 @@ function readKeychainCredential(serviceName, account) {
             stdio: ['pipe', 'pipe', 'pipe'],
         }).trim();
         if (!result)
-            return null;
+            return { status: 'unavailable' };
         const parsed = JSON.parse(result);
         // Handle nested structure (claudeAiOauth wrapper)
         const creds = parsed.claudeAiOauth || parsed;
         if (!creds.accessToken)
-            return null;
+            return { status: 'unavailable' };
+        const profileIdentity = getOAuthAccountProfileIdentity(creds);
         return {
-            accessToken: creds.accessToken,
-            expiresAt: creds.expiresAt,
-            refreshToken: creds.refreshToken,
-            source: 'keychain',
-            keychainAccount: account ?? null,
-            subscriptionType: creds.subscriptionType,
-            rateLimitTier: creds.rateLimitTier,
+            status: 'found',
+            credentials: {
+                accessToken: creds.accessToken,
+                expiresAt: creds.expiresAt,
+                refreshToken: creds.refreshToken,
+                profileIdentity: profileIdentity ?? undefined,
+                profileIdentityUnavailable: profileIdentity === null,
+                source: 'keychain',
+                keychainAccount: account ?? null,
+                subscriptionType: creds.subscriptionType,
+                rateLimitTier: creds.rateLimitTier,
+            },
         };
     }
-    catch {
-        return null;
+    catch (error) {
+        return isMissingKeychainItem(error) ? { status: 'missing' } : { status: 'unavailable' };
     }
 }
 /**
@@ -319,7 +548,7 @@ function readKeychainCredential(serviceName, account) {
  */
 function readKeychainCredentials() {
     if (process.platform !== 'darwin')
-        return null;
+        return { status: 'missing' };
     const serviceName = getKeychainServiceName();
     const candidateAccounts = [];
     try {
@@ -334,15 +563,23 @@ function readKeychainCredentials() {
     candidateAccounts.push(undefined);
     let expiredFallback = null;
     for (const account of candidateAccounts) {
-        const creds = readKeychainCredential(serviceName, account);
-        if (!creds)
+        const result = readKeychainCredential(serviceName, account);
+        if (result.status === 'unavailable') {
+            if (expiredFallback)
+                return { status: 'found', credentials: expiredFallback };
+            return result;
+        }
+        if (result.status === 'missing')
             continue;
+        const creds = result.credentials;
         if (!isCredentialExpired(creds)) {
-            return creds;
+            return result;
         }
         expiredFallback ??= creds;
     }
-    return expiredFallback;
+    if (expiredFallback)
+        return { status: 'found', credentials: expiredFallback };
+    return { status: 'missing' };
 }
 /**
  * Read OAuth credentials from file fallback
@@ -357,10 +594,13 @@ function readFileCredentials() {
         // Handle nested structure (claudeAiOauth wrapper)
         const creds = parsed.claudeAiOauth || parsed;
         if (creds.accessToken) {
+            const profileIdentity = getOAuthAccountProfileIdentity(creds);
             return {
                 accessToken: creds.accessToken,
                 expiresAt: creds.expiresAt,
                 refreshToken: creds.refreshToken,
+                profileIdentity: profileIdentity ?? undefined,
+                profileIdentityUnavailable: profileIdentity === null,
                 source: 'file',
                 subscriptionType: creds.subscriptionType,
                 rateLimitTier: creds.rateLimitTier,
@@ -372,16 +612,100 @@ function readFileCredentials() {
     }
     return null;
 }
-/**
- * Get OAuth credentials (Keychain first, then file fallback)
- */
-function getCredentials() {
-    // Try Keychain first (macOS)
-    const keychainCreds = readKeychainCredentials();
-    if (keychainCreds)
-        return keychainCreds;
-    // Fall back to file
-    return readFileCredentials();
+function getStoredCredentialCacheKey() {
+    return JSON.stringify([process.env.CLAUDE_CONFIG_DIR ?? null, getClaudeConfigDir()]);
+}
+/** Use the file fallback only after Keychain confirms there is no matching item. */
+function getStoredCredentials(refresh = false) {
+    const configKey = getStoredCredentialCacheKey();
+    if (!refresh &&
+        storedCredentialCache?.configKey === configKey &&
+        Date.now() - storedCredentialCache.checkedAt < getUsagePollIntervalMs() + CACHE_TTL_FAILURE_MS) {
+        return storedCredentialCache.credentials;
+    }
+    // Do not treat a failed Keychain read as an absent entry: the file may belong to another account.
+    const keychainLookup = readKeychainCredentials();
+    let credentials = null;
+    if (keychainLookup.status === 'found') {
+        credentials = keychainLookup.credentials;
+    }
+    else if (keychainLookup.status === 'missing') {
+        credentials = readFileCredentials();
+    }
+    storedCredentialCache = { configKey, checkedAt: Date.now(), credentials };
+    storedCredentialLookupGeneration++;
+    return credentials;
+}
+function rememberStoredCredentials(credentials) {
+    storedCredentialCache = {
+        configKey: getStoredCredentialCacheKey(),
+        checkedAt: Date.now(),
+        credentials,
+    };
+}
+function getCredentials(includeDirectOAuthToken = true, refreshStoredCredentials = false) {
+    // Respect an explicit CLAUDE_CODE_OAUTH_TOKEN override, matching how Claude Code itself
+    // authenticates. Multi-account setups launch each session with a per-account token via this
+    // env var; without honoring it here the HUD always reads the default Keychain login and shows
+    // the wrong account's usage. Setup-tokens are long-lived and carry no refresh token, so leave
+    // expiresAt/refreshToken unset — isCredentialExpired() then treats them as non-expiring and no
+    // token refresh or Keychain write-back is attempted.
+    const envToken = includeDirectOAuthToken ? process.env.CLAUDE_CODE_OAUTH_TOKEN?.trim() : undefined;
+    if (envToken) {
+        return { accessToken: envToken, source: 'env' };
+    }
+    return getStoredCredentials(refreshStoredCredentials);
+}
+function resolveUsageProfile(includeEnvironmentCredentials = true, refreshStoredCredentials = false) {
+    const baseUrl = includeEnvironmentCredentials ? process.env.ANTHROPIC_BASE_URL : undefined;
+    const authToken = includeEnvironmentCredentials ? process.env.ANTHROPIC_AUTH_TOKEN : undefined;
+    const isMinimax = baseUrl != null && isMinimaxHost(baseUrl);
+    const isKimi = baseUrl != null && isKimiHost(baseUrl);
+    const isZai = baseUrl != null && isZaiHost(baseUrl);
+    const minimaxApiKey = includeEnvironmentCredentials
+        ? process.env.MINIMAX_API_KEY || authToken
+        : undefined;
+    // Preserve Kimi's documented credential precedence: provider key, Anthropic
+    // API key, then auth token. A leftover auth token must not mask the Kimi key.
+    const kimiApiKey = includeEnvironmentCredentials
+        ? process.env.KIMI_API_KEY || process.env.ANTHROPIC_API_KEY || authToken
+        : undefined;
+    const currentSource = isMinimax ? 'minimax' : isKimi ? 'kimi' : isZai && authToken ? 'zai' : 'anthropic';
+    const previousLookupGeneration = storedCredentialLookupGeneration;
+    const credentials = currentSource === 'anthropic'
+        ? getCredentials(includeEnvironmentCredentials, refreshStoredCredentials)
+        : null;
+    const providerCredential = currentSource === 'minimax'
+        ? minimaxApiKey
+        : currentSource === 'kimi'
+            ? kimiApiKey
+            : currentSource === 'zai'
+                ? authToken
+                : undefined;
+    const credentialIdentity = credentials
+        ? credentials.profileIdentityUnavailable
+            ? undefined
+            : hashCredentialIdentity(JSON.stringify([
+                currentSource,
+                baseUrl ?? null,
+                credentials.profileIdentity ?? hashCredentialIdentity(credentials.refreshToken ?? credentials.accessToken),
+            ]))
+        : providerCredential
+            ? hashCredentialIdentity(JSON.stringify([currentSource, baseUrl ?? null, providerCredential]))
+            : undefined;
+    return {
+        currentSource,
+        authToken,
+        minimaxApiKey,
+        kimiApiKey,
+        credentials,
+        credentialIdentity,
+        storedCredentialsRead: storedCredentialLookupGeneration !== previousLookupGeneration,
+    };
+}
+/** Return a non-reversible identity for the source and credential used by getUsage. */
+export function getUsageCredentialIdentity(includeEnvironmentCredentials = true, refreshStoredCredentials = false) {
+    return resolveUsageProfile(includeEnvironmentCredentials, refreshStoredCredentials).credentialIdentity ?? null;
 }
 /**
  * Get subscription info from OAuth credentials.
@@ -462,9 +786,45 @@ function refreshAccessToken(refreshToken) {
     });
 }
 /**
+ * Build the User-Agent for the OAuth usage request.
+ *
+ * The endpoint buckets its rate limit by User-Agent, and a request that does not
+ * name a Claude Code *version* lands in a bucket that allows roughly one request
+ * per hour. Measured against api.anthropic.com with a single OAuth token,
+ * requests seconds apart, recording status and `retry-after` only:
+ *
+ *   User-Agent           | HTTP | retry-after
+ *   ---------------------|------|--------------------------------------------
+ *   (header omitted)     | 429  | 348s
+ *   claude-code          | 429  | 349s / 348s - same absolute deadline
+ *   claude-code/2.1.232  | 403  | none - the endpoint's real answer
+ *   claude-code/9.9.9    | 403  | none - the endpoint's real answer
+ *
+ * Node sends no User-Agent of its own, so this call has been landing in the
+ * throttled bucket and only the first request of each hour ever reached the API.
+ *
+ * The version is never invented. It comes from the Claude Code statusline
+ * payload's `version` field. When we do not have one we send no header at all:
+ * the bare product token was measured to share the throttled bucket, so it would
+ * buy nothing while looking like a fix, and a made-up version would put a false
+ * claim on the wire. The pattern is anchored because the value arrives as JSON
+ * and an unanchored match would let stray characters into an outgoing header.
+ */
+export function buildUserAgent(clientVersion) {
+    if (typeof clientVersion !== 'string')
+        return undefined;
+    const version = clientVersion.trim();
+    if (version.length > 128)
+        return undefined;
+    return /^\d+\.\d+\.\d+[A-Za-z0-9.+-]*$/.test(version)
+        ? `claude-code/${version}`
+        : undefined;
+}
+/**
  * Fetch usage from Anthropic API
  */
-function fetchUsageFromApi(accessToken) {
+function fetchUsageFromApi(accessToken, clientVersion) {
+    const userAgent = buildUserAgent(clientVersion);
     return new Promise((resolve) => {
         const req = https.request({
             hostname: 'api.anthropic.com',
@@ -474,6 +834,7 @@ function fetchUsageFromApi(accessToken) {
                 'Authorization': `Bearer ${accessToken}`,
                 'anthropic-beta': 'oauth-2025-04-20',
                 'Content-Type': 'application/json',
+                ...(userAgent ? { 'User-Agent': userAgent } : {}),
             },
             timeout: API_TIMEOUT_MS,
         }, (res) => {
@@ -496,6 +857,16 @@ function fetchUsageFromApi(accessToken) {
                     }
                     resolve({ data: null, rateLimited: true });
                 }
+                else if (res.statusCode === 403) {
+                    // Tokens minted by `claude setup-token` (headless / multi-account
+                    // setups launched with CLAUDE_CODE_OAUTH_TOKEN) lack the `user:profile`
+                    // scope this endpoint requires, so it answers 403. Such a token can
+                    // still read its own throttle status from the anthropic-ratelimit-
+                    // unified-* headers of an ordinary inference call, so fall back to that.
+                    // This recovers the 5h + weekly windows only — per-model weekly buckets
+                    // (e.g. "Fable") exist solely in this endpoint's body and are lost here.
+                    fetchUsageViaRateLimitHeaders(accessToken, clientVersion).then(resolve);
+                }
                 else {
                     resolve({ data: null });
                 }
@@ -506,6 +877,104 @@ function fetchUsageFromApi(accessToken) {
             req.destroy();
             resolve({ data: null });
         });
+        req.end();
+    });
+}
+/**
+ * Model used only to elicit rate-limit headers in the 403 fallback below. Any
+ * cheap, broadly-available model works; the reply content is discarded and
+ * max_tokens is 1. If it is ever retired the fallback degrades to "no data"
+ * (exactly as before this fallback existed), never an error.
+ */
+const RATE_LIMIT_PROBE_MODEL = 'claude-haiku-4-5-20251001';
+/**
+ * Build a synthetic UsageApiResponse from the `anthropic-ratelimit-unified-*`
+ * response headers of a /v1/messages call. Header utilization is a 0..1 fraction
+ * while the usage body (and parseUsageResponse) works in 0..100, so scale by 100.
+ * Reset headers are unix epoch seconds. Returns null when neither window is
+ * present. Exported for unit testing.
+ */
+export function rateLimitHeadersToUsage(headers) {
+    const num = (name) => {
+        const raw = headers[name];
+        const value = Array.isArray(raw) ? raw[0] : raw;
+        if (value == null)
+            return undefined;
+        const parsed = Number(value);
+        return isFinite(parsed) ? parsed : undefined;
+    };
+    const iso = (name) => {
+        const secs = num(name);
+        if (secs == null)
+            return undefined;
+        return new Date(secs * 1000).toISOString();
+    };
+    const fiveHour = num('anthropic-ratelimit-unified-5h-utilization');
+    const sevenDay = num('anthropic-ratelimit-unified-7d-utilization');
+    if (fiveHour == null && sevenDay == null)
+        return null;
+    const usage = {};
+    if (fiveHour != null) {
+        usage.five_hour = {
+            utilization: fiveHour * 100,
+            resets_at: iso('anthropic-ratelimit-unified-5h-reset'),
+        };
+    }
+    if (sevenDay != null) {
+        usage.seven_day = {
+            utilization: sevenDay * 100,
+            resets_at: iso('anthropic-ratelimit-unified-7d-reset'),
+        };
+    }
+    return usage;
+}
+/**
+ * Fallback usage source for OAuth tokens that lack the `user:profile` scope
+ * /api/oauth/usage requires (notably `claude setup-token` credentials used by
+ * headless / multi-account setups, which get 403 there). A minimal inference call
+ * carries the account's throttle status in its `anthropic-ratelimit-unified-*`
+ * response headers, which we turn into a five-hour + weekly UsageApiResponse.
+ * Best-effort: any non-200, transport error, or timeout resolves to no data.
+ */
+function fetchUsageViaRateLimitHeaders(accessToken, clientVersion) {
+    const userAgent = buildUserAgent(clientVersion);
+    const body = JSON.stringify({
+        model: RATE_LIMIT_PROBE_MODEL,
+        max_tokens: 1,
+        messages: [{ role: 'user', content: '.' }],
+    });
+    return new Promise((resolve) => {
+        const req = https.request({
+            hostname: 'api.anthropic.com',
+            path: '/v1/messages',
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${accessToken}`,
+                'anthropic-beta': 'oauth-2025-04-20',
+                'anthropic-version': '2023-06-01',
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(body),
+                ...(userAgent ? { 'User-Agent': userAgent } : {}),
+            },
+            timeout: API_TIMEOUT_MS,
+        }, (res) => {
+            // Only the headers matter; drain the body so the socket can close.
+            res.on('data', () => { });
+            res.on('end', () => {
+                if (res.statusCode === 200) {
+                    resolve({ data: rateLimitHeadersToUsage(res.headers) });
+                }
+                else {
+                    resolve({ data: null, rateLimited: res.statusCode === 429 });
+                }
+            });
+        });
+        req.on('error', () => resolve({ data: null }));
+        req.on('timeout', () => {
+            req.destroy();
+            resolve({ data: null });
+        });
+        req.write(body);
         req.end();
     });
 }
@@ -604,19 +1073,11 @@ function writeKeychainCredentials(creds) {
         // Merge into the correct structure
         if (existing.claudeAiOauth && typeof existing.claudeAiOauth === 'object') {
             const inner = existing.claudeAiOauth;
-            inner.accessToken = creds.accessToken;
-            if (creds.expiresAt != null)
-                inner.expiresAt = creds.expiresAt;
-            if (creds.refreshToken)
-                inner.refreshToken = creds.refreshToken;
+            updateStoredOAuthCredentialFields(inner, creds);
         }
         else {
             // Flat structure or empty
-            existing.accessToken = creds.accessToken;
-            if (creds.expiresAt != null)
-                existing.expiresAt = creds.expiresAt;
-            if (creds.refreshToken)
-                existing.refreshToken = creds.refreshToken;
+            updateStoredOAuthCredentialFields(existing, creds);
         }
         const newJson = JSON.stringify(existing);
         const writeArgs = account
@@ -635,17 +1096,33 @@ function writeKeychainCredentials(creds) {
         }
     }
 }
+function updateStoredOAuthCredentialFields(record, creds) {
+    record.accessToken = creds.accessToken;
+    if (creds.expiresAt != null)
+        record.expiresAt = creds.expiresAt;
+    if (creds.refreshToken)
+        record.refreshToken = creds.refreshToken;
+    if (creds.profileIdentity) {
+        // A successful refresh proves same-account continuity; rebind legacy identity
+        // to the new token so it survives a credential-store reread.
+        record[OMC_USAGE_PROFILE_ID_FIELD] = creds.profileIdentity;
+        record[OMC_USAGE_PROFILE_TOKEN_HASH_FIELD] = hashCredentialIdentity(creds.refreshToken ?? creds.accessToken);
+    }
+}
 /**
  * Persist refreshed credentials back to the credential store.
  * When the credentials originated from Keychain, writes back to Keychain.
  * When they originated from file, updates ~/.claude/.credentials.json.
- * Updates only the OAuth token fields, preserving other data.
+ * Environment-provided credentials are process-owned and are never persisted.
+ * The profile marker is bound to the refreshed token to preserve legacy identity.
  */
 function writeBackCredentials(creds) {
     if (creds.source === 'keychain') {
         writeKeychainCredentials(creds);
         return;
     }
+    if (creds.source === 'env')
+        return;
     try {
         const credPath = join(getClaudeConfigDir(), '.credentials.json');
         if (!existsSync(credPath))
@@ -654,23 +1131,11 @@ function writeBackCredentials(creds) {
         const parsed = JSON.parse(content);
         // Update the nested structure
         if (parsed.claudeAiOauth) {
-            parsed.claudeAiOauth.accessToken = creds.accessToken;
-            if (creds.expiresAt != null) {
-                parsed.claudeAiOauth.expiresAt = creds.expiresAt;
-            }
-            if (creds.refreshToken) {
-                parsed.claudeAiOauth.refreshToken = creds.refreshToken;
-            }
+            updateStoredOAuthCredentialFields(parsed.claudeAiOauth, creds);
         }
         else {
             // Flat structure
-            parsed.accessToken = creds.accessToken;
-            if (creds.expiresAt != null) {
-                parsed.expiresAt = creds.expiresAt;
-            }
-            if (creds.refreshToken) {
-                parsed.refreshToken = creds.refreshToken;
-            }
+            updateStoredOAuthCredentialFields(parsed, creds);
         }
         // Atomic write: write to tmp file, then rename (atomic on POSIX, best-effort on Windows)
         const tmpPath = `${credPath}.tmp.${process.pid}`;
@@ -707,6 +1172,101 @@ function clamp(v) {
     return Math.max(0, Math.min(100, v));
 }
 /**
+ * Parse `response.limits[]` defensively into recognized Sonnet/Opus weekly
+ * quotas plus a generic bucket list for unrecognized scoped weekly model
+ * families (e.g. "Fable").
+ *
+ * - Only `kind === "weekly_scoped"` entries are considered.
+ * - Entries missing/malformed `scope.model.display_name` or a finite `percent`
+ *   are skipped rather than throwing.
+ * - Family recognition is a case-insensitive substring match against
+ *   `display_name` (not an exact-case/enum match), so "Sonnet 4.5" or
+ *   "claude-sonnet" style names still map onto the Sonnet field.
+ * - Duplicate buckets for the same `display_name` are deduped, preferring the
+ *   entry flagged `is_active: true`; `is_active` is used only for this
+ *   tiebreak, never to hide/filter a bucket, so an inactive-but-present scoped
+ *   quota still renders.
+ * - When multiple *distinct* display names map onto the same recognized
+ *   family (e.g. two differently-named Sonnet tiers), the first one wins —
+ *   later ones do not overwrite an already-filled typed field.
+ */
+function resolveScopedWeeklyLimits(limits, parseDate) {
+    const result = { generic: [] };
+    if (!Array.isArray(limits))
+        return result;
+    // Dedup by normalized display_name, preferring the is_active entry.
+    const byKey = new Map();
+    for (const entry of limits) {
+        if (!entry || typeof entry !== 'object')
+            continue;
+        if (entry.kind !== 'weekly_scoped')
+            continue;
+        if (typeof entry.percent !== 'number' || !isFinite(entry.percent))
+            continue;
+        const displayName = entry.scope?.model?.display_name;
+        if (typeof displayName !== 'string' || displayName.trim() === '')
+            continue;
+        const key = displayName.trim().toLowerCase();
+        const isActive = entry.is_active === true;
+        const existing = byKey.get(key);
+        if (!existing || (isActive && !existing.isActive)) {
+            byKey.set(key, {
+                percent: entry.percent,
+                resetsAt: entry.resets_at,
+                isActive,
+                modelId: entry.scope?.model?.id,
+                displayName: displayName.trim(),
+            });
+        }
+    }
+    for (const bucket of byKey.values()) {
+        const percent = clamp(bucket.percent);
+        const resetsAt = parseDate(bucket.resetsAt);
+        const lower = bucket.displayName.toLowerCase();
+        const isSonnetFamily = lower.includes('sonnet');
+        const isOpusFamily = lower.includes('opus');
+        if (isSonnetFamily) {
+            // First Sonnet-family entry wins; later distinct Sonnet-named entries are
+            // dropped rather than falling through to the generic bucket (they refer
+            // to the same recognized family, not an unrecognized one).
+            if (result.sonnet == null)
+                result.sonnet = { percent, resetsAt };
+        }
+        else if (isOpusFamily) {
+            if (result.opus == null)
+                result.opus = { percent, resetsAt };
+        }
+        else {
+            const id = typeof bucket.modelId === 'string' && bucket.modelId.trim() !== '' ? bucket.modelId : lower;
+            result.generic.push({ id, label: bucket.displayName, percent, resetsAt, isActive: bucket.isActive });
+        }
+    }
+    return result;
+}
+/**
+ * Resolve the minor-unit exponent for `used_credits`/`monthly_limit`.
+ *
+ * The API annotates the currency's minor-unit exponent in `decimal_places`
+ * (EUR=2, JPY=0, BHD=3 per ISO 4217), so we no longer have to guess the scale.
+ * USD is implicitly 2-digit when the field is absent (long-standing behaviour).
+ * Returns null when the scale is unknown (non-USD currency without
+ * decimal_places), so callers skip the field rather than show a wrong figure.
+ *
+ * The exponent (not just the divisor) is carried through to the renderer so it
+ * can format with the right number of decimals — ¥50,000 not ¥50,000.00.
+ */
+function minorUnitDecimals(currency, decimalPlaces) {
+    // ISO 4217 minor-unit exponents are 0–4. Reject anything outside that range
+    // (malformed/changed payload) so a bogus value can't reach toFixed(), which
+    // throws a RangeError outside 0–100 — skip the field instead of crashing.
+    if (decimalPlaces != null && Number.isInteger(decimalPlaces) && decimalPlaces >= 0 && decimalPlaces <= 4) {
+        return decimalPlaces;
+    }
+    if (currency === 'USD')
+        return 2;
+    return null;
+}
+/**
  * Parse API response into RateLimits
  */
 export function parseUsageResponse(response, options) {
@@ -717,23 +1277,18 @@ export function parseUsageResponse(response, options) {
     const extra = response.extra_usage;
     const usedCredits = extra?.used_credits;
     const extraCurrency = (extra?.currency ?? 'USD').toUpperCase();
+    const minorDecimals = minorUnitDecimals(extraCurrency, extra?.decimal_places);
+    const minorDivisor = minorDecimals == null ? null : 10 ** minorDecimals;
     const isEnterpriseContext = isEnterpriseUsageContext(options);
-    // used_credits are only usable when we know how to interpret the minor-unit digits;
-    // see the USD guards in the extra_usage branch below for rationale.
-    const hasUsableUsedCredits = usedCredits != null && extraCurrency === 'USD';
-    const hasUsableEnterprise = isEnterpriseContext && hasUsableUsedCredits;
+    // Enterprise credits are usable once we know the minor-unit scale: USD, or any
+    // currency the API annotated with decimal_places (minorDivisor != null). The
+    // enterprise renderer is currency-aware (enterpriseCurrency).
+    const hasUsableEnterprise = isEnterpriseContext && usedCredits != null && minorDivisor != null;
     const hasUsableUsdExtraUsage = extra?.limit_usd != null && extra.limit_usd > 0;
-    const hasUsableCreditExtraUsage = !isEnterpriseContext && hasUsableUsedCredits && extra?.monthly_limit != null && extra.monthly_limit > 0;
+    // The Max/Pro overage renderer (limits.ts) hard-codes "$", so credit-shaped
+    // overage stays USD-only until that renderer learns about currency.
+    const hasUsableCreditExtraUsage = !isEnterpriseContext && usedCredits != null && extraCurrency === 'USD' && extra?.monthly_limit != null && extra.monthly_limit > 0;
     const hasUsableExtraUsage = hasUsableUsdExtraUsage || hasUsableCreditExtraUsage;
-    // Need at least one valid value. Model-specific weekly buckets are valid usage data
-    // even when generic subscription/window metadata is absent or nullish.
-    if (fiveHour == null &&
-        sevenDay == null &&
-        sonnetSevenDay == null &&
-        opusSevenDay == null &&
-        !hasUsableEnterprise &&
-        !hasUsableExtraUsage)
-        return null;
     // Parse ISO 8601 date strings to Date objects
     const parseDate = (dateStr) => {
         if (!dateStr)
@@ -746,40 +1301,76 @@ export function parseUsageResponse(response, options) {
             return null;
         }
     };
+    // Fall back to `limits[]` (`kind: "weekly_scoped"`) for per-model weekly quotas
+    // when the legacy flat seven_day_sonnet/seven_day_opus fields are null/absent
+    // (see issue #3576). Recognized families (sonnet/opus) fill the typed fields;
+    // unrecognized model names (e.g. "Fable") become a generic bucket.
+    const scopedWeekly = resolveScopedWeeklyLimits(response.limits, parseDate);
+    // Need at least one valid value. Model-specific weekly buckets (flat or
+    // limits[]-derived) are valid usage data even when generic subscription/window
+    // metadata is absent or nullish.
+    if (fiveHour == null &&
+        sevenDay == null &&
+        sonnetSevenDay == null &&
+        opusSevenDay == null &&
+        !hasUsableEnterprise &&
+        !hasUsableExtraUsage &&
+        scopedWeekly.sonnet == null &&
+        scopedWeekly.opus == null &&
+        scopedWeekly.generic.length === 0)
+        return null;
     // Per-model quotas are at the top level (flat structure)
     // e.g., response.seven_day_sonnet, response.seven_day_opus
     const sonnetResetsAt = response.seven_day_sonnet?.resets_at;
-    const result = {
-        fiveHourPercent: clamp(fiveHour),
-        fiveHourResetsAt: parseDate(response.five_hour?.resets_at),
-    };
+    const result = {};
+    if (fiveHour != null) {
+        result.fiveHourPercent = clamp(fiveHour);
+        result.fiveHourResetsAt = parseDate(response.five_hour?.resets_at);
+    }
     if (sevenDay != null) {
         result.weeklyPercent = clamp(sevenDay);
         result.weeklyResetsAt = parseDate(response.seven_day?.resets_at);
     }
-    // Add Sonnet-specific quota if available from API
+    // Add Sonnet-specific quota if available from API (flat field takes precedence;
+    // limits[] weekly_scoped fallback only fills the gap when the flat field is
+    // null/absent — never overwrites trustworthy old-shape data).
     if (sonnetSevenDay != null) {
         result.sonnetWeeklyPercent = clamp(sonnetSevenDay);
         result.sonnetWeeklyResetsAt = parseDate(sonnetResetsAt);
     }
-    // Add Opus-specific quota if available from API
+    else if (scopedWeekly.sonnet != null) {
+        result.sonnetWeeklyPercent = scopedWeekly.sonnet.percent;
+        result.sonnetWeeklyResetsAt = scopedWeekly.sonnet.resetsAt;
+    }
+    // Add Opus-specific quota if available from API (same precedence as Sonnet above).
     const opusResetsAt = response.seven_day_opus?.resets_at;
     if (opusSevenDay != null) {
         result.opusWeeklyPercent = clamp(opusSevenDay);
         result.opusWeeklyResetsAt = parseDate(opusResetsAt);
     }
+    else if (scopedWeekly.opus != null) {
+        result.opusWeeklyPercent = scopedWeekly.opus.percent;
+        result.opusWeeklyResetsAt = scopedWeekly.opus.resetsAt;
+    }
+    // Unrecognized scoped weekly model buckets (e.g. "Fable") render generically so
+    // new tiers don't need a source release.
+    if (scopedWeekly.generic.length > 0) {
+        result.scopedWeeklyBuckets = scopedWeekly.generic;
+    }
     // Add extra (metered) usage if available (Pro subscribers with extra usage allocation)
     if (extra != null) {
         // Enterprise path: used_credits (minor units) is present instead of spent_usd/limit_usd.
-        // Only USD is observed in practice; the /100 divisor below assumes 2-digit minor units.
-        // For any non-USD currency we refuse to guess the minor-unit digit count (JPY/KRW are
-        // 0-digit, TND/BHD are 3-digit per ISO 4217) and skip the enterprise fields — the
-        // renderer will then return null rather than display a wrong figure.
-        const currency = (extra.currency ?? 'USD').toUpperCase();
-        if (extra.used_credits != null && currency === 'USD' && isEnterpriseContext) {
-            result.enterpriseSpentUsd = extra.used_credits / 100;
-            result.enterpriseLimitUsd = extra.monthly_limit == null ? null : extra.monthly_limit / 100;
+        // The scale comes from minorUnitDivisor — USD (implicitly 2-digit) or any currency
+        // the API annotated with decimal_places (EUR=2, JPY=0, BHD=3 per ISO 4217). When the
+        // scale is unknown (non-USD with no decimal_places) minorDivisor is null and we skip
+        // the enterprise fields — the renderer then returns null rather than show a wrong figure.
+        const currency = extraCurrency;
+        if (extra.used_credits != null && minorDivisor != null && isEnterpriseContext) {
+            result.enterpriseSpentUsd = extra.used_credits / minorDivisor;
+            result.enterpriseLimitUsd = extra.monthly_limit == null ? null : extra.monthly_limit / minorDivisor;
             result.enterpriseCurrency = currency;
+            if (minorDecimals != null)
+                result.enterpriseDecimalPlaces = minorDecimals;
             // Only compute utilization when there is a positive cap
             if (extra.monthly_limit != null && extra.monthly_limit > 0) {
                 result.enterpriseUtilization = clamp((extra.used_credits / extra.monthly_limit) * 100);
@@ -991,16 +1582,272 @@ export function parseMinimaxResponse(response) {
     };
 }
 /**
+ * Fetch usage from the Kimi For Coding platform.
+ *
+ * Endpoint: GET https://{canonical kimi host}/coding/v1/usages. Only the host
+ * comes from ANTHROPIC_BASE_URL (whose path may be /coding, /coding/, or
+ * /coding/v1 depending on setup docs) and it must be one of
+ * KIMI_USAGE_HOSTNAMES — the bearer token never leaves that origin.
+ * Auth: Bearer token — accepts both Kimi API keys (METHOD_API_KEY) and OAuth
+ * access tokens from the kimi-code CLI.
+ */
+function fetchUsageFromKimi(apiKey) {
+    return new Promise((resolve) => {
+        const baseUrl = process.env.ANTHROPIC_BASE_URL;
+        if (!baseUrl) {
+            resolve({ data: null });
+            return;
+        }
+        // Validate baseUrl for SSRF protection
+        const validation = validateAnthropicBaseUrl(baseUrl);
+        if (!validation.allowed) {
+            console.error(`[SSRF Guard] Blocking usage API call: ${validation.reason}`);
+            resolve({ data: null });
+            return;
+        }
+        try {
+            const hostname = new URL(baseUrl).hostname.toLowerCase();
+            // Provider detection accepts any *.kimi.com host; the credential does not.
+            if (!KIMI_USAGE_HOSTNAMES.has(hostname)) {
+                if (process.env.OMC_DEBUG) {
+                    console.error(`[usage-api] Refusing to send Kimi credentials to non-canonical host '${hostname}'`);
+                }
+                resolve({ data: null });
+                return;
+            }
+            const req = https.request({
+                hostname,
+                path: KIMI_USAGE_PATH,
+                method: 'GET',
+                headers: {
+                    'Authorization': `Bearer ${apiKey}`,
+                    'Accept': 'application/json',
+                },
+                timeout: API_TIMEOUT_MS,
+            }, (res) => {
+                let data = '';
+                // A socket reset *after* headers arrive surfaces on the response
+                // stream, not the request. Without these listeners that 'error' is
+                // unhandled and takes the HUD process down instead of degrading to a
+                // network failure. resolve() past the first call is a no-op.
+                res.on('error', () => resolve({ data: null }));
+                res.on('aborted', () => resolve({ data: null }));
+                res.on('data', (chunk) => { data += chunk; });
+                res.on('end', () => {
+                    if (res.statusCode === 200) {
+                        try {
+                            resolve({ data: JSON.parse(data) });
+                        }
+                        catch {
+                            resolve({ data: null });
+                        }
+                    }
+                    else if (res.statusCode === 429) {
+                        if (process.env.OMC_DEBUG) {
+                            console.error(`[usage-api] Kimi API returned 429 (rate limited)`);
+                        }
+                        resolve({ data: null, rateLimited: true });
+                    }
+                    else {
+                        resolve({ data: null });
+                    }
+                });
+            });
+            req.on('error', () => resolve({ data: null }));
+            req.on('timeout', () => { req.destroy(); resolve({ data: null }); });
+            req.end();
+        }
+        catch {
+            resolve({ data: null });
+        }
+    });
+}
+/**
+ * Parse a Kimi quota row's number-ish field (wire format uses strings).
+ */
+function kimiToNumber(value) {
+    if (typeof value === 'number') {
+        return Number.isFinite(value) ? value : null;
+    }
+    if (typeof value === 'string' && value.length > 0) {
+        const n = Number(value);
+        return Number.isFinite(n) ? n : null;
+    }
+    return null;
+}
+/**
+ * Parse a Kimi resetTime/reset_at/resetAt ISO string into a Date.
+ * Trims nano-precision fractions to milliseconds so Date.parse never chokes.
+ */
+function parseKimiResetTime(row) {
+    const raw = row?.resetTime ?? row?.reset_at ?? row?.resetAt;
+    // Runtime payloads are untrusted: a non-string reset field must not throw
+    // (parseFn exceptions would escape fetchAndCacheUsage into the HUD).
+    if (typeof raw !== 'string' || raw.length === 0)
+        return null;
+    let normalized = raw;
+    if (normalized.includes('.') && normalized.endsWith('Z')) {
+        const [base, frac] = normalized.slice(0, -1).split('.');
+        if (base && frac) {
+            normalized = `${base}.${frac.slice(0, 3)}Z`;
+        }
+    }
+    try {
+        const date = new Date(normalized);
+        return isNaN(date.getTime()) ? null : date;
+    }
+    catch {
+        return null;
+    }
+}
+/**
+ * Normalize a Kimi currency code to upper case, or null when absent.
+ * Non-string values are rejected rather than coerced: runtime payloads are
+ * untrusted and `.toUpperCase()` on a number would throw into the HUD.
+ */
+function kimiCurrencyCode(value) {
+    return typeof value === 'string' && value.length > 0 ? value.toUpperCase() : null;
+}
+/**
+ * Used quota for a Kimi row: direct `used`, or `limit - remaining` fallback
+ * (mirrors kimi-code's loose parser — field spelling drifted across versions).
+ */
+function kimiUsedQuota(row) {
+    const used = kimiToNumber(row.used);
+    if (used != null)
+        return used;
+    const limit = kimiToNumber(row.limit);
+    const remaining = kimiToNumber(row.remaining);
+    if (limit != null && remaining != null)
+        return limit - remaining;
+    return null;
+}
+/**
+ * Convert a Kimi limits[] window descriptor to total minutes, or null when
+ * the window shape is unknown (duration missing or unrecognized timeUnit).
+ */
+function kimiWindowMinutes(window) {
+    const duration = window?.duration;
+    // Untrusted payload: a non-string timeUnit must not throw on .includes()
+    const rawUnit = window?.timeUnit;
+    const timeUnit = typeof rawUnit === 'string' ? rawUnit : '';
+    if (duration == null || !Number.isFinite(duration) || duration <= 0)
+        return null;
+    if (timeUnit.includes('MINUTE'))
+        return duration;
+    if (timeUnit.includes('HOUR'))
+        return duration * 60;
+    if (timeUnit.includes('DAY'))
+        return duration * 60 * 24;
+    return null;
+}
+/**
+ * Duration of the Kimi For Coding rolling window the HUD renders as "5h".
+ *
+ * Kimi documents a rolling 5-hour rate window on top of the weekly quota, and
+ * the live payload reports it as `{ duration: 300, timeUnit: TIME_UNIT_MINUTE }`.
+ * Only this exact duration may fill `fiveHourPercent`: the HUD prints that field
+ * under a hard-coded "5h" label, so accepting a nearby window (a 1h burst cap,
+ * say) would report one product limit while claiming another.
+ */
+const KIMI_FIVE_HOUR_WINDOW_MINUTES = 300;
+/**
+ * Parse Kimi For Coding `/usages` response into RateLimits.
+ *
+ * Mapping (verified against live payload):
+ * - Top-level `usage` → weekly window (resetTime ~7 days out)
+ * - `limits[]` entry whose window is exactly 300 minutes → 5-hour window
+ *   (observed: window.duration=300, timeUnit=TIME_UNIT_MINUTE). Any other
+ *   duration is dropped, never rendered under the HUD's "5h" label.
+ * - `boosterWallet` (optional) → extra usage, USD only: the HUD's extra-usage
+ *   renderer hard-codes "$", so CNY wallets are skipped rather than mislabeled.
+ */
+export function parseKimiResponse(response) {
+    // fiveHourPercent is intentionally left unset: seeding 0 would render as
+    // "5h:0%" for a payload that carried no 5-hour window at all, asserting zero
+    // usage of a quota we have no data for.
+    const result = {};
+    let hasAny = false;
+    // Weekly window: top-level usage row
+    const weekly = response.usage;
+    if (weekly) {
+        const limit = kimiToNumber(weekly.limit);
+        const used = kimiUsedQuota(weekly);
+        if (limit != null && limit > 0 && used != null) {
+            result.weeklyPercent = clamp((used / limit) * 100);
+            result.weeklyResetsAt = parseKimiResetTime(weekly);
+            hasAny = true;
+        }
+    }
+    // 5-hour window: the limits[] entry whose window is exactly 5 hours. Windows
+    // of any other duration (and unclassifiable ones) are left out rather than
+    // relabelled — see KIMI_FIVE_HOUR_WINDOW_MINUTES.
+    const limits = Array.isArray(response.limits) ? response.limits : [];
+    let filledFiveHour = false;
+    let sawOtherWindow = false;
+    for (const entry of limits) {
+        if (!entry || typeof entry !== 'object')
+            continue;
+        if (kimiWindowMinutes(entry.window) !== KIMI_FIVE_HOUR_WINDOW_MINUTES) {
+            sawOtherWindow = true;
+            continue;
+        }
+        const row = entry.detail ?? entry;
+        const limit = kimiToNumber(row.limit);
+        const used = kimiUsedQuota(row);
+        // Keep scanning on an unusable row: a duplicate 5h entry may still be good
+        if (limit == null || limit <= 0 || used == null)
+            continue;
+        result.fiveHourPercent = clamp((used / limit) * 100);
+        result.fiveHourResetsAt = parseKimiResetTime(row);
+        hasAny = true;
+        filledFiveHour = true;
+        break;
+    }
+    if (!filledFiveHour && sawOtherWindow && process.env.OMC_DEBUG) {
+        console.error(`[usage-api] Kimi limits[] carried no ${KIMI_FIVE_HOUR_WINDOW_MINUTES}-minute window — 5h bucket left empty`);
+    }
+    // Extra (metered) usage: booster wallet monthly spend vs monthly cap.
+    // Monthly figures arrive as priceInCents. USD-only — see comment above; an
+    // absent currency is skipped too (never guess "$" for an unknown currency).
+    const wallet = response.boosterWallet;
+    if (wallet?.balance?.type === 'BOOSTER') {
+        const limitCents = kimiToNumber(wallet.monthlyChargeLimit?.priceInCents);
+        const usedCents = kimiToNumber(wallet.monthlyUsed?.priceInCents);
+        // Both sides must declare USD independently. Falling back from one to the
+        // other would render a mismatched pair (limit USD / used CNY) as one "$"
+        // figure over another, silently misstating the spend.
+        const limitCurrency = kimiCurrencyCode(wallet.monthlyChargeLimit?.currency);
+        const usedCurrency = kimiCurrencyCode(wallet.monthlyUsed?.currency);
+        if (wallet.monthlyChargeLimitEnabled === true &&
+            limitCents != null && limitCents > 0 &&
+            usedCents != null &&
+            limitCurrency === 'USD' && usedCurrency === 'USD') {
+            result.extraUsageSpentUsd = usedCents / 100;
+            result.extraUsageLimitUsd = limitCents / 100;
+            result.extraUsagePercent = clamp((usedCents / limitCents) * 100);
+            hasAny = true;
+        }
+    }
+    return hasAny ? result : null;
+}
+/**
  * Generic provider fetch-and-cache cycle.
  * Handles 429 backoff, stale data fallback, and cache writes.
  * Provider-specific pre-fetch logic (e.g., credential refresh) runs before calling this.
  */
 async function fetchAndCacheUsage(opts) {
-    const { source, fetchFn, parseFn, cache, pollIntervalMs } = opts;
+    const { source, fetchFn, parseFn, cache, pollIntervalMs, rateLimitIdentity, credentialIdentity, } = opts;
     const result = await fetchFn();
     if (result.rateLimited) {
         const prevLastSuccess = cache?.lastSuccessAt;
-        const rateLimitedCache = createRateLimitedCacheEntry(source, cache?.data || null, pollIntervalMs, cache?.rateLimitedCount || 0, prevLastSuccess);
+        const previousBackoffs = source === 'anthropic' ? getRateLimitBackoffs(cache) : undefined;
+        const previousBackoff = source === 'anthropic'
+            ? getRateLimitBackoff(cache, rateLimitIdentity)
+            : null;
+        const rateLimitedCache = createRateLimitedCacheEntry(source, cache?.data || null, pollIntervalMs, source === 'anthropic'
+            ? previousBackoff?.rateLimitedCount || 0
+            : cache?.rateLimitedCount || 0, prevLastSuccess, rateLimitIdentity, previousBackoffs);
         writeCache({
             data: rateLimitedCache.data,
             error: rateLimitedCache.error,
@@ -1010,6 +1857,9 @@ async function fetchAndCacheUsage(opts) {
             rateLimitedUntil: rateLimitedCache.rateLimitedUntil,
             errorReason: 'rate_limited',
             lastSuccessAt: rateLimitedCache.lastSuccessAt,
+            rateLimitIdentity: rateLimitedCache.rateLimitIdentity,
+            credentialIdentity,
+            rateLimitBackoffs: rateLimitedCache.rateLimitBackoffs,
         });
         if (rateLimitedCache.data) {
             if (prevLastSuccess && Date.now() - prevLastSuccess > MAX_STALE_DATA_MS) {
@@ -1027,6 +1877,8 @@ async function fetchAndCacheUsage(opts) {
             source,
             errorReason: 'network',
             lastSuccessAt: cache?.lastSuccessAt,
+            credentialIdentity,
+            rateLimitBackoffs: source === 'anthropic' ? getRateLimitBackoffs(cache) : undefined,
         });
         if (fallbackData) {
             return { rateLimits: fallbackData, error: 'network', stale: true };
@@ -1034,8 +1886,48 @@ async function fetchAndCacheUsage(opts) {
         return { rateLimits: null, error: 'network' };
     }
     const usage = parseFn(result.data);
-    writeCache({ data: usage, error: !usage, source, lastSuccessAt: Date.now() });
+    writeCache({
+        data: usage,
+        error: !usage,
+        source,
+        lastSuccessAt: Date.now(),
+        credentialIdentity,
+        rateLimitBackoffs: source === 'anthropic'
+            ? clearRateLimitBackoff(cache, rateLimitIdentity)
+            : undefined,
+    });
     return { rateLimits: usage };
+}
+/** Validate a fresh Anthropic cache by stable config metadata before a Keychain read. */
+function getWarmAnthropicUsageCache(pollIntervalMs, rateLimitIdentity) {
+    const baseUrl = process.env.ANTHROPIC_BASE_URL;
+    if (process.env.CLAUDE_CODE_OAUTH_TOKEN?.trim() ||
+        process.env.ANTHROPIC_AUTH_TOKEN?.trim() ||
+        process.env.MINIMAX_API_KEY?.trim() ||
+        process.env.KIMI_API_KEY?.trim() ||
+        process.env.ANTHROPIC_API_KEY?.trim() ||
+        (baseUrl != null && (isMinimaxHost(baseUrl) || isKimiHost(baseUrl) || isZaiHost(baseUrl)))) {
+        return undefined;
+    }
+    const profileIdentity = getOAuthAccountProfileIdentity({});
+    if (!profileIdentity)
+        return undefined;
+    const credentialIdentity = hashCredentialIdentity(JSON.stringify([
+        'anthropic',
+        baseUrl ?? null,
+        profileIdentity,
+    ]));
+    migrateLegacyCache('anthropic');
+    const cache = readCache('anthropic');
+    const hasCacheOutcome = !!cache?.data || cache?.error === true || getRateLimitBackoff(cache, rateLimitIdentity) !== null;
+    if (!cache ||
+        !hasCacheOutcome ||
+        cache.source !== 'anthropic' ||
+        !isCacheForCredential(cache, credentialIdentity) ||
+        !isCacheValid(cache, pollIntervalMs, rateLimitIdentity)) {
+        return undefined;
+    }
+    return getCachedUsageResult(cache, rateLimitIdentity);
 }
 /**
  * Get usage data (with caching)
@@ -1047,68 +1939,139 @@ async function fetchAndCacheUsage(opts) {
  *   - 'auth': credentials expired and refresh failed
  *   - 'no_credentials': no OAuth credentials available (expected for API key users)
  *   - 'rate_limited': API returned 429; stale data served if available, with exponential backoff
+ *
+ * @param opts.clientVersion Claude Code version for the usage API User-Agent
+ *   (see buildUserAgent). Optional: callers without a statusline payload omit it
+ *   and the header is left off rather than guessed.
+ * @param opts.skipWarmCache Skip metadata-only cache hits when credential identity
+ *   must be verified before using the returned usage data.
  */
-export async function getUsage() {
-    const baseUrl = process.env.ANTHROPIC_BASE_URL;
-    const authToken = process.env.ANTHROPIC_AUTH_TOKEN;
-    const isMinimax = baseUrl != null && isMinimaxHost(baseUrl);
-    const isZai = baseUrl != null && isZaiHost(baseUrl);
-    const minimaxApiKey = process.env.MINIMAX_API_KEY || authToken;
-    const currentSource = isMinimax ? 'minimax' : isZai && authToken ? 'zai' : 'anthropic';
+export async function getUsage(opts) {
     const pollIntervalMs = getUsagePollIntervalMs();
+    const anthropicRateLimitIdentity = buildUserAgent(opts?.clientVersion) ?? 'anonymous';
+    const warmCachedUsage = opts?.skipWarmCache
+        ? undefined
+        : getWarmAnthropicUsageCache(pollIntervalMs, anthropicRateLimitIdentity);
+    if (warmCachedUsage)
+        return warmCachedUsage;
+    let profile = resolveUsageProfile();
+    const { currentSource, authToken, minimaxApiKey, kimiApiKey } = profile;
+    let credentials = profile.credentials;
+    let credentialIdentity = profile.credentialIdentity;
+    const rateLimitIdentity = currentSource === 'anthropic'
+        ? anthropicRateLimitIdentity
+        : undefined;
     // Migrate legacy single-file cache to provider-specific file (one-shot, best-effort)
     migrateLegacyCache(currentSource);
     const initialCache = readCache(currentSource);
-    if (initialCache && isCacheValid(initialCache, pollIntervalMs) && initialCache.source === currentSource) {
-        return getCachedUsageResult(initialCache);
+    let initialMatchingCache = isCacheForCredential(initialCache, credentialIdentity)
+        ? initialCache
+        : null;
+    if (initialMatchingCache &&
+        isCacheValid(initialMatchingCache, pollIntervalMs, rateLimitIdentity) &&
+        initialMatchingCache.source === currentSource) {
+        return getCachedUsageResult(initialMatchingCache, rateLimitIdentity);
+    }
+    if (currentSource === 'anthropic' &&
+        credentials?.source !== 'env' &&
+        !profile.storedCredentialsRead) {
+        profile = resolveUsageProfile(true, true);
+        credentials = profile.credentials;
+        credentialIdentity = profile.credentialIdentity;
+        initialMatchingCache = isCacheForCredential(initialCache, credentialIdentity)
+            ? initialCache
+            : null;
+        if (initialMatchingCache &&
+            isCacheValid(initialMatchingCache, pollIntervalMs, rateLimitIdentity) &&
+            initialMatchingCache.source === currentSource) {
+            return getCachedUsageResult(initialMatchingCache, rateLimitIdentity);
+        }
     }
     try {
         return await withFileLock(lockPathFor(getCachePath(currentSource)), async () => {
             const cache = readCache(currentSource);
-            if (cache && isCacheValid(cache, pollIntervalMs) && cache.source === currentSource) {
-                return getCachedUsageResult(cache);
+            const matchingCache = isCacheForCredential(cache, credentialIdentity) ? cache : null;
+            if (matchingCache &&
+                isCacheValid(matchingCache, pollIntervalMs, rateLimitIdentity) &&
+                matchingCache.source === currentSource) {
+                return getCachedUsageResult(matchingCache, rateLimitIdentity);
             }
             // MiniMax path (must precede z.ai and OAuth checks)
-            if (isMinimax) {
+            if (currentSource === 'minimax') {
                 if (!minimaxApiKey) {
-                    writeCache({ data: null, error: true, source: 'minimax', errorReason: 'no_credentials' });
+                    writeCache({ data: null, error: true, source: 'minimax', errorReason: 'no_credentials', credentialIdentity });
                     return { rateLimits: null, error: 'no_credentials' };
                 }
                 return fetchAndCacheUsage({
                     source: 'minimax',
                     fetchFn: () => fetchUsageFromMinimax(minimaxApiKey),
                     parseFn: parseMinimaxResponse,
-                    cache,
+                    cache: matchingCache,
                     pollIntervalMs,
+                    credentialIdentity,
+                });
+            }
+            // Kimi path (must precede z.ai and OAuth checks)
+            if (currentSource === 'kimi') {
+                if (!kimiApiKey) {
+                    writeCache({ data: null, error: true, source: 'kimi', errorReason: 'no_credentials', credentialIdentity });
+                    return { rateLimits: null, error: 'no_credentials' };
+                }
+                return fetchAndCacheUsage({
+                    source: 'kimi',
+                    fetchFn: () => fetchUsageFromKimi(kimiApiKey),
+                    parseFn: parseKimiResponse,
+                    cache: matchingCache,
+                    pollIntervalMs,
+                    credentialIdentity,
                 });
             }
             // z.ai path (must precede OAuth check to avoid stale Anthropic credentials)
-            if (isZai && authToken) {
+            if (currentSource === 'zai' && authToken) {
                 return fetchAndCacheUsage({
                     source: 'zai',
                     fetchFn: () => fetchUsageFromZai(),
                     parseFn: parseZaiResponse,
-                    cache,
+                    cache: matchingCache,
                     pollIntervalMs,
+                    credentialIdentity,
                 });
             }
             // Anthropic OAuth path (official Claude Code support)
-            let creds = getCredentials();
+            let creds = credentials;
             if (creds) {
                 if (!validateCredentials(creds)) {
                     if (creds.refreshToken) {
                         const refreshed = await refreshAccessToken(creds.refreshToken);
                         if (refreshed) {
-                            creds = { ...creds, ...refreshed };
+                            creds = {
+                                ...creds,
+                                ...refreshed,
+                                profileIdentity: creds.profileIdentity ?? hashCredentialIdentity(creds.refreshToken ?? creds.accessToken),
+                            };
                             writeBackCredentials(creds);
+                            if (creds.source !== 'env')
+                                rememberStoredCredentials(creds);
                         }
                         else {
-                            writeCache({ data: null, error: true, source: 'anthropic', errorReason: 'auth' });
+                            writeCache({
+                                data: null,
+                                error: true,
+                                source: 'anthropic',
+                                errorReason: 'auth',
+                                credentialIdentity,
+                            });
                             return { rateLimits: null, error: 'auth' };
                         }
                     }
                     else {
-                        writeCache({ data: null, error: true, source: 'anthropic', errorReason: 'auth' });
+                        writeCache({
+                            data: null,
+                            error: true,
+                            source: 'anthropic',
+                            errorReason: 'auth',
+                            credentialIdentity,
+                        });
                         return { rateLimits: null, error: 'auth' };
                     }
                 }
@@ -1117,16 +2080,24 @@ export async function getUsage() {
                 const rateLimitTier = creds.rateLimitTier;
                 return fetchAndCacheUsage({
                     source: 'anthropic',
-                    fetchFn: () => fetchUsageFromApi(accessToken),
+                    fetchFn: () => fetchUsageFromApi(accessToken, opts?.clientVersion),
                     parseFn: (data) => parseUsageResponse(data, {
                         subscriptionType,
                         rateLimitTier,
                     }),
-                    cache,
+                    cache: matchingCache,
                     pollIntervalMs,
+                    rateLimitIdentity,
+                    credentialIdentity,
                 });
             }
-            writeCache({ data: null, error: true, source: 'anthropic', errorReason: 'no_credentials' });
+            writeCache({
+                data: null,
+                error: true,
+                source: 'anthropic',
+                errorReason: 'no_credentials',
+                credentialIdentity,
+            });
             return { rateLimits: null, error: 'no_credentials' };
         }, USAGE_CACHE_LOCK_OPTS);
     }
@@ -1134,8 +2105,8 @@ export async function getUsage() {
         // Lock acquisition failed — return stale cache without touching the cache file
         // to avoid racing with the lock holder writing fresh data
         if (err instanceof Error && err.message.startsWith('Failed to acquire file lock')) {
-            if (initialCache?.data) {
-                return { rateLimits: initialCache.data, stale: true };
+            if (initialMatchingCache?.data) {
+                return { rateLimits: initialMatchingCache.data, stale: true };
             }
             return { rateLimits: null, error: 'network' };
         }

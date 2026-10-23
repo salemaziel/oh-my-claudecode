@@ -20,12 +20,12 @@ describe('Tier-0 contract docs consistency', () => {
         expect(tocSkills?.[1]).toBe(headingSkills?.[1]);
     });
     it('documents all Tier-0 slash commands in REFERENCE.md', () => {
-        for (const skillName of ['autopilot', 'ultrawork', 'ralph', 'team', 'ralplan']) {
+        for (const skillName of ['autopilot', 'ralph', 'team', 'ralplan', 'omc-setup', 'wiki']) {
             expect(referenceDoc).toContain(`/oh-my-claudecode:${skillName}`);
         }
     });
     it('documents all Tier-0 keywords in CLAUDE.md', () => {
-        for (const keyword of ['autopilot', 'ultrawork', 'ralph', 'team', 'ralplan']) {
+        for (const keyword of ['autopilot', 'ralph', 'ralplan']) {
             expect(claudeDoc).toContain(`\`${keyword}\``);
         }
     });
@@ -40,7 +40,7 @@ describe('Tier-0 contract docs consistency', () => {
     it('keeps deprecated compatibility aliases documented for project session manager', () => {
         // swarm alias removed in #1131
         expect(referenceDoc).toContain('project-session-manager');
-        expect(referenceDoc).toContain('`psm` | **Deprecated** compatibility alias for `project-session-manager`');
+        expect(referenceDoc).toMatch(/`psm`\s+\| Deprecated compatibility alias for `project-session-manager`/);
     });
     it('does not document removed wrapper slash commands as installed skills', () => {
         expect(referenceDoc).not.toContain('/oh-my-claudecode:analyze <target>');
@@ -61,7 +61,7 @@ describe('Tier-0 contract docs consistency', () => {
     it('keeps install and update guidance aligned on canonical setup entrypoints', () => {
         const localPluginDoc = readProjectFile('docs', 'LOCAL_PLUGIN_INSTALL.md');
         expect(claudeDoc).toContain('Say "setup omc" or run `/oh-my-claudecode:omc-setup`.');
-        expect(referenceDoc).toContain('/oh-my-claudecode:setup');
+        expect(referenceDoc).toContain('/oh-my-claudecode:omc-setup');
         expect(localPluginDoc).toContain('/setup');
         expect(localPluginDoc).toContain('git worktrees');
     });
@@ -93,21 +93,21 @@ describe('Tier-0 contract docs consistency', () => {
         const omc = readProjectFile('benchmark', 'run_omc.sh');
         const fullComparison = readProjectFile('benchmark', 'run_full_comparison.sh');
         const resultsReadme = readProjectFile('benchmark', 'results', 'README.md');
-        const expectedModel = 'claude-sonnet-4-6-20260217';
+        const expectedModel = 'claude-sonnet-5';
         for (const content of [benchmarkReadme, benchmarkRunner, quickTest, vanilla, omc, fullComparison, resultsReadme]) {
             expect(content).toContain(expectedModel);
         }
         expect(benchmarkReadme).not.toContain('claude-sonnet-4.5-20250929');
         expect(benchmarkRunner).not.toContain('claude-sonnet-4-20250514');
-        expect(resultsReadme).toContain('Claude Sonnet 4.6');
+        expect(resultsReadme).toContain('Claude Sonnet 5');
     });
     it('removes dead package build aliases and keeps seminar demo model guidance current', () => {
         const packageJson = JSON.parse(readProjectFile('package.json'));
         const seminarDemo = readProjectFile('seminar', 'demos', 'demo-0-live-audience.md');
         expect(packageJson.scripts).not.toHaveProperty('build:codex');
         expect(packageJson.scripts).not.toHaveProperty('build:gemini');
-        expect(seminarDemo).toContain('# 빠른 모델 (Sonnet 4.6)');
-        expect(seminarDemo).toContain('export OMC_MODEL=anthropic/claude-sonnet-4-6');
+        expect(seminarDemo).toContain('# 빠른 모델 (Sonnet 5)');
+        expect(seminarDemo).toContain('export OMC_MODEL=anthropic/claude-sonnet-5');
         expect(seminarDemo).not.toContain('anthropic/claude-sonnet-4-5');
     });
 });

@@ -10,7 +10,6 @@
  * Ported from oh-my-opencode's ralph hook.
  */
 import { type PRDStatus, type UserStory } from "./prd.js";
-export declare function isUltraQAActive(directory: string, sessionId?: string): boolean;
 export interface RalphLoopState {
     /** Whether the loop is currently active */
     active: boolean;
@@ -30,18 +29,21 @@ export interface RalphLoopState {
     prd_mode?: boolean;
     /** Current story being worked on */
     current_story_id?: string;
-    /** Whether ultrawork is linked/auto-activated with ralph */
-    linked_ultrawork?: boolean;
     /** Reviewer mode for Ralph completion verification */
     critic_mode?: RalphCriticMode;
 }
 export declare const RALPH_CRITIC_MODES: readonly ["architect", "critic", "codex"];
 export type RalphCriticMode = typeof RALPH_CRITIC_MODES[number];
+/**
+ * The startup line that makes the feedback gate non-optional for executors
+ * (#45). Skill text alone lost to executor improvisation in live smokes; this
+ * notice is printed by `startLoop` where the stale-PRD warning already proves
+ * reliable, and named here so its contract is testable without state IO.
+ */
+export declare function ralphFeedbackGateNotice(sessionId?: string): string;
 export interface RalphLoopOptions {
     /** Maximum iterations (default: 10) */
     maxIterations?: number;
-    /** Disable auto-activation of ultrawork (default: false - ultrawork is enabled) */
-    disableUltrawork?: boolean;
     /** Reviewer mode for Ralph completion verification */
     criticMode?: RalphCriticMode;
 }
@@ -58,14 +60,11 @@ export declare function readRalphState(directory: string, sessionId?: string): R
  * Write Ralph Loop state to disk
  */
 export declare function writeRalphState(directory: string, state: RalphLoopState, sessionId?: string): boolean;
+export declare function restoreRalphStateIfAbsent(directory: string, state: RalphLoopState, sessionId?: string): boolean;
 /**
  * Clear Ralph Loop state (includes ghost-legacy cleanup)
  */
-export declare function clearRalphState(directory: string, sessionId?: string): boolean;
-/**
- * Clear ultrawork state (only if linked to ralph)
- */
-export declare function clearLinkedUltraworkState(directory: string, sessionId?: string): boolean;
+export declare function clearRalphState(directory: string, sessionId?: string, expectedState?: RalphLoopState): boolean;
 /**
  * Increment Ralph Loop iteration
  */

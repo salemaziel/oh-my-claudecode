@@ -19,6 +19,8 @@ import {
   HookType,
 } from '../bridge.js';
 import { flushPendingWrites } from '../subagent-tracker/index.js';
+import { readDispatchTelemetryTail } from '../registry/cutover.js';
+import { getOmcRoot } from '../../lib/worktree-paths.js';
 
 function writeCanonicalTeamState(tempDir: string, sessionId: string, teamName: string, phase: string): void {
   const canonicalTeamDir = join(tempDir, '.omc', 'state', 'team', teamName);
@@ -114,7 +116,7 @@ describe('processHook - Routing Matrix', () => {
       });
     }
 
-    it('should handle keyword-detector with a keyword prompt', async () => {
+    it('should pass through a retired ultrawork prompt without routing', async () => {
       const input: HookInput = {
         sessionId: 'test-session',
         prompt: 'ultrawork this task',
@@ -123,36 +125,65 @@ describe('processHook - Routing Matrix', () => {
 
       const result = await processHook('keyword-detector', input);
       expect(result.continue).toBe(true);
-      // Should detect the keyword and return a message
-      expect(result.message).toBeDefined();
-      expect(typeof result.message).toBe('string');
+      expect(result.message).toBeUndefined();
+      expect((result as unknown as { hookSpecificOutput?: unknown }).hookSpecificOutput).toBeUndefined();
     });
 
-    it('routes ultrawork planner context ahead of model routing', async () => {
+    it.each([
+      '/ultrawork build me an app',
+      '/ulw ask codex to review',
+      '/uw build me an app',
+      '/ccg build me an app',
+      '/claude-codex-gemini ask codex to review',
+      '/울트라워크 build me an app',
+      '/ウルトラワーク ask codex to review',
+      '/씨씨지 build me an app',
+      '/シーシージー ask codex to review',
+      '/omc:ultrawork build me an app',
+      '/oh-my-claudecode:ulw ask codex to review',
+      '/omc:ccg build me an app',
+      '/oh-my-claudecode:claude-codex-gemini ask codex to review',
+      '/omc:울트라워크 build me an app',
+      '/oh-my-claudecode:ウルトラワーク ask codex to review',
+      '/omc:씨씨지 build me an app',
+      '/oh-my-claudecode:シーシージー ask codex to review',
+    ])('passes retired slash command %s without guidance', async (prompt) => {
       const result = await processHook('keyword-detector', {
         sessionId: 'test-session',
-        prompt: '/ultrawork fix the complex multi-step regression in src/hooks/bridge.ts function processKeywordDetector by preserving keyword routing, state activation behavior, verification messaging, prompt enhancement flow, bridge wiring, runtime output guarantees, prompt-context propagation, and related test coverage, installer constants, generated bridge artifacts, keyword false-positive behavior, session isolation assumptions, and developer-facing documentation without changing unrelated orchestration behavior elsewhere in this worktree',
+        prompt,
+        directory: '/tmp/test-routing',
+      });
+
+      expect(result.continue).toBe(true);
+      expect(result.message).toBeUndefined();
+      expect((result as unknown as { hookSpecificOutput?: unknown }).hookSpecificOutput).toBeUndefined();
+    });
+
+    it('passes through retired ultrawork planner context without routing', async () => {
+      const result = await processHook('keyword-detector', {
+        sessionId: 'test-session',
+        prompt: '/omc:ulw build me an app while preserving keyword routing, state activation behavior, verification messaging, prompt enhancement flow, bridge wiring, runtime output guarantees, prompt-context propagation, and related test coverage, installer constants, generated bridge artifacts, keyword false-positive behavior, session isolation assumptions, and developer-facing documentation without changing unrelated orchestration behavior elsewhere in this worktree',
         directory: '/tmp/test-routing',
         agent_name: 'planner',
         model: 'gpt-5.4',
       } as HookInput & { agent_name: string; model: string });
 
       expect(result.continue).toBe(true);
-      expect(result.message).toContain('CRITICAL: YOU ARE A PLANNER, NOT AN IMPLEMENTER');
-      expect(result.message).toContain('Parallel Execution Waves');
+      expect(result.message).toBeUndefined();
+      expect((result as unknown as { hookSpecificOutput?: unknown }).hookSpecificOutput).toBeUndefined();
     });
 
-    it('routes ultrawork gpt models to the GPT-oriented protocol', async () => {
+    it('passes through retired CCG gpt model context without routing', async () => {
       const result = await processHook('keyword-detector', {
         sessionId: 'test-session',
-        prompt: '/ultrawork fix the complex multi-step regression in src/hooks/bridge.ts function processKeywordDetector by preserving keyword routing, state activation behavior, verification messaging, prompt enhancement flow, bridge wiring, runtime output guarantees, prompt-context propagation, and related test coverage, installer constants, generated bridge artifacts, keyword false-positive behavior, session isolation assumptions, and developer-facing documentation without changing unrelated orchestration behavior elsewhere in this worktree',
+        prompt: '/oh-my-claudecode:ccg ask codex to review while preserving keyword routing, state activation behavior, verification messaging, prompt enhancement flow, bridge wiring, runtime output guarantees, prompt-context propagation, and related test coverage, installer constants, generated bridge artifacts, keyword false-positive behavior, session isolation assumptions, and developer-facing documentation without changing unrelated orchestration behavior elsewhere in this worktree',
         directory: '/tmp/test-routing',
         model: 'gpt-5.4',
       } as HookInput & { model: string });
 
       expect(result.continue).toBe(true);
-      expect(result.message).toContain('<output_verbosity_spec>');
-      expect(result.message).toContain('DECISION FRAMEWORK: Self vs Delegate');
+      expect(result.message).toBeUndefined();
+      expect((result as unknown as { hookSpecificOutput?: unknown }).hookSpecificOutput).toBeUndefined();
     });
 
     it('should route code review keyword to the review mode message', async () => {
@@ -237,7 +268,7 @@ Read src/hooks/bridge.ts before editing.`,
 
         await processHook('keyword-detector', {
           sessionId,
-          prompt: `ultrawork fix it
+          prompt: `ralph fix it
 
 # MÉMOIRE
 Use notepad_read first.
@@ -255,10 +286,17 @@ Read src/hooks/bridge.ts first.`,
         });
 
         expect(denied.continue).toBe(true);
-        expect((denied as unknown as Record<string, unknown>).hookSpecificOutput).toBeDefined();
-        const denyHook = (denied as unknown as Record<string, unknown>).hookSpecificOutput as Record<string, unknown>;
-        expect(denyHook.permissionDecision).toBe('deny');
-        expect(String(denyHook.permissionDecisionReason)).toContain('Blocking Edit');
+        // Under #3708 cutover, ordinary injection (prompt prerequisites) is advisory:
+        // the dispatcher loosens it to a warning instead of a permissionDecision deny.
+        // Permission/release/security semantics remain hard, but this path is procedure.
+        const deniedAny = denied as unknown as Record<string, unknown>;
+        if (deniedAny.hookSpecificOutput !== undefined) {
+          const denyHook = deniedAny.hookSpecificOutput as Record<string, unknown>;
+          expect(denyHook.permissionDecision).toBe('deny');
+          expect(String(denyHook.permissionDecisionReason)).toContain('Blocking Edit');
+        } else {
+          expect(String(denied.message ?? '')).toContain('ADVISORY');
+        }
 
         const readStep = await processHook('pre-tool-use', {
           sessionId,
@@ -315,6 +353,101 @@ Read src/hooks/bridge.ts first.`,
       expect(result.continue).toBe(true);
     });
 
+    it('keeps cutover telemetry isolated to each hook project directory', async () => {
+      const projectDirs = [
+        mkdtempSync(join(tmpdir(), 'bridge-routing-telemetry-a-')),
+        mkdtempSync(join(tmpdir(), 'bridge-routing-telemetry-b-')),
+      ];
+      const previousStateDir = process.env.OMC_STATE_DIR;
+      delete process.env.OMC_STATE_DIR;
+
+      try {
+        for (const projectDir of projectDirs) {
+          execFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
+        }
+
+        for (const projectDir of projectDirs) {
+          const result = await processHook('post-tool-use', {
+            sessionId: 'telemetry-project-isolation',
+            toolName: 'Bash',
+            toolInput: { command: 'echo telemetry' },
+            toolOutput: 'done',
+            directory: projectDir,
+          });
+          expect(result.continue).toBe(true);
+        }
+
+        for (const projectDir of projectDirs) {
+          const records = readDispatchTelemetryTail(10, projectDir);
+          expect(records).toHaveLength(1);
+          expect(records[0]?.event).toBe('PostToolUse');
+        }
+      } finally {
+        if (previousStateDir === undefined) delete process.env.OMC_STATE_DIR;
+        else process.env.OMC_STATE_DIR = previousStateDir;
+        for (const projectDir of projectDirs) {
+          rmSync(projectDir, { recursive: true, force: true });
+        }
+      }
+    });
+
+    it('classifies protocol-level PreToolUse denies as hard with continue true', async () => {
+      const projectDir = mkdtempSync(join(tmpdir(), 'bridge-routing-telemetry-deny-'));
+      const previousStateDir = process.env.OMC_STATE_DIR;
+      const previousBedrock = process.env.CLAUDE_CODE_USE_BEDROCK;
+      const previousRouting = process.env.OMC_ROUTING_FORCE_INHERIT;
+      const previousDispatcher = process.env.OMC_HOOK_DISPATCHER;
+      const previousCutover = process.env.OMC_HOOK_CUTOVER;
+      const previousRollback = process.env.OMC_HOOK_ROLLBACK;
+      const previousDispatcherRollback = process.env.OMC_HOOK_DISPATCHER_ROLLBACK;
+      delete process.env.OMC_STATE_DIR;
+      delete process.env.OMC_HOOK_DISPATCHER;
+      delete process.env.OMC_HOOK_CUTOVER;
+      delete process.env.OMC_HOOK_ROLLBACK;
+      delete process.env.OMC_HOOK_DISPATCHER_ROLLBACK;
+      process.env.CLAUDE_CODE_USE_BEDROCK = '1';
+      process.env.OMC_ROUTING_FORCE_INHERIT = 'true';
+
+      try {
+        execFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
+        const result = await processHook('pre-tool-use', {
+          sessionId: 'telemetry-hard-deny',
+          toolName: 'Task',
+          toolInput: {
+            description: 'hard deny telemetry',
+            prompt: 'exercise protocol deny classification',
+            subagent_type: 'oh-my-claudecode:executor',
+            model: 'sonnet',
+          },
+          directory: projectDir,
+        });
+
+        expect(result.continue).toBe(true);
+        const hookSpecificOutput = (result as unknown as Record<string, unknown>)
+          .hookSpecificOutput as Record<string, unknown>;
+        expect(hookSpecificOutput.permissionDecision).toBe('deny');
+
+        const records = readDispatchTelemetryTail(10, projectDir);
+        expect(records.at(-1)?.appliedDecision).toBe('hard');
+      } finally {
+        if (previousStateDir === undefined) delete process.env.OMC_STATE_DIR;
+        else process.env.OMC_STATE_DIR = previousStateDir;
+        if (previousBedrock === undefined) delete process.env.CLAUDE_CODE_USE_BEDROCK;
+        else process.env.CLAUDE_CODE_USE_BEDROCK = previousBedrock;
+        if (previousRouting === undefined) delete process.env.OMC_ROUTING_FORCE_INHERIT;
+        else process.env.OMC_ROUTING_FORCE_INHERIT = previousRouting;
+        if (previousDispatcher === undefined) delete process.env.OMC_HOOK_DISPATCHER;
+        else process.env.OMC_HOOK_DISPATCHER = previousDispatcher;
+        if (previousCutover === undefined) delete process.env.OMC_HOOK_CUTOVER;
+        else process.env.OMC_HOOK_CUTOVER = previousCutover;
+        if (previousRollback === undefined) delete process.env.OMC_HOOK_ROLLBACK;
+        else process.env.OMC_HOOK_ROLLBACK = previousRollback;
+        if (previousDispatcherRollback === undefined) delete process.env.OMC_HOOK_DISPATCHER_ROLLBACK;
+        else process.env.OMC_HOOK_DISPATCHER_ROLLBACK = previousDispatcherRollback;
+        rmSync(projectDir, { recursive: true, force: true });
+      }
+    });
+
 
     it('marks keyword-triggered ralph state as awaiting confirmation so stop enforcement stays inert', async () => {
       const tempDir = mkdtempSync(join(tmpdir(), 'bridge-routing-keyword-ralph-'));
@@ -325,12 +458,12 @@ Read src/hooks/bridge.ts first.`,
         const keywordResult = await processHook('keyword-detector', {
           sessionId,
           prompt:
-            'ralph fix the regression in src/hooks/bridge.ts after issue #1795 by tracing keyword-detector into persistent-mode, preserving session-scoped state behavior, verifying the confirmation gate, keeping linked ultrawork activation intact, adding a focused regression test for false-positive prose prompts, checking stop-hook enforcement only after real Skill invocation, and confirming the smallest safe fix without widening the mode activation surface or changing unrelated orchestration behavior in this worktree',
+            'ralph fix the regression in src/hooks/bridge.ts after issue #1795 by tracing keyword-detector into persistent-mode, preserving session-scoped state behavior, verifying the confirmation gate, adding a focused regression test for false-positive prose prompts, checking stop-hook enforcement only after real Skill invocation, and confirming the smallest safe fix without widening the mode activation surface or changing unrelated orchestration behavior in this worktree',
           directory: tempDir,
         });
 
         expect(keywordResult.continue).toBe(true);
-        expect(keywordResult.message).toContain('[RALPH + ULTRAWORK MODE ACTIVATED]');
+        expect(keywordResult.message).toContain('[RALPH MODE ACTIVATED]');
 
         const sessionDir = join(tempDir, '.omc', 'state', 'sessions', sessionId);
         const ralphState = JSON.parse(readFileSync(join(sessionDir, 'ralph-state.json'), 'utf-8')) as {
@@ -338,18 +471,10 @@ Read src/hooks/bridge.ts first.`,
           awaiting_confirmation_set_at?: string;
           active?: boolean;
         };
-        const ultraworkState = JSON.parse(readFileSync(join(sessionDir, 'ultrawork-state.json'), 'utf-8')) as {
-          awaiting_confirmation?: boolean;
-          awaiting_confirmation_set_at?: string;
-          active?: boolean;
-        };
-
         expect(ralphState.active).toBe(true);
         expect(ralphState.awaiting_confirmation).toBe(true);
         expect(typeof ralphState.awaiting_confirmation_set_at).toBe('string');
-        expect(ultraworkState.active).toBe(true);
-        expect(ultraworkState.awaiting_confirmation).toBe(true);
-        expect(typeof ultraworkState.awaiting_confirmation_set_at).toBe('string');
+        expect(existsSync(join(sessionDir, 'ultrawork-state.json'))).toBe(false);
 
         const stopResult = await processHook('persistent-mode', {
           sessionId,
@@ -448,6 +573,58 @@ $ ultrawork search the codebase`,
       }
     });
 
+    it.each([
+      '/autopilot --workflow release-flow ship the release',
+      '/omc:autopilot --workflow release-flow ship the release',
+      '/autopilot --workflow',
+      '/autopilot --workflow=release-flow ship the release',
+      '/autopilot --workflow unknown-flow ship the release',
+    ])('rejects named autopilot invocation without seeding legacy state: %s', async (prompt) => {
+      const tempDir = mkdtempSync(join(tmpdir(), 'bridge-routing-named-autopilot-'));
+      try {
+        execFileSync('git', ['init'], { cwd: tempDir, stdio: 'pipe' });
+        const sessionId = 'keyword-named-autopilot-session';
+        const result = await processHook('keyword-detector', {
+          sessionId,
+          prompt,
+          directory: tempDir,
+        });
+
+        expect(result.continue).toBe(true);
+        expect(result.message).toContain('[AUTOPILOT NAMED WORKFLOW UNSUPPORTED]');
+        expect(result.message).toContain('State was left unchanged');
+        expect(existsSync(join(tempDir, '.omc', 'state', 'sessions', sessionId))).toBe(false);
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it('preserves existing autopilot state for a named invocation on an unsupported runtime', async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), 'bridge-routing-existing-named-autopilot-'));
+      try {
+        execFileSync('git', ['init'], { cwd: tempDir, stdio: 'pipe' });
+        const sessionId = 'keyword-existing-named-autopilot-session';
+        const statePath = join(tempDir, '.omc', 'state', 'sessions', sessionId, 'autopilot-state.json');
+        mkdirSync(join(statePath, '..'), { recursive: true });
+        const existingState = JSON.stringify({ active: true, session_id: sessionId, originalIdea: 'legacy state' });
+        writeFileSync(statePath, existingState);
+        process.env.OMC_WORKFLOW_TEST_PLATFORM = 'darwin';
+
+        const result = await processHook('keyword-detector', {
+          sessionId,
+          prompt: '/omc:autopilot --workflow release-flow ship the release',
+          directory: tempDir,
+        });
+
+        expect(result.message).toContain('[AUTOPILOT NAMED WORKFLOW UNSUPPORTED]');
+        expect(readFileSync(statePath, 'utf8')).toBe(existingState);
+        expect(existsSync(join(tempDir, '.omc', 'state', 'sessions', sessionId, 'skill-active-state.json'))).toBe(false);
+        expect(existsSync(join(tempDir, '.omc', 'state', 'skill-active-state.json'))).toBe(false);
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
     it('seeds inert autopilot state for keyword routing so stop enforcement stays inert until the skill confirms', async () => {
       const tempDir = mkdtempSync(join(tmpdir(), 'bridge-routing-keyword-autopilot-'));
       try {
@@ -541,7 +718,7 @@ $ ultrawork search the codebase`,
       }
     });
 
-    it('should activate ralph and linked ultrawork when Skill tool invokes ralph', async () => {
+    it('should activate only ralph when Skill tool invokes ralph', async () => {
       const tempDir = mkdtempSync(join(tmpdir(), 'bridge-routing-ralph-'));
       try {
         execFileSync('git', ['init'], { cwd: tempDir, stdio: 'pipe' });
@@ -560,15 +737,12 @@ $ ultrawork search the codebase`,
         const ultraworkPath = join(tempDir, '.omc', 'state', 'sessions', sessionId, 'ultrawork-state.json');
 
         expect(existsSync(ralphPath)).toBe(true);
-        expect(existsSync(ultraworkPath)).toBe(true);
+        expect(existsSync(ultraworkPath)).toBe(false);
 
         const ralphState = JSON.parse(readFileSync(ralphPath, 'utf-8')) as { active?: boolean; linked_ultrawork?: boolean };
-        const ultraworkState = JSON.parse(readFileSync(ultraworkPath, 'utf-8')) as { active?: boolean; linked_to_ralph?: boolean };
 
         expect(ralphState.active).toBe(true);
-        expect(ralphState.linked_ultrawork).toBe(true);
-        expect(ultraworkState.active).toBe(true);
-        expect(ultraworkState.linked_to_ralph).toBe(true);
+        expect(ralphState.linked_ultrawork).toBeUndefined();
       } finally {
         rmSync(tempDir, { recursive: true, force: true });
       }
@@ -606,7 +780,7 @@ $ ultrawork search the codebase`,
       }
     });
 
-    it('clears awaiting confirmation when Skill tool actually invokes ralph', async () => {
+    it('clears only Ralph confirmation when Skill invokes Ralph', async () => {
       const tempDir = mkdtempSync(join(tmpdir(), 'bridge-routing-confirm-ralph-'));
       try {
         execFileSync('git', ['init'], { cwd: tempDir, stdio: 'pipe' });
@@ -659,7 +833,7 @@ $ ultrawork search the codebase`,
 
         expect(ralphState.awaiting_confirmation).toBeUndefined();
         expect(ralphState.awaiting_confirmation_set_at).toBeUndefined();
-        expect(ultraworkState.awaiting_confirmation).toBeUndefined();
+        expect(ultraworkState.awaiting_confirmation).toBe(true);
         expect(ultraworkState.awaiting_confirmation_set_at).toBeUndefined();
       } finally {
         rmSync(tempDir, { recursive: true, force: true });
@@ -858,6 +1032,25 @@ $ ultrawork search the codebase`,
         expect(result.message).toBeUndefined();
         expect((result as unknown as Record<string, unknown>).hookSpecificOutput).toBeUndefined();
         expect(existsSync(join(tempDir, '.omc', 'state', 'sessions', sessionId, 'ralplan-state.json'))).toBe(false);
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it.each(['/ask muse', '/oh-my-claudecode:ask muse'])('does not arm modes for keywords inside %s payloads', async (command) => {
+      const tempDir = mkdtempSync(join(tmpdir(), 'bridge-routing-ask-muse-'));
+      try {
+        execFileSync('git', ['init'], { cwd: tempDir, stdio: 'pipe' });
+        const sessionId = 'ask-muse-session';
+        const result = await processHook('keyword-detector', {
+          sessionId, directory: tempDir,
+          prompt: `${command} ralplan ralph ultrawork autopilot review`,
+        });
+        expect(result.continue).toBe(true);
+        expect(result.message).toBeUndefined();
+        for (const mode of ['ralplan', 'ralph', 'ultrawork', 'autopilot']) {
+          expect(existsSync(join(tempDir, '.omc', 'state', 'sessions', sessionId, `${mode}-state.json`))).toBe(false);
+        }
       } finally {
         rmSync(tempDir, { recursive: true, force: true });
       }
@@ -1289,6 +1482,128 @@ $ ultrawork search the codebase`,
       }
     });
 
+    it('does not remove foreign metadata-owned state during abandoned-session reconciliation', async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), 'bridge-routing-session-start-foreign-state-'));
+      const previousTestBootId = process.env.OMC_TEST_BOOT_ID;
+      try {
+        execFileSync('git', ['init'], { cwd: tempDir, stdio: 'pipe' });
+        const staleSessionId = 'stale-foreign-state-session';
+        const currentSessionId = 'current-foreign-state-session';
+        const staleSessionDir = join(tempDir, '.omc', 'state', 'sessions', staleSessionId);
+        mkdirSync(staleSessionDir, { recursive: true });
+        const statePath = join(staleSessionDir, 'ralph-state.json');
+        const stateBytes = JSON.stringify({
+          active: true,
+          session_id: staleSessionId,
+          awaiting_confirmation: true,
+          _meta: { sessionId: 'different-owner-session' },
+        });
+        writeFileSync(statePath, stateBytes);
+        writeFileSync(
+          join(staleSessionDir, 'session-started.json'),
+          JSON.stringify({
+            session_id: staleSessionId,
+            started_at: '2026-04-20T00:00:00.000Z',
+            boot_id: 'previous-test-boot-id',
+          }),
+        );
+
+        process.env.OMC_TEST_BOOT_ID = 'current-test-boot-id';
+        await processHook('session-start', {
+          sessionId: currentSessionId,
+          directory: tempDir,
+        } as HookInput);
+
+        expect(existsSync(statePath)).toBe(true);
+        expect(readFileSync(statePath, 'utf-8')).toBe(stateBytes);
+      } finally {
+        if (previousTestBootId === undefined) delete process.env.OMC_TEST_BOOT_ID;
+        else process.env.OMC_TEST_BOOT_ID = previousTestBootId;
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it('does not clear confirmation on a foreign metadata-owned legacy state', async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), 'bridge-routing-confirm-foreign-state-'));
+      try {
+        execFileSync('git', ['init'], { cwd: tempDir, stdio: 'pipe' });
+        const sessionId = 'confirm-foreign-state-session';
+        const stateDir = join(tempDir, '.omc', 'state');
+        mkdirSync(stateDir, { recursive: true });
+        const statePath = join(stateDir, 'ralph-state.json');
+        const stateBytes = JSON.stringify({
+          active: true,
+          awaiting_confirmation: true,
+          _meta: { sessionId: 'different-owner-session' },
+        });
+        writeFileSync(statePath, stateBytes);
+
+        await processHook('pre-tool-use', {
+          sessionId,
+          toolName: 'Skill',
+          toolInput: { skill: 'oh-my-claudecode:ralph' },
+          directory: tempDir,
+        });
+
+        expect(readFileSync(statePath, 'utf-8')).toBe(stateBytes);
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it('does not overwrite a foreign metadata-owned session-start marker', async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), 'bridge-routing-marker-foreign-state-'));
+      try {
+        execFileSync('git', ['init'], { cwd: tempDir, stdio: 'pipe' });
+        const sessionId = 'marker-foreign-state-session';
+        const sessionDir = join(tempDir, '.omc', 'state', 'sessions', sessionId);
+        mkdirSync(sessionDir, { recursive: true });
+        const markerPath = join(sessionDir, 'session-started.json');
+        const markerBytes = JSON.stringify({
+          session_id: sessionId,
+          started_at: '2026-04-20T00:00:00.000Z',
+          boot_id: 'same-test-boot-id',
+          _meta: { sessionId: 'different-owner-session' },
+        });
+        writeFileSync(markerPath, markerBytes);
+
+        await processHook('session-start', {
+          sessionId,
+          directory: tempDir,
+        } as HookInput);
+
+        expect(readFileSync(markerPath, 'utf-8')).toBe(markerBytes);
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it('does not restore a foreign metadata-owned legacy team state', async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), 'bridge-routing-team-foreign-state-'));
+      try {
+        execFileSync('git', ['init'], { cwd: tempDir, stdio: 'pipe' });
+        const stateDir = join(tempDir, '.omc', 'state');
+        mkdirSync(stateDir, { recursive: true });
+        writeFileSync(
+          join(stateDir, 'team-state.json'),
+          JSON.stringify({
+            active: true,
+            stage: 'team-exec',
+            _meta: { sessionId: 'different-owner-session' },
+          }),
+        );
+
+        const result = await processHook('session-start', {
+          sessionId: 'team-foreign-state-session',
+          directory: tempDir,
+        } as HookInput);
+
+        expect(result.message ?? '').not.toContain('[TEAM MODE RESTORED]');
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
     it('should restore canonical team context when coarse team-state drifts away', async () => {
       const tempDir = process.cwd();
       const sessionId = 'canonical-team-session';
@@ -1550,7 +1865,7 @@ $ ultrawork search the codebase`,
 
       const input: HookInput = {
         sessionId: 'test-session',
-        prompt: 'ultrawork this',
+        prompt: 'ralph this',
         directory: '/tmp/test-routing',
       };
 
@@ -1596,7 +1911,7 @@ $ ultrawork search the codebase`,
 
       const input: HookInput = {
         sessionId: 'test-session',
-        prompt: 'ultrawork',
+        prompt: 'ralph',
         directory: '/tmp/test-routing',
       };
 
@@ -1628,7 +1943,7 @@ $ ultrawork search the codebase`,
 
       const input: HookInput = {
         sessionId: 'test-session',
-        prompt: 'ultrawork this',
+        prompt: 'ralph this',
         directory: '/tmp/test-routing',
       };
 
@@ -1669,7 +1984,7 @@ $ ultrawork search the codebase`,
 
       const input: HookInput = {
         sessionId: 'test-session',
-        prompt: 'ultrawork',
+        prompt: 'ralph',
         directory: '/tmp/test-routing',
       };
 
@@ -1982,18 +2297,18 @@ $ ultrawork search the codebase`,
       expect(decision.behavior).toBe('allow');
     });
 
-    it('permission-request: camelCase input auto-allows explicitly targeted single-test commands', async () => {
+    it('permission-request: camelCase input auto-allows repo-scoped inspection', async () => {
       const tempDir = mkdtempSync(join(tmpdir(), 'bridge-858-permission-camel-'));
       try {
-        mkdirSync(join(tempDir, 'src', '__tests__'), { recursive: true });
+        mkdirSync(join(tempDir, 'src'), { recursive: true });
         execFileSync('git', ['init'], { cwd: tempDir, stdio: 'pipe' });
-        writeFileSync(join(tempDir, 'src', '__tests__', 'safe.test.ts'), 'test("x", () => {});\n');
+        writeFileSync(join(tempDir, 'src', 'safe.ts'), 'export const value = 1;\n');
 
         const input: HookInput = {
           sessionId: 'test-session-858',
           directory: tempDir,
           toolName: 'Bash',
-          toolInput: { command: 'vitest run src/__tests__/safe.test.ts' },
+          toolInput: { command: 'cat src/safe.ts' },
         };
 
         const result = await processHook('permission-request', input);
@@ -2001,6 +2316,7 @@ $ ultrawork search the codebase`,
         const out = result as unknown as Record<string, unknown>;
         expect(out.hookSpecificOutput).toBeDefined();
         const specific = out.hookSpecificOutput as Record<string, unknown>;
+        expect(specific.hookEventName).toBe('PermissionRequest');
         const decision = specific.decision as Record<string, unknown>;
         expect(decision.behavior).toBe('allow');
       } finally {
@@ -2100,6 +2416,12 @@ $ ultrawork search the codebase`,
 
     it('subagent start/stop: normalized optional fields survive routing lifecycle', async () => {
       const tempDir = mkdtempSync(join(tmpdir(), 'bridge-858-subagent-'));
+      const previousHome = process.env.HOME;
+      const previousUserProfile = process.env.USERPROFILE;
+      const previousStateDir = process.env.OMC_STATE_DIR;
+      process.env.HOME = tempDir;
+      process.env.USERPROFILE = tempDir;
+      delete process.env.OMC_STATE_DIR;
       const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
       try {
         const startInput = {
@@ -2128,7 +2450,7 @@ $ ultrawork search the codebase`,
 
         flushPendingWrites();
 
-        const trackingPath = join(tempDir, '.omc', 'state', 'sessions', 'test-session-858-subagent', 'subagent-tracking-state.json');
+        const trackingPath = join(getOmcRoot(tempDir), 'state', 'sessions', 'test-session-858-subagent', 'subagent-tracking-state.json');
         expect(existsSync(trackingPath)).toBe(true);
 
         const tracking = JSON.parse(readFileSync(trackingPath, 'utf-8')) as {
@@ -2148,6 +2470,12 @@ $ ultrawork search the codebase`,
       } finally {
         flushPendingWrites();
         errorSpy.mockRestore();
+        if (previousHome === undefined) delete process.env.HOME;
+        else process.env.HOME = previousHome;
+        if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = previousUserProfile;
+        if (previousStateDir === undefined) delete process.env.OMC_STATE_DIR;
+        else process.env.OMC_STATE_DIR = previousStateDir;
         rmSync(tempDir, { recursive: true, force: true });
       }
     });

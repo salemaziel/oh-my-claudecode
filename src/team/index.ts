@@ -38,11 +38,8 @@ export {
   validateTmux,
   sanitizeName,
   sessionName,
-  createSession,
-  killSession,
   isSessionAlive,
   listActiveSessions,
-  spawnBridgeInSession,
 } from './tmux-session.js';
 
 export {
@@ -218,6 +215,29 @@ export {
   writeWorkerOverlay,
 } from './worker-bootstrap.js';
 
+export type {
+  WorkerLaunchAttempt,
+  WorkerLaunchBootstrapSpec,
+  WorkerLaunchAcceptance,
+  WorkerLaunchBootstrapResult,
+  WorkerLaunchContext,
+  ProviderSpawnInvocation,
+} from './worker-launch-ack.js';
+export {
+  prepareWorkerLaunchAttempt,
+  loadWorkerLaunchAttempt,
+  loadCurrentWorkerLaunchAttempt,
+  buildWorkerLaunchBootstrapSpec,
+  revokeWorkerLaunchAttempt,
+  awaitWorkerLaunchAcknowledgement,
+  isWorkerLaunchAttemptAccepted,
+  runWorkerLaunchBootstrap,
+  isWorkerLaunchProviderStarted,
+  isWorkerLaunchAttemptCurrent,
+  withWorkerLaunchAttemptFence,
+  buildProviderSpawnInvocation,
+} from './worker-launch-ack.js';
+
 // tmux-comm
 export {
   sendTmuxTrigger,
@@ -241,9 +261,32 @@ export type {
   TeamRuntime,
   WorkerStatus as RuntimeWorkerStatus,
   TeamSnapshot,
-  WatchdogCompletionEvent,
 } from './runtime.js';
-export { startTeam, monitorTeam, assignTask, shutdownTeam, resumeTeam, watchdogCliWorkers } from './runtime.js';
+export { startTeam, monitorTeam, shutdownTeam, resumeTeam } from './runtime.js';
+export {
+  setRuntimeOwnerRecoveryClient,
+  recoverDeadWorkerV2,
+  readRecoverDeadWorkerV2Outcome,
+  readRecoverDeadWorkerV2Result,
+} from './runtime-v2.js';
+export type {
+  RecoverDeadWorkerV2Options,
+  RuntimeOwnerRecoveryClient,
+} from './runtime-v2.js';
+export type {
+  RecoverDeadWorkerV2Error,
+  RecoverDeadWorkerV2Result,
+  RecoverDeadWorkerV2Success,
+  RecoverDeadWorkerV2Failure,
+} from './types.js';
+export type {
+  RecoveryDurableOutcome,
+  RecoveryOutcomePending,
+  RecoveryOutcomeFinal,
+} from './recovery-request-store.js';
+
+export { teamPublishTaskRecoveryCheckpoint } from './team-ops.js';
+export type { PublishTaskRecoveryCheckpointInput, PublishTaskRecoveryCheckpointResult } from './task-recovery-checkpoint.js';
 
 export { injectToLeaderPane } from './tmux-session.js';
 

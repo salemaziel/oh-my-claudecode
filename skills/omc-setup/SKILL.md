@@ -49,23 +49,23 @@ MODES:
     - Configures CLAUDE.md (local or global)
     - Sets up HUD statusline
     - Checks for updates
-    - Offers MCP server configuration
+    - Clears retired setup values (5.0.0 removed defaultExecutionMode) and points MCP registration at Claude Code's native config
     - Configures team mode defaults (agent count, type, model)
     - If already configured, offers quick update option
 
   Local Configuration (--local)
-    - Downloads fresh CLAUDE.md to ./.claude/
-    - Backs up existing CLAUDE.md to .claude/CLAUDE.md.backup.YYYY-MM-DD
+    - Invokes the plugin-local coordinator through `scripts/setup-claude-md.sh`; the shell validates the coordinator response and its exit status before any post-install work
+    - Reports coordinator-created byte-identical backups only for files that required mutation
     - Project-specific settings
     - Use this to update project config after OMC upgrades
 
   Global Configuration (--global)
-    - Downloads fresh CLAUDE.md to ~/.claude/
-    - Backs up existing CLAUDE.md to ~/.claude/CLAUDE.md.backup.YYYY-MM-DD
+    - Invokes the plugin-local coordinator through `scripts/setup-claude-md.sh`; the shell validates the coordinator response and its exit status before any post-install work
+    - Reports coordinator-created byte-identical backups only for changed global files
     - Default: explicitly overwrites ~/.claude/CLAUDE.md so plain `claude` also uses OMC
     - Optional preserve mode keeps the user's base `CLAUDE.md` and installs OMC into `CLAUDE-omc.md` for `omc` launches
     - Applies to all Claude Code sessions
-    - Cleans up legacy hooks
+    - Preserves same-named legacy hook files unless their exact historical contents are independently verified
     - Use this to update global config after OMC upgrades
 
   Force Full Setup (--force)
@@ -83,20 +83,15 @@ For more info: https://github.com/salemaziel/oh-my-claudecode
 ```
 
 
-## Active Plugin Root Resolution
+## Setup Invocation
 
-Before running setup shell commands or reading phase files, resolve the current OMC plugin root. This prevents an already-running Claude Code session from continuing to use a stale `CLAUDE_PLUGIN_ROOT` after `/plugin marketplace update omc` installs a newer cache version.
-
-```bash
-OMC_SETUP_PLUGIN_ROOT=$(node -e "const f=require('fs'),p=require('path'),h=require('os').homedir(),d=(process.env.CLAUDE_CONFIG_DIR||p.join(h,'.claude')).replace(/[\\/]+$/,''),b=p.join(d,'plugins','cache','omc','oh-my-claudecode'),valid=r=>f.existsSync(p.join(r,'skills','omc-setup','SKILL.md'))||f.existsSync(p.join(r,'hooks','hooks.json'))||f.existsSync(p.join(r,'docs','CLAUDE.md'));try{const vs=f.readdirSync(b,{withFileTypes:true}).filter(e=>(e.isDirectory()||e.isSymbolicLink())&&/^\d+\.\d+\.\d+/.test(e.name)).map(e=>e.name).sort((a,c)=>c.localeCompare(a,void 0,{numeric:true}));const hit=vs.map(v=>p.join(b,v)).find(valid);if(hit)console.log(hit);else if(process.env.CLAUDE_PLUGIN_ROOT)console.log(process.env.CLAUDE_PLUGIN_ROOT)}catch{if(process.env.CLAUDE_PLUGIN_ROOT)console.log(process.env.CLAUDE_PLUGIN_ROOT)}")
-export OMC_SETUP_PLUGIN_ROOT
-```
-
-Use `${OMC_SETUP_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT}}` for all setup script and phase paths, then immediately repair stale cache references before any prompts or phase work:
+Do not independently scan plugin cache directories or select a plugin root in this skill. Invoke the setup script from the plugin root supplied by the running plugin environment:
 
 ```bash
-node "${OMC_SETUP_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT}}/scripts/repair-plugin-cache.mjs"
+bash "${OMC_SETUP_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT}}/scripts/setup-claude-md.sh" <local|global> [overwrite|preserve]
 ```
+
+The script is the sole cache resolver. It accepts only complete plugin roots (canonical `docs/CLAUDE.md`, coordinator artifact, and `wiki` skill), chooses a strict full-SemVer cache version, verifies the compiled-source handshake, and fails closed on coordinator protocol or status disagreement. Do not download configuration or mutate `CLAUDE.md` outside that coordinator.
 
 ## Pre-Setup Check: Already Configured?
 
@@ -104,11 +99,24 @@ node "${OMC_SETUP_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT}}/scripts/repair-plugin-cach
 
 ```bash
 # Check if setup was already completed
-CONFIG_FILE="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.omc-config.json"
+CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+case "$CONFIG_DIR" in
+  "~") CONFIG_DIR="$HOME" ;;
+  "~/"*) CONFIG_DIR="$HOME/${CONFIG_DIR#\~/}" ;;
+  "~\\"*) CONFIG_DIR="$HOME/${CONFIG_DIR#\~\\}" ;;
+esac
+CONFIG_FILE="$CONFIG_DIR/.omc-config.json"
 
 if [ -f "$CONFIG_FILE" ]; then
-  SETUP_COMPLETED=$(jq -r '.setupCompleted // empty' "$CONFIG_FILE" 2>/dev/null)
-  SETUP_VERSION=$(jq -r '.setupVersion // empty' "$CONFIG_FILE" 2>/dev/null)
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "ERROR: jq is required to inspect existing OMC setup state. Existing config was not modified."
+    exit 1
+  fi
+  if ! SETUP_COMPLETED=$(jq -r '.setupCompleted // empty' "$CONFIG_FILE" 2>/dev/null) \
+    || ! SETUP_VERSION=$(jq -r '.setupVersion // empty' "$CONFIG_FILE" 2>/dev/null); then
+    echo "ERROR: Existing OMC config is invalid JSON. Existing config was not modified."
+    exit 1
+  fi
 
   if [ -n "$SETUP_COMPLETED" ] && [ "$SETUP_COMPLETED" != "null" ]; then
     echo "OMC setup was already completed on: $SETUP_COMPLETED"
@@ -127,15 +135,16 @@ Use AskUserQuestion to prompt:
 **Question:** "OMC is already configured. What would you like to do?"
 
 **Options:**
-1. **Update CLAUDE.md only** - Download latest CLAUDE.md without re-running full setup
+1. **Update CLAUDE.md and clear retired setup values** - Install the active plugin's canonical CLAUDE.md and run Phase 2 Step 2.4 without re-running the full setup
 2. **Run full setup again** - Go through the complete setup wizard
 3. **Cancel** - Exit without changes
 
-**If user chooses "Update CLAUDE.md only":**
+**If user chooses "Update CLAUDE.md and clear retired setup values":**
 - Detect if local (.claude/CLAUDE.md) or global (~/.claude/CLAUDE.md) config exists
 - If local exists, run: `bash "${OMC_SETUP_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT}}/scripts/setup-claude-md.sh" local`
 - If only global exists, run: `bash "${OMC_SETUP_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT}}/scripts/setup-claude-md.sh" global`
-- Skip all other steps
+- Run Phase 2 Step 2.4 to clear the retired `defaultExecutionMode` key
+- Skip all other steps after the cleanup
 - Report success and exit
 
 **If user chooses "Run full setup again":**
@@ -194,7 +203,9 @@ Execute phases sequentially. For each phase, read the corresponding file and fol
 
 After installing oh-my-claudecode updates (via npm or plugin update):
 
-**Automatic**: Just run `/oh-my-claudecode:omc-setup` - it will detect you've already configured and offer a quick "Update CLAUDE.md only" option that skips the full wizard.
+**Automatic**: Just run `/oh-my-claudecode:omc-setup` - it will detect you've already configured and offer a quick "Update CLAUDE.md and clear retired setup values" option that skips the rest of the wizard.
+
+The quick update path must still perform Phase 2 Step 2.4 so upgrades remove the retired `defaultExecutionMode` value; it must not write any replacement execution-mode setting.
 
 **Manual options**:
 - `/oh-my-claudecode:omc-setup --local` to update project config only

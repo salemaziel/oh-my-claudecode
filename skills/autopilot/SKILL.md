@@ -1,7 +1,7 @@
 ---
 name: autopilot
 description: Full autonomous execution from idea to working code
-argument-hint: "<product idea or task description>"
+argument-hint: "[--workflow <name>] <product idea or task description>"
 level: 4
 ---
 
@@ -33,8 +33,51 @@ Most non-trivial software tasks require coordinated phases: understanding requir
 - Parallel execution is used within phases where possible (Phase 2 and Phase 4)
 - QA cycles repeat up to 5 times; if the same error persists 3 times, stop and report the fundamental issue
 - Validation requires approval from all reviewers; rejected items get fixed and re-validated
-- Cancel with `/oh-my-claudecode:cancel` at any time; progress is preserved for resume
+- Budget stop (opt-in): when `OMC_RUN_BUDGET_TOKENS` is set, compare session token spend against it at each phase boundary — the `trace_summary` MCP tool reports token usage. At 90% of budget, finish the current phase; at 100%, stop with a budget report, state preserved for resume. Budget exhaustion is a stop condition, not a failure.
+- Cancel with `/oh-my-claudecode:cancel` at any time; before terminal state cleanup, run the Phase 5 closeout, and preserve resumable progress artifacts
 </Execution_Policy>
+
+<Workflow_Profiles>
+## Named stage profiles (v1)
+
+Select a configured profile only with `/autopilot --workflow <name> <task>`. A profile is an autopilot-owned stage schedule, not a command, mode, plugin, filename, or separate state identity. Without `--workflow`, autopilot retains its legacy lifecycle and behavior.
+
+Named workflow profiles require Linux with the `flock` utility in v1 because their transcript evidence boundary uses Linux no-follow file-descriptor traversal and their recoverable mutation lock uses kernel advisory locking. Unsupported environments reject explicit `--workflow` activation before state mutation; use legacy autopilot instead.
+
+Profiles are configured in project or user JSONC as `autopilot.workflows.<slug>`. Every v1 profile has exactly `version: 1` and `stages`; no other profile keys are accepted. The only admitted stage sequences are:
+
+```jsonc
+{
+  "autopilot": {
+    "workflows": {
+      "plan-build-qa": {
+        "version": 1,
+        "stages": ["ralplan", "execution", "qa"]
+      }
+    }
+  }
+}
+```
+
+```text
+[ralplan, execution]
+[ralplan, execution, ralph]
+[ralplan, execution, qa]
+[ralplan, execution, ralph, qa]
+```
+
+`ralplan` creates the plan consumed by `execution`; `execution` creates the implemented workspace required by `ralph` and `qa`. Thus omitted or reordered prerequisites, duplicate stages, and non-built-in stages are invalid. Profile names use `^[a-z][a-z0-9-]{0,62}$`, are validated metadata only, and cannot collide with built-in stages, autopilot/mode names, or deprecated aliases.
+
+User and project configuration sources are each validated before composition. Different names coexist; a project profile with the same name replaces the complete user profile rather than deep-merging it. Environment configuration cannot define or replace profiles.
+
+On successful selection, autopilot atomically creates its existing session-scoped state with an immutable normalized descriptor and selected-only pipeline tracking. The descriptor contains the workflow name, profile version, canonical stages, and a deterministic SHA-256 profile hash; it excludes task text and mutable progress. Resume and Stop verify that hash and refuse a mismatch without reloading configuration or emitting a stage prompt. Cancel, resume, cleanup, state inspection, HUD, and Stop continuation remain owned by autopilot.
+
+The installed plugin and standalone-installed Stop hooks advance only after an authorized assistant completion record for the active stage appears after that stage's persisted activation transcript boundary. They bind evidence to the owner session and bounded, non-symlink transcript; reject user/tool/local-command output and stale or wrong-stage evidence; and use compare-before-write tracking updates so duplicate or concurrent Stop events advance exactly once. Public state, HUD, and Stop output show only safe workflow metadata and progress, never the task, descriptor internals, transcript references, offsets, or record hashes.
+
+### V1 deferrals
+
+V1 does not support `stageModels`, model routing, provider or role selection; inline/no-spawn execution; dynamic commands, modes, or state files; arbitrary stages, prompts, plugins, branches, loops, DAGs, or callbacks; or environment-defined profile definitions. The separate custom-skill inline-array frontmatter parser mismatch is also deferred.
+</Workflow_Profiles>
 
 <Steps>
 1. **Phase 0 - Expansion**: Turn the user's idea into a detailed spec
@@ -42,6 +85,7 @@ Most non-trivial software tasks require coordinated phases: understanding requir
    - **If ralplan consensus plan exists** (`.omc/plans/ralplan-*.md` or `.omc/plans/consensus-*.md` from the 3-stage pipeline): Skip BOTH Phase 0 and Phase 1 — jump directly to Phase 2 (Execution). The plan has already been Planner/Architect/Critic validated.
    - **If deep-interview spec exists** (`.omc/specs/deep-interview-*.md`): Skip analyst+architect expansion, use the pre-validated spec directly as Phase 0 output. Continue to Phase 1 (Planning).
    - **If input is vague** (no file paths, function names, or concrete anchors): Offer redirect to `/deep-interview` for Socratic clarification before expanding
+   - **If the redirect cannot be answered** (headless/AFK invocation, an unanswered offer, or the user choosing to expand directly): proceed under the **AFK assumption protocol** — never stall on a missing human and never guess silently (see Escalation_And_Stop_Conditions)
    - **Otherwise**: Analyst (Opus) extracts requirements, Architect (Opus) creates technical specification
    - Output: `.omc/autopilot/spec.md`
 
@@ -51,13 +95,13 @@ Most non-trivial software tasks require coordinated phases: understanding requir
    - Critic (Opus): Validate plan
    - Output: `.omc/plans/autopilot-impl.md`
 
-3. **Phase 2 - Execution**: Implement the plan using Ralph + Ultrawork
+3. **Phase 2 - Execution**: Implement the plan using executor agents with Ralph persistence when needed
    - Executor (Haiku): Simple tasks
    - Executor (Sonnet): Standard tasks
    - Executor (Opus): Complex tasks
    - Run independent tasks in parallel
 
-4. **Phase 3 - QA**: Cycle until all tests pass (UltraQA mode)
+4. **Phase 3 - QA**: Cycle until all tests pass
    - Build, lint, test, fix failures
    - Repeat up to 5 cycles
    - Stop early if the same error repeats 3 times (indicates a fundamental issue)
@@ -68,8 +112,11 @@ Most non-trivial software tasks require coordinated phases: understanding requir
    - Code-reviewer: Quality review
    - All must approve; fix and re-validate on rejection
 
-6. **Phase 5 - Cleanup**: Delete all state files on successful completion
-   - Remove `.omc/state/autopilot-state.json`, `ralph-state.json`, `ultrawork-state.json`, `ultraqa-state.json`
+6. **Phase 5 - Closeout and Cleanup**:
+   - **Run closeout (before state cleanup)**: Append at most three factual lines to `.omc/notepads/autopilot/problems.md` (blockers additionally in `.omc/notepads/autopilot/issues.md`) — what broke (3-strike QA errors, validation rejections) and what dragged (missing checks, unreachable information, environment friction). Preserve existing entries: append only and never replace the shared file. If there are no observations, append nothing; an empty closeout is valid, so do not write “no lessons.” Observations only — landing them on repo surfaces is `refit`'s job, with the user's approval. When the run ends in a stop-and-report escalation, also draft an incident work item with the failure signature, evidence pointers, and reopen path. Post it to a tracker only with explicit user or mode authorization; otherwise append it to `.omc/notepads/autopilot/issues.md`.
+   - When the user or mode invocation explicitly authorizes publishing and draft-PR creation, draft the body with `/oh-my-claudecode:pr` (verification evidence and Open Assumptions) and create the draft PR. Do not push or open a PR based on completion alone. Mark an authorized draft ready only after the user accepts the completion report.
+   - Delete all state files on successful completion
+   - Remove `.omc/state/autopilot-state.json`, `ralph-state.json` (plus stale retired `ultraqa-state.json`/`ultrawork-state.json` if legacy copies exist)
    - Run `/oh-my-claudecode:cancel` for clean exit
 </Steps>
 
@@ -77,7 +124,7 @@ Most non-trivial software tasks require coordinated phases: understanding requir
 - Use `Task(subagent_type="oh-my-claudecode:architect", ...)` for Phase 4 architecture validation
 - Use `Task(subagent_type="oh-my-claudecode:security-reviewer", ...)` for Phase 4 security review
 - Use `Task(subagent_type="oh-my-claudecode:code-reviewer", ...)` for Phase 4 quality review
-- Agents form their own analysis first, then spawn Claude Task agents for cross-validation
+- Agents form their own analysis and return it; the LEAD then spawns any cross-validation agents itself. Do not rely on a subagent spawning further subagents without checking the Claude Code depth setting: Claude Code 2.1.217–2.1.218 defaulted `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH` to 1, while 2.1.219+ defaults to 3. Keep cross-validation at the LEAD level unless nested delegation is deliberate and supported by the active runtime.
 - Never block on external tools; proceed with available agents if delegation fails
 </Tool_Usage>
 
@@ -108,6 +155,7 @@ Why bad: This is an exploration/brainstorming request. Respond conversationally 
 - Stop and report when validation keeps failing after 3 re-validation rounds
 - Stop when the user says "stop", "cancel", or "abort"
 - If requirements were too vague and expansion produces an unclear spec, offer redirect to `/deep-interview` for Socratic clarification, or pause and ask the user for clarification before proceeding
+- **AFK assumption protocol** (when no answer is available — headless run, unanswered redirect offer, or the user choosing to expand anyway): proceed, but never silently. Every guess that would have been an interview question is recorded as an assumption — statement, basis, reversibility — in the spec's `## Assumptions` section. A guess that passes the ADR test (hard to reverse, surprising without context, a real trade-off) is NOT assumed: it lands in `.omc/autopilot/decisions-pending.md` (options, recommendation, reversibility note) and the affected scope is implemented only in its reversible direction, or deferred. The completion report leads with the Open Assumptions ranked by how much a returning human would want to veto them.
 </Escalation_And_Stop_Conditions>
 
 <Final_Checklist>
@@ -170,8 +218,7 @@ or the Claude Code slash compatibility surface:
 ```
 
 Limitations:
-- Cursor workers are executor-style only: implementation, file edits, build/test fixes, and other plan execution tasks.
-- Keep reviewer, critic, security-review, validation verdict, and final approval roles on native Claude/OMC reviewer agents unless explicit safe support is added later.
+- Cursor workers support implementation and reviewer-style team roles. `critic`, `code-reviewer`, `security-reviewer`, and `test-engineer` workers must emit the structured verdict file consumed by the team leader; final approval remains a lead-session responsibility.
 - Cursor requires the `cursor-agent` CLI to be installed and authenticated. If `cursor-agent` is unavailable, report that setup requirement instead of silently falling back to Claude-only execution.
 
 ## Resume
@@ -205,6 +252,8 @@ Autopilot: "Your request is open-ended. Would you like to run a deep interview f
 
 If a deep-interview spec already exists at `.omc/specs/deep-interview-*.md`, autopilot uses it directly as Phase 0 output (the spec has already been mathematically validated for clarity).
 
+When no interview can happen (headless/AFK run, unanswered offer, expand-anyway), the AFK assumption protocol in Escalation_And_Stop_Conditions governs: assumptions are recorded in the spec, irreversible-direction guesses become pending decisions, and the completion report leads with the Open Assumptions.
+
 ### 3-Stage Pipeline: deep-interview → ralplan → autopilot
 
 The recommended full pipeline chains three quality gates:
@@ -221,5 +270,5 @@ When autopilot detects a ralplan consensus plan (`.omc/plans/ralplan-*.md` or `.
 - Architecture-reviewed (ralplan Architect agent)
 - Quality-checked (ralplan Critic agent)
 
-Autopilot starts directly at Phase 2 (Execution via Ralph + Ultrawork).
+Autopilot starts directly at Phase 2 using executor agents and Ralph persistence.
 </Advanced>

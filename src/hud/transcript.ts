@@ -27,6 +27,7 @@ import type {
   PendingPermission,
   LastRequestTokenUsage,
 } from "./types.js";
+import { classifyAgentSpawn, parseIncomingAgentWrapper } from "./agent-kind.js";
 
 // Performance constants
 // 4MB tail window: enough to catch the full tool_use → tool_result → task-notification
@@ -62,6 +63,30 @@ const PERMISSION_THRESHOLD_MS = 3000; // 3 seconds
  * Cleared when tool_result is received for the corresponding tool_use.
  */
 const pendingPermissionMap = new Map<string, PendingPermission>();
+
+/**
+ * Per-parse Task-tool state (#4242). TaskCreate/TaskUpdate are incremental,
+ * unlike TodoWrite's full-list replace, so items are indexed by task id.
+ * Keyed by the parse's `latestTodos` array so state never leaks across parses.
+ */
+interface TaskToolState {
+  /** TaskCreate tool_use id -> item awaiting its "Task #<id> created" result */
+  pendingCreates: Map<string, TodoItem>;
+  /** task id -> item currently in latestTodos */
+  byId: Map<string, TodoItem>;
+}
+const taskToolStates = new WeakMap<TodoItem[], TaskToolState>();
+
+function getTaskToolState(latestTodos: TodoItem[]): TaskToolState {
+  let state = taskToolStates.get(latestTodos);
+  if (!state) {
+    state = { pendingCreates: new Map(), byId: new Map() };
+    taskToolStates.set(latestTodos, state);
+  }
+  return state;
+}
+
+const TASK_STATUSES = new Set<TodoItem["status"]>(["pending", "in_progress", "completed"]);
 
 /**
  * Content block types that indicate extended thinking mode.
@@ -101,6 +126,7 @@ export async function parseTranscript(
   const result: TranscriptData = {
     agents: [],
     todos: [],
+    incomingMessages: [],
     lastActivatedSkill: undefined,
     toolCallCount: 0,
     agentCallCount: 0,
@@ -251,6 +277,7 @@ function cloneTranscriptData(result: TranscriptData): TranscriptData {
       endTime: cloneDate(agent.endTime),
     })),
     todos: result.todos.map((todo) => ({ ...todo })),
+    incomingMessages: result.incomingMessages?.map((message) => ({ ...message })),
     sessionStart: cloneDate(result.sessionStart),
     lastActivatedSkill: result.lastActivatedSkill
       ? {
@@ -342,6 +369,25 @@ function readTailLines(
 
 // Map from background agent IDs (e.g., "a8de3dd") to tool_use_id
 type BackgroundAgentMap = Map<string, string>;
+
+/**
+ * Extract task ID from TaskCreate tool_result.
+ * Looks for patterns like "Task #123 created" in the result content.
+ */
+function extractTaskIdFromTaskCreateResult(
+  content: string | Array<{ type?: string; text?: string }>,
+): string | null {
+  let text = "";
+  if (typeof content === "string") {
+    text = content;
+  } else if (Array.isArray(content)) {
+    text = content
+      .map((b) => (typeof b?.text === "string" ? b.text : ""))
+      .join("\n");
+  }
+  const match = /Task #([^\s:]+) created/.exec(text);
+  return match ? match[1] : null;
+}
 
 /**
  * Extract background agent ID from "Async agent launched" message
@@ -468,7 +514,15 @@ function processEntry(
   // run_in_background, Explore/Plan/general-purpose, etc.) never transition
   // from "running" to "completed" in the HUD.
   if (typeof content === "string") {
-    if (content.includes("<task-notification>") || content.includes("<task_id>") || content.includes("<task-id>")) {
+    // Backward-compatible completion handling. Claude Code emits background
+    // completion as a `<task-notification>` envelope today; older transcripts
+    // carry the bare `<task_id>`/`<task-id>` tag sequence instead. Both must
+    // still transition the background agent to "completed".
+    if (
+      content.includes("<task-notification>") ||
+      content.includes("<task_id>") ||
+      content.includes("<task-id>")
+    ) {
       const taskOutput = parseTaskOutputResult(content);
       if (taskOutput && taskOutput.status === "completed") {
         // Prefer direct tool-use-id lookup (skips the backgroundAgentMap
@@ -488,6 +542,14 @@ function processEntry(
         }
       }
     }
+
+    // Classify the sender of an incoming agent wrapper (issue #3666) and
+    // record it with the payload redacted. Bare legacy tag sequences (no
+    // envelope) classify as nothing — they only carry completion signals.
+    const wrapper = parseIncomingAgentWrapper(content, entry.sessionId);
+    if (wrapper) {
+      result.incomingMessages?.push(wrapper);
+    }
     return;
   }
 
@@ -506,20 +568,45 @@ function processEntry(
       };
     }
 
+    // Incoming agent wrapper messages arrive as plain text blocks (teammate /
+    // peer messages are not tool results). tool_result blocks are deliberately
+    // excluded so an agent quoting a wrapper inside its output cannot spoof an
+    // incoming message (issue #3666).
+    if (block.type === "text") {
+      const text = (block as { text?: string }).text;
+      if (text) {
+        const wrapper = parseIncomingAgentWrapper(text, entry.sessionId);
+        if (wrapper) result.incomingMessages?.push(wrapper);
+      }
+    }
     // Track tool_use for Task (agents) and TodoWrite
     if (block.type === "tool_use" && block.id && block.name) {
       result.toolCallCount++;
       result.lastToolName = block.name;
-      if (block.name === "Task" || block.name === "proxy_Task" || block.name === "Agent") {
+      if (
+        block.name === "Task" ||
+        block.name === "proxy_Task" ||
+        block.name === "Agent" ||
+        block.name === "proxy_Agent"
+      ) {
         result.agentCallCount++;
         const input = block.input as TaskInput | undefined;
+        // Named Task/Agent spawns are teammates on the native agent team;
+        // unnamed spawns are anonymous subagents (issue #3666).
+        const spawn = classifyAgentSpawn({
+          hasName: Boolean(input?.name),
+          sessionId: entry.sessionId,
+        });
         const agentEntry: ActiveAgent = {
           id: block.id,
           type: input?.subagent_type ?? "unknown",
           model: input?.model,
+          name: input?.name,
           description: input?.description,
           status: "running",
           startTime: timestamp,
+          kind: spawn.kind,
+          spawnedBy: spawn.spawnedBy,
         };
 
         // Bounded agent map: evict oldest completed agents if at capacity
@@ -545,8 +632,9 @@ function processEntry(
       } else if (block.name === "TodoWrite" || block.name === "proxy_TodoWrite") {
         const input = block.input as TodoWriteInput | undefined;
         if (input?.todos && Array.isArray(input.todos)) {
-          // Replace latest todos with new ones
+          // Replace latest todos with new ones; Task tools apply on top
           latestTodos.length = 0;
+          taskToolStates.get(latestTodos)?.byId.clear();
           latestTodos.push(
             ...input.todos.map((t) => ({
               content: t.content,
@@ -554,6 +642,34 @@ function processEntry(
               activeForm: t.activeForm,
             })),
           );
+        }
+      } else if (block.name === "TaskCreate" || block.name === "proxy_TaskCreate") {
+        const input = block.input as TaskCreateInput | undefined;
+        if (block.id && typeof input?.subject === "string" && input.subject) {
+          // The task id only appears in the paired tool_result.
+          getTaskToolState(latestTodos).pendingCreates.set(block.id, {
+            content: input.subject,
+            status: "pending",
+            ...(input.activeForm ? { activeForm: input.activeForm } : {}),
+          });
+        }
+      } else if (block.name === "TaskUpdate" || block.name === "proxy_TaskUpdate") {
+        const input = block.input as TaskUpdateInput | undefined;
+        const taskId = input?.taskId == null ? "" : String(input.taskId);
+        const state = getTaskToolState(latestTodos);
+        const item = taskId ? state.byId.get(taskId) : undefined;
+        if (input && item) {
+          if (input.status === "deleted") {
+            const idx = latestTodos.indexOf(item);
+            if (idx >= 0) latestTodos.splice(idx, 1);
+            state.byId.delete(taskId);
+          } else {
+            if (input.status && TASK_STATUSES.has(input.status as TodoItem["status"])) {
+              item.status = input.status as TodoItem["status"];
+            }
+            if (typeof input.subject === "string" && input.subject) item.content = input.subject;
+            if (typeof input.activeForm === "string" && input.activeForm) item.activeForm = input.activeForm;
+          }
         }
       } else if (block.name === "Skill" || block.name === "proxy_Skill") {
         result.skillCallCount++;
@@ -582,10 +698,27 @@ function processEntry(
       }
     }
 
-    // Track tool_result to mark agents as completed
+    // Track tool_result to mark agents as completed and finalize TaskCreate operations
     if (block.type === "tool_result" && block.tool_use_id) {
       // Clear from pending permissions when tool_result arrives
       pendingPermissionMap.delete(block.tool_use_id);
+
+      // Finalize TaskCreate once its result names the task id (#4242)
+      const taskState = taskToolStates.get(latestTodos);
+      const pendingTask = taskState?.pendingCreates.get(block.tool_use_id);
+      if (taskState && pendingTask) {
+        taskState.pendingCreates.delete(block.tool_use_id);
+        const taskId = block.is_error || !block.content
+          ? null
+          : extractTaskIdFromTaskCreateResult(block.content);
+        if (taskId) {
+          const previous = taskState.byId.get(taskId);
+          const prevIdx = previous ? latestTodos.indexOf(previous) : -1;
+          if (prevIdx >= 0) latestTodos.splice(prevIdx, 1);
+          taskState.byId.set(taskId, pendingTask);
+          latestTodos.push(pendingTask);
+        }
+      }
 
       const agent = agentMap.get(block.tool_use_id);
       if (agent) {
@@ -702,6 +835,7 @@ interface ContentBlock {
 interface TaskInput {
   subagent_type?: string;
   model?: string;
+  name?: string;
   description?: string;
 }
 
@@ -716,6 +850,20 @@ interface TodoWriteInput {
 interface SkillInput {
   skill: string;
   args?: string;
+}
+
+interface TaskCreateInput {
+  subject?: string;
+  description?: string;
+  activeForm?: string;
+}
+
+interface TaskUpdateInput {
+  taskId?: string | number;
+  status?: string;
+  subject?: string;
+  description?: string;
+  activeForm?: string;
 }
 
 

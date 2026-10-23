@@ -1,55 +1,55 @@
-# oh-my-claudecode v4.15.0: add antigravity (agy), surface usage hint
+# oh-my-claudecode v5.7.4: More reliable hooks, team workflows, HUD, and Jev planning
 
 ## Release Notes
 
-Release with **2 new features**, **8 bug fixes**, **2 other changes** across **22 merged PRs**.
+Release with **1 new feature**, **4 bug fixes**, **1 performance improvement**, and **3 test improvements** across **9 merged PRs**.
 
 ### Highlights
 
-- **feat(providers): add antigravity (agy) CLI as drop-in alternative to gemini** (#3315)
-- **feat(hud): surface usage hint for API-key users when built-in usage unavailable (#3277)** (#3277)
+- **feat(jev): add OMC_JEV_PLAN_MODE to keep Jev from deciding in plan mode** (#4395)
+- **fix(team): quarantine stale Cursor verdicts and retain them on unreadable tasks** (#4380)
+- **perf(hooks): launch the file-context injectors only for the tools they act on** (#4373)
 
 ### New Features
 
-- **feat(providers): add antigravity (agy) CLI as drop-in alternative to gemini** (#3315)
-- **feat(hud): surface usage hint for API-key users when built-in usage unavailable (#3277)** (#3277)
+- **feat(jev): add OMC_JEV_PLAN_MODE to keep Jev from deciding in plan mode** (#4395)
+
+### Performance Improvements
+
+- **perf(hooks): launch the file-context injectors only for the tools they act on** (#4373)
+  - File-context injectors now launch only for the tools they act on, reducing hook overhead.
 
 ### Bug Fixes
 
-- **fix(hooks): encode project paths in transcript resolution**
-- **fix(jsonc): tolerate trailing commas in JSONC config files**
-- **fix(post-tool-rules-injector): honor existing skip guards**
-- **fix(team): verify cursor worker start submission** (#3296)
-- **fix: configurable magic keyword triggers** (#3289)
-- **fix(persistent-mode): bound thinking-only continuation loops** (#3280)
-- **fix(session-search): fix Windows worktree transcript resolution + converge the encoder** (#3276)
-- **fix(session-search): strip drive colon so current-scope search finds transcripts on Windows** (#3274)
+- **fix(plugin-cache): link stale plugin roots only to a real cache directory** (#4375)
+- **fix(installer): log CLAUDE.md as already up to date when install leaves it unchanged** (#4377)
+- **fix(team): quarantine stale Cursor verdicts and retain them on unreadable tasks** (#4380)
+- **fix: scope HUD stdin cache per session using stdin.session_id** (#4398)
 
-### Documentation
+### Test Improvements
 
-- **docs(release): include PR #3300 in v4.14.8 notes**
-- **docs: clarify psmux Windows team caveats** (#3312)
-- **docs: clarify OMC automation and SDK surfaces**
-- **docs: audit Claude Code changelog compatibility** (#3303)
-
-### Other Changes
-
-- **ci: run path-handling tests on a real Windows runner**
-- **ci: move workflows to GitHub-hosted runners** (#3287)
+- **test(run-cjs): blank user-level OMC env in the worker skip-guard hook spawns** (#4376)
+- **test(atomic-write): give SQLite contention timing bounds a runner margin** (#4385)
+- **test: make shutdown and state-clear race checks environment-independent** (#4379)
 
 ### Stats
 
-- **22 PRs merged** | **2 new features** | **8 bug fixes** | **0 security/hardening improvements** | **2 other changes**
+- **9 PRs merged** | **1 new feature** | **4 bug fixes** | **1 performance improvement** | **3 test improvements**
 
 ### Install / Update
 
+The npm CLI and the Claude Code marketplace/plugin are separate install tracks, not either/or replacements. Update whichever track you use; if you have both installed, update both. CLI-dependent skill paths such as `ask` and CLI-backed `team` require the `omc` CLI from the npm package.
+
+**CLI / runtime:**
+
 ```bash
-npm install -g oh-my-claude-sisyphus@4.15.0
+npm install -g oh-my-claude-sisyphus@5.7.4
 ```
 
-Or reinstall the plugin:
-```bash
-claude /install-plugin oh-my-claudecode
+**Claude Code plugin:**
+
+```text
+/plugin marketplace update omc
 ```
 
-**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-claudecode/compare/v4.14.7...v4.15.0
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-claudecode/compare/v5.7.3...v5.7.4

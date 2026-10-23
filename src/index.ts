@@ -67,9 +67,42 @@ export {
 } from './features/auto-update.js';
 export * from './shared/index.js';
 
+// Lookout pre-flight danger scanning API.
+export { LookoutError, resolveBriefArg, scanLookout } from './features/lookout/index.js';
+export type {
+  LookoutConfidence,
+  LookoutFinding,
+  LookoutReport,
+  LookoutSeverity,
+  LookoutVerdict,
+  ScanLookoutOptions,
+} from './features/lookout/index.js';
+
 // Hooks module exports
 export * from './hooks/index.js';
 
+
+// Team recovery and worker checkpoint public clients.
+export {
+  recoverDeadWorkerV2,
+  readRecoverDeadWorkerV2Outcome,
+  readRecoverDeadWorkerV2Result,
+  teamPublishTaskRecoveryCheckpoint,
+} from './team/index.js';
+export type {
+  RecoverDeadWorkerV2Options,
+  RecoverDeadWorkerV2Error,
+  RecoverDeadWorkerV2Result,
+  RecoverDeadWorkerV2Success,
+  RecoverDeadWorkerV2Failure,
+  PublishTaskRecoveryCheckpointInput,
+  PublishTaskRecoveryCheckpointResult,
+} from './team/index.js';
+export type {
+  RecoveryDurableOutcome,
+  RecoveryOutcomePending,
+  RecoveryOutcomeFinal,
+} from './team/index.js';
 // Features module exports (boulder-state, context-injector)
 export {
   // Boulder State
@@ -256,7 +289,7 @@ export interface OmcSession {
  *
  * // Use with Claude Agent SDK
  * for await (const message of query({
- *   prompt: session.processPrompt("ultrawork refactor the authentication module"),
+ *   prompt: session.processPrompt("analyze the authentication module"),
  *   ...session.queryOptions
  * })) {
  *   console.log(message);
