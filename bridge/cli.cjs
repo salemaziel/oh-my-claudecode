@@ -4533,7 +4533,7 @@ function buildDefaultConfig() {
       fallbackPolicy: {
         onModelFailure: "provider_chain",
         allowCrossProvider: false,
-        crossProviderOrder: ["codex", "gemini"]
+        crossProviderOrder: ["codex", "antigravity"]
       }
     },
     // Delegation routing configuration (opt-in feature for external model routing)
@@ -48422,7 +48422,7 @@ async function performUpdate(options) {
         success: false,
         previousVersion,
         newVersion: "unknown",
-        message: 'Running inside an active Claude Code plugin session. Use "/plugin install oh-my-claudecode" to update, or pass --standalone to force npm update.'
+        message: 'Running inside an active Claude Code plugin session. Use "/plugin install oh-my-claudecode@vdw" to update, or pass --standalone to force npm update.'
       };
     }
     const release = await fetchLatestRelease();
@@ -48505,7 +48505,7 @@ async function performUpdate(options) {
       throw new Error(
         `Auto-update via npm failed. Please run manually:
   npm install -g oh-my-claude-sisyphus@latest
-Or use: /plugin install oh-my-claudecode
+Or use: /plugin install oh-my-claudecode@vdw
 Error: ${npmError instanceof Error ? npmError.message : npmError}`
       );
     }
@@ -48533,7 +48533,7 @@ function formatUpdateNotification(checkResult) {
     `  Latest version:  ${checkResult.latestVersion}`,
     "",
     "  To update, run: /update",
-    "  Or reinstall via: /plugin install oh-my-claudecode",
+    "  Or reinstall via: /plugin install oh-my-claudecode@vdw",
     ""
   ];
   if (checkResult.releaseNotes && checkResult.releaseNotes !== "No release notes available.") {
@@ -48735,7 +48735,7 @@ var init_auto_update = __esm({
     init_paths();
     init_security_config();
     init_paths3();
-    REPO_OWNER = "Yeachan-Heo";
+    REPO_OWNER = "salemaziel";
     REPO_NAME = "oh-my-claudecode";
     GITHUB_API_URL = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}`;
     GITHUB_RAW_URL = `https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}`;

@@ -111,7 +111,7 @@ describe('release generation', () => {
         expect(body).toContain('CLI-dependent skill paths such as `ask` and CLI-backed `team` require the `omc` CLI');
         expect(body).toContain('npm install -g oh-my-claude-sisyphus@4.10.2');
         expect(body).toContain('/plugin marketplace update omc');
-        expect(body).toContain('https://github.com/Yeachan-Heo/oh-my-claudecode/compare/v4.10.1...v4.10.2');
+        expect(body).toContain('https://github.com/salemaziel/oh-my-claudecode/compare/v4.10.1...v4.10.2');
         expect(body).toContain('@blue-int @DdangJin @Yeachan-Heo');
         expect(body.match(/## Contributors/g)).toHaveLength(1);
     });
