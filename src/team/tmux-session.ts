@@ -1499,15 +1499,48 @@ export interface WaitForShellReadyOptions {
   tmuxServerIdentity?: TmuxServerIdentity;
 }
 
+const DECIMAL_INTEGER_TEXT = /^(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:[eE]([+-]?\d+))?$/;
+
+function parseExactInteger(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const negative = trimmed.startsWith('-');
+  const magnitude = negative || trimmed.startsWith('+') ? trimmed.slice(1) : trimmed;
+  const match = DECIMAL_INTEGER_TEXT.exec(magnitude);
+  if (!match) return null;
+  const integerDigits = match[1] ?? '';
+  const fractionDigits = match[2] ?? match[3] ?? '';
+  const exponent = match[4] === undefined ? 0 : Number(match[4]);
+  const shift = fractionDigits.length - exponent;
+  if (shift > 0) {
+    const significand = integerDigits + fractionDigits;
+    if (/[1-9]/.test(significand)) {
+      const trailingZeros = significand.length - significand.replace(/0+$/, '').length;
+      if (trailingZeros < shift) return null;
+    }
+  }
+  const parsed = (negative ? -1 : 1) * Number(magnitude);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+export function resolveTeamShellReadyTimeoutMs(
+  env: NodeJS.ProcessEnv = process.env,
+  explicitTimeoutMs?: number,
+): number {
+  if (Number.isFinite(explicitTimeoutMs) && (explicitTimeoutMs ?? 0) > 0) {
+    return Number(explicitTimeoutMs);
+  }
+  const raw = env.OMC_TEAM_SHELL_READY_TIMEOUT_MS;
+  const parsed = raw == null || String(raw).trim() === '' ? null : parseExactInteger(String(raw));
+  return parsed !== null && parsed > 0 ? parsed : 5_000;
+}
+
 async function waitForShellReady(paneId: string, opts: WaitForShellReadyOptions = {}): Promise<boolean> {
   if (isCmuxSurfaceTarget(paneId)) return true;
   if (!opts.tmuxServerIdentity) return false;
   if (!isValidTmuxServerIdentity(opts.tmuxServerIdentity)
     || await observeTmuxServerIdentity(opts.tmuxServerIdentity) !== 'matching') return false;
-  const envTimeout = Number.parseInt(process.env.OMC_TEAM_SHELL_READY_TIMEOUT_MS ?? '', 10);
-  const timeoutMs = Number.isFinite(opts.timeoutMs) && (opts.timeoutMs ?? 0) > 0
-    ? Number(opts.timeoutMs)
-    : (Number.isFinite(envTimeout) && envTimeout > 0 ? envTimeout : 5_000);
+  const timeoutMs = resolveTeamShellReadyTimeoutMs(process.env, opts.timeoutMs);
   const pollIntervalMs = Number.isFinite(opts.pollIntervalMs) && (opts.pollIntervalMs ?? 0) > 0
     ? Number(opts.pollIntervalMs)
     : 50;
@@ -1559,9 +1592,16 @@ async function verifyWorkerStartCommandDelivered(
   return false;
 }
 
-function resolvePositiveIntegerEnv(name: string, fallback: number): number {
-  const value = Number.parseInt(process.env[name] ?? '', 10);
-  return Number.isFinite(value) && value > 0 ? value : fallback;
+export function resolveTeamStartSubmitTimeoutMs(
+  env: NodeJS.ProcessEnv = process.env,
+  explicitTimeoutMs?: number,
+): number {
+  if (Number.isFinite(explicitTimeoutMs) && (explicitTimeoutMs ?? 0) > 0) {
+    return Number(explicitTimeoutMs);
+  }
+  const raw = env.OMC_TEAM_START_SUBMIT_TIMEOUT_MS;
+  const parsed = raw == null || String(raw).trim() === '' ? null : parseExactInteger(String(raw));
+  return parsed !== null && parsed > 0 ? parsed : 8_000;
 }
 
 
@@ -1581,9 +1621,7 @@ async function verifyWorkerStartCommandSubmitted(
   if (!opts.tmuxServerIdentity) return false;
   const expected = normalizeTmuxCapture(startCmd);
   const compactExpected = normalizeTmuxCaptureForDelivery(startCmd);
-  const timeoutMs = Number.isFinite(opts.timeoutMs) && (opts.timeoutMs ?? 0) > 0
-    ? Number(opts.timeoutMs)
-    : resolvePositiveIntegerEnv('OMC_TEAM_START_SUBMIT_TIMEOUT_MS', 8_000);
+  const timeoutMs = resolveTeamStartSubmitTimeoutMs(process.env, opts.timeoutMs);
   const maxPollIntervalMs = Number.isFinite(opts.maxPollIntervalMs) && (opts.maxPollIntervalMs ?? 0) > 0
     ? Number(opts.maxPollIntervalMs)
     : 500;
@@ -3440,10 +3478,6 @@ export function paneHasTrustPrompt(captured: string, provider?: CliAgentType): b
   return detectPaneTrustPromptKind(captured, provider) !== null;
 }
 
-export function paneHasCursorWorkspaceTrustPrompt(captured: string): boolean {
-  return detectPaneTrustPromptKind(captured, 'cursor') === 'cursor_workspace_trust';
-}
-
 function paneHasClaudeStartupBanner(captured: string, provider?: CliAgentType): boolean {
   const lines = captured
     .split('\n')
@@ -3522,10 +3556,9 @@ export async function waitForPaneReady(
   opts: WaitForPaneReadyOptions = {}
 ): Promise<boolean> {
   if (!isCmuxSurfaceTarget(paneId) && !opts.tmuxServerIdentity) return false;
-  const envTimeout = Number.parseInt(process.env.OMC_SHELL_READY_TIMEOUT_MS ?? '', 10);
   const timeoutMs = Number.isFinite(opts.timeoutMs) && (opts.timeoutMs ?? 0) > 0
     ? Number(opts.timeoutMs)
-    : (Number.isFinite(envTimeout) && envTimeout > 0 ? envTimeout : 30_000);
+    : 30_000;
   const pollIntervalMs = Number.isFinite(opts.pollIntervalMs) && (opts.pollIntervalMs ?? 0) > 0
     ? Number(opts.pollIntervalMs)
     : 250;
@@ -3543,7 +3576,7 @@ export async function waitForPaneReady(
 
   console.warn(
     `[tmux-session] waitForPaneReady: pane ${paneId} timed out after ${timeoutMs}ms ` +
-    `(set OMC_SHELL_READY_TIMEOUT_MS to tune)`
+    `(set OMC_TEAM_READY_TIMEOUT_MS to tune)`
   );
   return false;
 }
